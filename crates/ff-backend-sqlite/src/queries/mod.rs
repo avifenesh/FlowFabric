@@ -10,12 +10,14 @@
 //! Phase 2a.2 (attempt / exec_core) and Phase 2a.3 (lease / dispatch).
 
 pub mod attempt;
+pub mod budget;
 pub mod dispatch;
 pub mod exec_core;
 pub mod flow;
 pub mod flow_staging;
 pub mod lease;
 pub mod operator;
+pub mod quota;
 pub mod reads;
 pub mod signal;
 pub mod stream;

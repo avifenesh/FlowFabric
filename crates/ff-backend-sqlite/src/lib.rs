@@ -26,6 +26,7 @@
 #![allow(clippy::result_large_err)]
 
 mod backend;
+mod budget;
 mod completion_subscribe;
 mod config;
 mod errors;

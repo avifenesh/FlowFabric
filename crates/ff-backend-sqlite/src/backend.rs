@@ -26,9 +26,11 @@ use ff_core::backend::{SummaryDocument, TailVisibility};
 use ff_core::capability::{BackendIdentity, Capabilities, Supports, Version};
 use ff_core::caps::{CapabilityRequirement, matches as caps_matches};
 use ff_core::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
-    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
-    SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
+    BudgetStatus, CancelFlowResult, CreateBudgetArgs, CreateBudgetResult, CreateQuotaPolicyArgs,
+    CreateQuotaPolicyResult, ExecutionSnapshot, FlowSnapshot, ReportUsageAdminArgs,
+    ReportUsageResult, ResetBudgetArgs, ResetBudgetResult, RotateWaitpointHmacSecretAllArgs,
+    RotateWaitpointHmacSecretAllResult, SeedOutcome, SeedWaitpointHmacSecretArgs, SuspendArgs,
+    SuspendOutcome,
 };
 #[cfg(feature = "core")]
 use ff_core::contracts::{
@@ -2638,13 +2640,62 @@ impl EngineBackend for SqliteBackend {
         unavailable("sqlite.set_edge_group_policy")
     }
 
+    // ── RFC-020 Wave 9 — Budget + quota admin (Phase 3.4) ───────────
+    //
+    // Five admin methods (§4.4.1-§4.4.7) + `report_usage` hot-path are
+    // extended to maintain the 0013 breach-counter columns
+    // incrementally (RFC-020 Rev 6 §7.2 pin-lift). All write paths run
+    // under `BEGIN IMMEDIATE` + `retry_serializable`; the single-writer
+    // envelope replaces PG's `FOR NO KEY UPDATE` lock discipline.
+
     async fn report_usage(
         &self,
         _handle: &Handle,
-        _budget: &BudgetId,
-        _dimensions: UsageDimensions,
+        budget: &BudgetId,
+        dimensions: UsageDimensions,
     ) -> Result<ReportUsageResult, EngineError> {
-        unavailable("sqlite.report_usage")
+        crate::budget::report_usage_impl(&self.inner.pool, budget, dimensions).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn create_budget(
+        &self,
+        args: CreateBudgetArgs,
+    ) -> Result<CreateBudgetResult, EngineError> {
+        crate::budget::create_budget_impl(&self.inner.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn reset_budget(
+        &self,
+        args: ResetBudgetArgs,
+    ) -> Result<ResetBudgetResult, EngineError> {
+        crate::budget::reset_budget_impl(&self.inner.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn create_quota_policy(
+        &self,
+        args: CreateQuotaPolicyArgs,
+    ) -> Result<CreateQuotaPolicyResult, EngineError> {
+        crate::budget::create_quota_policy_impl(&self.inner.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn get_budget_status(
+        &self,
+        id: &BudgetId,
+    ) -> Result<BudgetStatus, EngineError> {
+        crate::budget::get_budget_status_impl(&self.inner.pool, id).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn report_usage_admin(
+        &self,
+        budget_id: &BudgetId,
+        args: ReportUsageAdminArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        crate::budget::report_usage_admin_impl(&self.inner.pool, budget_id, args).await
     }
 
     #[cfg(feature = "streaming")]

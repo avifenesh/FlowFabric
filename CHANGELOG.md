@@ -7,6 +7,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 3.4 Wave 9 budget/quota admin
+  (RFC-023 Phase 3.4 / RFC-020 §4.4 Rev 6).** Replaces 5
+  `Unavailable` trait defaults with real SQLite bodies ported from
+  `ff-backend-postgres/src/budget.rs`: `create_budget` (INSERT
+  `ff_budget_policy` with 8 Rev-6 columns + idempotent
+  `ON CONFLICT DO NOTHING`), `reset_budget` (zero `ff_budget_usage` +
+  clear breach metadata + advance `next_reset_at_ms`),
+  `create_quota_policy` (INSERT `ff_quota_policy`;
+  `ff_quota_window` + `ff_quota_admitted` tables from migration 0012
+  exist and are written by the future admission path, matching PG's
+  `create_quota_policy_impl`), `get_budget_status` (two SELECTs —
+  policy row + usage rows), `report_usage_admin` (admin-path
+  shared-core entry; translates the parallel dim/delta vectors to
+  `UsageDimensions`).
+- `crates/ff-backend-sqlite/src/budget.rs` — new module hosting the
+  5 method bodies + `report_usage_and_check_core` shared hot-path.
+- `crates/ff-backend-sqlite/src/queries/budget.rs` +
+  `queries/quota.rs` — SQLite-dialect SQL constants (positional `?`
+  placeholders; shape-identical to the PG reference).
+
+### Changed
+
+- `ff-backend-sqlite::report_usage` — extended to maintain the 0013
+  breach-counter columns (`breach_count`, `soft_breach_count`,
+  `last_breach_at_ms`, `last_breach_dim`) incrementally in the same
+  write tx as the `ff_budget_usage` increments, matching Valkey
+  parity at `flowfabric.lua:6576-6580,6614` and the PG Rev-6 §7.2
+  pin-lift. Single-writer `BEGIN IMMEDIATE` + `retry_serializable`
+  replaces PG's `FOR NO KEY UPDATE` lock discipline per RFC-023
+  §4.3.
+
 - **`crates/ff-backend-sqlite` — Phase 3.3 Wave 9 read model +
   cancel-flow split + waitpoint read (RFC-023 Phase 3.3 / RFC-020 §4.1
   + §4.2.3 + §4.5).** Replaces 6 `Unavailable` trait defaults with
