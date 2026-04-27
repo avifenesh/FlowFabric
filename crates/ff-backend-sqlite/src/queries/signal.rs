@@ -4,9 +4,19 @@
 //! the signal-delivery bodies in `suspend_ops.rs`.
 
 /// Append one signal-delivery event to the outbox.
-/// Binds: 1=execution_uuid (TEXT), 2=signal_id (TEXT),
-///        3=waitpoint_id (TEXT, nullable), 4=source_identity (TEXT, nullable),
-///        5=delivered_at_ms, 6=partition_key.
+///
+/// Binds:
+/// * 1 = execution_uuid stringified — `ff_signal_event.execution_id`
+///   is TEXT (mirrors PG at `ff-backend-postgres/migrations/0007`).
+/// * 2 = signal_id stringified — TEXT column.
+/// * 3 = waitpoint_id stringified (nullable) — TEXT column.
+/// * 4 = source_identity (nullable) — TEXT.
+/// * 5 = delivered_at_ms.
+/// * 6 = partition_key (reused in the `WHERE` clause).
+/// * 7 = execution_uuid as BLOB — `ff_exec_core.execution_id` is
+///   stored as a 16-byte BLOB; the co-transactional SELECT looks it
+///   up by BLOB equality while emitting the TEXT stringification
+///   onto `ff_signal_event`.
 ///
 /// The SQLite ff_signal_event table populates `namespace` +
 /// `instance_tag` from `ff_exec_core.raw_fields` via a co-transactional

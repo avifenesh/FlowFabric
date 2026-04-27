@@ -45,44 +45,9 @@ use crate::errors::map_sqlx_error;
 use crate::handle_codec::decode_handle;
 use crate::pubsub::{OutboxEvent, PubSub};
 use crate::queries::{signal as q_signal, suspend as q_suspend, waitpoint as q_wp};
+use crate::tx_util::{begin_immediate, commit_or_rollback, now_ms, rollback_quiet, split_exec_id};
 
-// ── shared small helpers ──────────────────────────────────────────────
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i64::MAX)
-}
-
-fn split_exec_id(eid: &ExecutionId) -> Result<(i64, Uuid), EngineError> {
-    let s = eid.as_str();
-    let rest = s
-        .strip_prefix("{fp:")
-        .ok_or_else(|| EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: format!("execution_id missing `{{fp:` prefix: {s}"),
-        })?;
-    let close = rest.find("}:").ok_or_else(|| EngineError::Validation {
-        kind: ValidationKind::InvalidInput,
-        detail: format!("execution_id missing `}}:`: {s}"),
-    })?;
-    let part: i64 = rest[..close]
-        .parse()
-        .map_err(|_| EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: format!("execution_id partition index not u16: {s}"),
-        })?;
-    let uuid = Uuid::parse_str(&rest[close + 2..]).map_err(|_| EngineError::Validation {
-        kind: ValidationKind::InvalidInput,
-        detail: format!("execution_id UUID invalid: {s}"),
-    })?;
-    Ok((part, uuid))
-}
+// ── suspend-module-local helpers ──────────────────────────────────────
 
 fn wp_uuid(w: &WaitpointId) -> Result<Uuid, EngineError> {
     Uuid::parse_str(&w.to_string()).map_err(|e| EngineError::Validation {
@@ -98,33 +63,37 @@ fn susp_uuid(s: &SuspensionId) -> Result<Uuid, EngineError> {
     })
 }
 
-async fn begin_immediate(
-    pool: &SqlitePool,
-) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, EngineError> {
-    let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .map_err(map_sqlx_error)?;
-    Ok(conn)
-}
-
-async fn commit_or_rollback(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
-) -> Result<(), EngineError> {
-    if let Err(e) = sqlx::query("COMMIT")
-        .execute(&mut **conn)
-        .await
-        .map_err(map_sqlx_error)
-    {
-        let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
-        return Err(e);
+/// HMAC kid validation shared by seed + rotate. The token wire shape
+/// is `<kid>:<hex>`; a kid containing `':'` collapses to an ambiguous
+/// parse at verify time, so reject up-front.
+fn validate_kid(kid: &str) -> Result<(), EngineError> {
+    if kid.is_empty() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "kid must be non-empty".into(),
+        });
+    }
+    if kid.contains(':') {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "kid must not contain ':' (token wire shape is `<kid>:<hex>`)".into(),
+        });
     }
     Ok(())
 }
 
-async fn rollback_quiet(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>) {
-    let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
+/// 256-bit hex validator shared by seed + rotate.
+fn validate_secret_hex(s: &str) -> Result<Vec<u8>, EngineError> {
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "secret_hex must be 64 hex characters (256-bit secret)".into(),
+        });
+    }
+    hex::decode(s).map_err(|_| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: "secret_hex is not valid hex".into(),
+    })
 }
 
 // ── RFC-020 §3.1.1 — derive required_signal_names (mirror PG) ─────────
@@ -240,9 +209,9 @@ mod evaluator {
                         set.len() as u32
                     }
                     CountKind::DistinctSignals => {
-                        let mut set: HashSet<String> = HashSet::new();
+                        let mut set: HashSet<Uuid> = HashSet::new();
                         for (_, s) in &candidates {
-                            set.insert(s.signal_id.0.to_string());
+                            set.insert(s.signal_id.0);
                         }
                         set.len() as u32
                     }
@@ -470,6 +439,17 @@ async fn suspend_inner(
     args: SuspendArgs,
     idem_key: Option<String>,
 ) -> Result<(SuspendOutcome, ()), EngineError> {
+    // 0. Guard: SuspendArgs::waitpoints is documented non-empty but
+    //    `with_waitpoints(vec![])` can empty it post-construction. Fail
+    //    loud before minting the HMAC + writing rows; `signed[0]`
+    //    indexing below panics on an empty vec (Copilot review #378).
+    if args.waitpoints.is_empty() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "suspend requires at least one waitpoint binding".into(),
+        });
+    }
+
     // 1. Dedup replay.
     if let Some(key) = idem_key.as_deref() {
         let row: Option<(String,)> = sqlx::query_as(q_suspend::SELECT_SUSPEND_DEDUP_SQL)
@@ -1115,22 +1095,8 @@ pub(crate) async fn seed_waitpoint_hmac_secret_impl(
     pool: &SqlitePool,
     args: SeedWaitpointHmacSecretArgs,
 ) -> Result<SeedOutcome, EngineError> {
-    if args.secret_hex.len() != 64 || !args.secret_hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: "secret_hex must be 64 hex characters (256-bit secret)".into(),
-        });
-    }
-    if args.kid.is_empty() {
-        return Err(EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: "kid must be non-empty".into(),
-        });
-    }
-    let secret_bytes = hex::decode(&args.secret_hex).map_err(|_| EngineError::Validation {
-        kind: ValidationKind::InvalidInput,
-        detail: "secret_hex is not valid hex".into(),
-    })?;
+    validate_kid(&args.kid)?;
+    let secret_bytes = validate_secret_hex(&args.secret_hex)?;
 
     let mut conn = begin_immediate(pool).await?;
 
@@ -1189,15 +1155,10 @@ pub(crate) async fn rotate_waitpoint_hmac_secret_all_impl(
     pool: &SqlitePool,
     args: RotateWaitpointHmacSecretAllArgs,
 ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
-    let secret_bytes = match hex::decode(&args.new_secret_hex) {
-        Ok(b) => b,
-        Err(_) => {
-            return Err(EngineError::Validation {
-                kind: ValidationKind::InvalidInput,
-                detail: "new_secret_hex is not valid hex".into(),
-            });
-        }
-    };
+    // Same input invariants as seed — reject empty/colon-containing kid
+    // and < 256-bit secret up-front (Copilot review #378).
+    validate_kid(&args.new_kid)?;
+    let secret_bytes = validate_secret_hex(&args.new_secret_hex)?;
     let now = now_ms();
 
     let mut conn = begin_immediate(pool).await?;

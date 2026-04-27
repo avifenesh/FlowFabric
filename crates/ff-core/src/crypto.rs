@@ -20,6 +20,18 @@ pub mod hmac {
 
     /// HMAC-SHA256 signature over `kid || ":" || message`. Returns a
     /// `kid:hex` token.
+    ///
+    /// # Kid constraints
+    ///
+    /// The wire shape is `<kid>:<hex>`; a kid containing `':'` would
+    /// collapse to an ambiguous `split_once(':')` at verify time. The
+    /// backend seed / rotate entry points validate kid shape before
+    /// minting secrets (backend-postgres `rotate_waitpoint_hmac_secret_all_impl`,
+    /// backend-sqlite `suspend_ops::validate_kid`), so every secret
+    /// reaching this function should already carry a colon-free kid.
+    /// This primitive does not re-validate for performance — callers
+    /// that build tokens from unvalidated input must run their own
+    /// shape check first.
     pub fn hmac_sign(secret: &[u8], kid: &str, message: &[u8]) -> String {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
             .expect("HMAC-SHA256 accepts any key length");
