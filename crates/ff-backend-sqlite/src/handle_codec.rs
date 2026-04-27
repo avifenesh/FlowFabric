@@ -18,17 +18,16 @@
 //! the embedded tag means something upstream is lying; we treat that
 //! as `HandleFromOtherBackend` too.
 //!
-//! At Phase 2a.1.5 the SQLite backend still returns `Unavailable` for
-//! every trait method that touches a [`Handle`], so the bodies here
-//! are unused by the live hot path today — they exist to lock in the
-//! backend-tag invariant and to give Phase 2a.2 a ready-to-use API.
+//! Phase 2a.2 wires these helpers into the live hot path — `claim`
+//! mints handles via [`encode_handle`]; `complete` / `fail` decode +
+//! validate the caller's handle via [`decode_handle`] before any
+//! write.
 
 use ff_core::backend::{BackendTag, Handle, HandleKind, HandleOpaque};
 use ff_core::engine_error::{EngineError, ValidationKind};
 use ff_core::handle_codec::{decode as core_decode, encode as core_encode, HandlePayload};
 
 /// Encode a [`HandlePayload`] into a SQLite-tagged [`Handle`].
-#[allow(dead_code)] // Wired up in Phase 2a.2+ when Handle-bearing ops land.
 pub(crate) fn encode_handle(payload: &HandlePayload, kind: HandleKind) -> Handle {
     let opaque: HandleOpaque = core_encode(BackendTag::Sqlite, payload);
     Handle::new(BackendTag::Sqlite, kind, opaque)
@@ -38,7 +37,6 @@ pub(crate) fn encode_handle(payload: &HandlePayload, kind: HandleKind) -> Handle
 /// Valkey/Postgres-tagged handle decodes successfully at the core
 /// codec layer but is rejected here with
 /// `ValidationKind::HandleFromOtherBackend`.
-#[allow(dead_code)] // Wired up in Phase 2a.2+.
 pub(crate) fn decode_handle(handle: &Handle) -> Result<HandlePayload, EngineError> {
     if handle.backend != BackendTag::Sqlite {
         return Err(EngineError::Validation {

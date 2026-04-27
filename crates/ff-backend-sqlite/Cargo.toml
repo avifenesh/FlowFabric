@@ -32,6 +32,7 @@ sqlx = { workspace = true, features = ["sqlite", "runtime-tokio", "macros", "mig
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
