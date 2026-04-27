@@ -7,6 +7,37 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 3.1 subscribe methods (RFC-023
+  Wave 9 / RFC-019 Stage B/C).** Replaces the 3 `Unavailable` defaults
+  for `subscribe_completion`, `subscribe_lease_history`, and
+  `subscribe_signal_delivery` with real bodies built on the Phase
+  2b.2.2 `OutboxCursorReader` primitive: catch-up SELECT on subscribe,
+  park on the matching `pubsub` broadcast channel for post-commit
+  wakeups, re-SELECT on each wake, decode typed events via per-family
+  closures. Cursor encoding reuses the Postgres family prefix
+  (`0x02 ++ event_id(BE8)`) — SQLite's i64 event_ids are equivalent
+  in shape — so cursors are wire-stable across backends. `ScannerFilter`
+  is applied in the row decoder against the outbox's denormalised
+  `namespace` + `instance_tag` columns (matching the PG reference at
+  `ff-backend-postgres/src/lease_event_subscribe.rs`); NULL filter
+  columns silently drop under any non-noop filter, preserving the
+  cross-backend "filtered subscribers drop NULL-column rows"
+  invariant. `subscribe_instance_tags` remains on the trait default
+  (`Unavailable`) per RFC-020 §3.2 / the #311 deferral.
+- `crates/ff-backend-sqlite/src/completion_subscribe.rs`,
+  `src/lease_event_subscribe.rs`, `src/signal_delivery_subscribe.rs`
+  — one module per subscribe method; each owns its SELECT SQL, row
+  decoder, and typed-event mapping. Module naming mirrors the PG
+  reference for straight cross-backend diff.
+- `crates/ff-backend-sqlite/tests/subscribe.rs` — 10-test integration
+  harness covering tail happy-path, cursor-resume across subscribe
+  sessions, `ScannerFilter::instance_tag` behaviour (positive match
+  through the signal-delivery outbox where the producer populates
+  the column via `json_extract`; null-drop on lease/completion where
+  the producer writes NULL today), and lagged-broadcast recovery
+  (300 completions vs the 256-slot broadcast ring, verifying the
+  cursor-select fallback catches every durable row after a
+  `RecvError::Lagged`).
 - **`crates/ff-backend-sqlite` — Phase 2b.2.2 stream readers + outbox
   cursor-resume primitive (RFC-023 Group C + Group D.2; completes
   Phase 2).** Replaces the 3 Group C `Unavailable` stubs with real
