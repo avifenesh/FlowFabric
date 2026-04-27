@@ -354,6 +354,25 @@ impl Client {
         self.inner.is_cluster().await
     }
 
+    /// Force an immediate refresh of the cluster slot map.
+    ///
+    /// In standalone mode this is a no-op and returns `Ok(())`
+    /// without a network round-trip. In cluster mode it drives an
+    /// unthrottled `CLUSTER SLOTS` query and updates the internal
+    /// routing table; concurrent callers coalesce behind the same
+    /// refresh lock used by ferriskey's background topology checker.
+    ///
+    /// Intended for consumers that have just observed a stale-
+    /// topology symptom on a cluster command (e.g. a `READONLY`
+    /// error after a failover moved the target slot to a new
+    /// primary) and want the next retry to use a fresh slot map.
+    /// Normal command dispatch already refreshes on `MOVED`/`ASK`;
+    /// this entry point exists for the `READONLY` case, which
+    /// ferriskey does not yet auto-refresh on (tracked separately).
+    pub async fn force_cluster_slot_refresh(&self) -> Result<()> {
+        self.inner.force_cluster_slot_refresh().await
+    }
+
     /// Dial a second, independent multiplexed connection using the
     /// same configuration (addresses, TLS, auth, cluster mode,
     /// timeouts, retry strategy, ...) that produced this client.
