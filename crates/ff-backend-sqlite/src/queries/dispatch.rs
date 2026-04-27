@@ -12,20 +12,40 @@
 
 // ── lease_event outbox ────────────────────────────────────────────────
 
-/// Insert one lease-lifecycle outbox row. Mirror of the in-line SQL
-/// previously embedded in `backend.rs::insert_lease_event` (Phase 2a.2);
-/// centralized here so post-commit broadcast emit picks up the
-/// `event_id` with one read.
+/// Insert one lease-lifecycle outbox row, back-filling `namespace` +
+/// `instance_tag` from the co-transactional `ff_exec_core.raw_fields`
+/// row so tag-filtered subscribers do not silently drop the event
+/// (Phase 3.2 fix — pre-fix, both columns landed NULL and a filter
+/// with `instance_tag=...` matched zero rows). Mirrors the
+/// `INSERT_SIGNAL_EVENT_SQL` SELECT+UNION-ALL shape from
+/// `queries/signal.rs`: the first branch reads exec_core (usual
+/// path); the second branch fires only when the exec row does not
+/// exist so the insert is still guaranteed by the 4 shipped binds
+/// and never lost.
 ///
 /// Binds:
-///   1. execution_id (TEXT — UUID string)
+///   1. execution_id (TEXT — UUID string) — emitted on the outbox row
 ///   2. event_type (TEXT)
 ///   3. occurred_at_ms (i64)
-///   4. partition_key (i64)
+///   4. partition_key (i64) — used both on the outbox row and the
+///      co-transactional exec_core lookup
+///   5. execution_id (BLOB) — `ff_exec_core.execution_id` is BLOB, so
+///      the lookup binds the Uuid-as-bytes form
 pub(crate) const INSERT_LEASE_EVENT_SQL: &str = r#"
     INSERT INTO ff_lease_event
-        (execution_id, lease_id, event_type, occurred_at_ms, partition_key)
-    VALUES (?1, NULL, ?2, ?3, ?4)
+        (execution_id, lease_id, event_type, occurred_at_ms, partition_key,
+         namespace, instance_tag)
+    SELECT ?1, NULL, ?2, ?3, ?4,
+           json_extract(raw_fields, '$.namespace'),
+           json_extract(raw_fields, '$.tags."cairn.instance_id"')
+      FROM ff_exec_core
+     WHERE partition_key = ?4 AND execution_id = ?5
+    UNION ALL
+    SELECT ?1, NULL, ?2, ?3, ?4, NULL, NULL
+     WHERE NOT EXISTS (
+         SELECT 1 FROM ff_exec_core
+          WHERE partition_key = ?4 AND execution_id = ?5
+     )
 "#;
 
 // ── signal_event outbox ───────────────────────────────────────────────
@@ -49,24 +69,8 @@ pub(crate) const INSERT_SIGNAL_EVENT_SQL: &str = r#"
     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 "#;
 
-// ── operator_event outbox ─────────────────────────────────────────────
-
-/// Insert one operator-event outbox row. Used by Wave-9 admin ops
-/// (Phase 2b.2+); the migration CHECK clause restricts `event_type`
-/// to the allowed literal set.
-///
-/// Binds:
-///   1. execution_id (TEXT)
-///   2. event_type (TEXT)
-///   3. details (Option<TEXT JSON>)
-///   4. occurred_at_ms (i64)
-///   5. partition_key (i64)
-///   6. namespace (Option<TEXT>)
-///   7. instance_tag (Option<TEXT>)
-#[allow(dead_code)] // Consumed by Phase 2b.2 change_priority / replay / cancel_flow_header
-pub(crate) const INSERT_OPERATOR_EVENT_SQL: &str = r#"
-    INSERT INTO ff_operator_event
-        (execution_id, event_type, details, occurred_at_ms, partition_key,
-         namespace, instance_tag)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-"#;
+// Operator-event outbox inserts live in `queries::operator`
+// (Phase 3.2). See `queries/operator.rs::INSERT_OPERATOR_EVENT_SQL` —
+// the Wave-9 producer back-fills namespace + instance_tag from
+// exec_core.raw_fields via co-transactional SELECT, matching the
+// lease/completion/signal producer shape.

@@ -300,28 +300,35 @@ async fn subscribe_completion_cursor_resume() {
 
 #[tokio::test]
 #[serial(ff_dev_mode)]
-async fn subscribe_completion_filter_drops_null_tag_rows() {
+async fn subscribe_completion_filter_by_instance_tag_receives_events() {
+    // Phase 3.2 fix: the SQLite completion producer now populates
+    // `instance_tag` from `ff_exec_core.raw_fields.tags."cairn.instance_id"`
+    // via a co-transactional SELECT (see
+    // `queries/attempt.rs::INSERT_COMPLETION_EVENT_SQL`). A subscriber
+    // filtering on a matching tag MUST observe the event; a subscriber
+    // with a non-matching filter MUST drop it.
     let b = fresh_backend().await;
-    // The SQLite completion outbox writes NULL `instance_tag` on every
-    // row today, so a non-noop filter drops every event. This mirrors
-    // the Postgres "filtered subscribers silently drop NULL-column
-    // rows" invariant. The assertion below is the visible shape of
-    // that invariant — once the producer is taught to populate the
-    // column, this test updates to positive filter-through.
-    let filter = ScannerFilter::new().with_instance_tag("cairn.instance_id", "i-nope");
+    let filter = ScannerFilter::new().with_instance_tag("cairn.instance_id", "i-42");
     let mut stream = b
         .subscribe_completion(StreamCursor::empty(), &filter)
         .await
         .expect("subscribe");
     tokio::time::sleep(Duration::from_millis(20)).await;
 
+    // Untagged completion — filter drops it.
     let (_e, h) = create_and_claim(&b).await;
-    b.complete(&h, None).await.expect("complete");
+    b.complete(&h, None).await.expect("complete untagged");
 
-    let events = drain_n::<CompletionEvent>(&mut stream, 1, Duration::from_millis(400)).await;
-    assert!(
-        events.is_empty(),
-        "filter with instance_tag must drop NULL-column completion rows"
+    // Tagged completion — filter passes it through.
+    let (_e, h) = create_and_claim_tagged(&b, Some(("cairn.instance_id", "i-42"))).await;
+    b.complete(&h, None).await.expect("complete tagged");
+
+    let events =
+        drain_n::<CompletionEvent>(&mut stream, 1, Duration::from_millis(2000)).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "filter should pass through exactly one tagged completion event"
     );
 }
 
@@ -383,19 +390,40 @@ async fn subscribe_lease_history_cursor_resume() {
 
 #[tokio::test]
 #[serial(ff_dev_mode)]
-async fn subscribe_lease_history_filter_drops_null_tag_rows() {
+async fn subscribe_lease_history_filter_by_instance_tag_receives_events() {
+    // Phase 3.2 fix: the SQLite lease_event producer now populates
+    // `instance_tag` from `ff_exec_core.raw_fields.tags."cairn.instance_id"`
+    // via a co-transactional SELECT (see
+    // `queries/dispatch.rs::INSERT_LEASE_EVENT_SQL`). A subscriber
+    // filtering on a matching tag MUST observe the full lease
+    // lifecycle (acquired + revoked); a non-matching filter MUST drop.
     let b = fresh_backend().await;
-    let filter = ScannerFilter::new().with_instance_tag("cairn.instance_id", "i-nope");
+    let filter = ScannerFilter::new().with_instance_tag("cairn.instance_id", "i-42");
     let mut stream = b
         .subscribe_lease_history(StreamCursor::empty(), &filter)
         .await
         .expect("subscribe");
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let (_eid, handle) = create_and_claim(&b).await;
-    b.complete(&handle, None).await.expect("complete");
+
+    // Untagged — filter drops every event.
+    let (_eid, h_untagged) = create_and_claim(&b).await;
+    b.complete(&h_untagged, None).await.expect("complete untagged");
+
+    // Tagged — acquired + revoked both land with instance_tag=i-42,
+    // both pass the filter.
+    let (_eid, h_tagged) =
+        create_and_claim_tagged(&b, Some(("cairn.instance_id", "i-42"))).await;
+    b.complete(&h_tagged, None).await.expect("complete tagged");
+
     let events =
-        drain_n::<LeaseHistoryEvent>(&mut stream, 1, Duration::from_millis(400)).await;
-    assert!(events.is_empty(), "filtered lease-history drops NULL rows");
+        drain_n::<LeaseHistoryEvent>(&mut stream, 2, Duration::from_millis(2000)).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "tagged acquired + revoked should both pass the filter, got {events:?}"
+    );
+    assert!(matches!(events[0], LeaseHistoryEvent::Acquired { .. }));
+    assert!(matches!(events[1], LeaseHistoryEvent::Revoked { .. }));
 }
 
 // ── subscribe_signal_delivery ─────────────────────────────────────────

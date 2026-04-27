@@ -141,7 +141,9 @@ pub(crate) const INSERT_COMPLETION_EVENT_SQL: &str = r#"
         namespace, instance_tag, occurred_at_ms
     )
     SELECT partition_key, execution_id, flow_id, ?1,
-           NULL, NULL, ?2
+           json_extract(raw_fields, '$.namespace'),
+           json_extract(raw_fields, '$.tags."cairn.instance_id"'),
+           ?2
       FROM ff_exec_core
      WHERE partition_key = ?3 AND execution_id = ?4
 "#;

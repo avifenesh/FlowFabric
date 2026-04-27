@@ -1042,6 +1042,9 @@ pub(crate) async fn claim_resumed_execution_impl(
             .bind("acquired")
             .bind(now)
             .bind(part)
+            // BLOB bind for the co-transactional exec_core lookup that
+            // back-fills namespace + instance_tag (Phase 3.2 fix).
+            .bind(exec_uuid)
             .execute(&mut *conn)
             .await
             .map_err(map_sqlx_error)?;

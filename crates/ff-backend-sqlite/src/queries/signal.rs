@@ -39,10 +39,25 @@ pub const INSERT_SIGNAL_EVENT_SQL: &str = "INSERT INTO ff_signal_event \
       )";
 
 /// Completion outbox insert for the `resumable` transition when a
-/// signal satisfies a waitpoint. `flow_id` + `namespace` + `instance_tag`
-/// columns on `ff_completion_event` default to NULL when not provided —
-/// matches the PG path's minimal insert shape at
-/// `ff-backend-postgres/src/suspend_ops.rs:845-854`.
+/// signal satisfies a waitpoint. Back-fills `namespace` +
+/// `instance_tag` from `ff_exec_core.raw_fields` via a
+/// co-transactional SELECT so tag-filtered subscribers receive the
+/// event (Phase 3.2 fix — pre-fix both columns landed NULL).
+/// `flow_id` stays NULL here (matches the PG minimal insert shape at
+/// `ff-backend-postgres/src/suspend_ops.rs:845-854`).
+///
+/// Binds: ?1 partition_key, ?2 execution_id (BLOB — reused for the
+/// exec_core lookup), ?3 occurred_at_ms.
 pub const INSERT_COMPLETION_RESUMABLE_SQL: &str = "INSERT INTO ff_completion_event \
-     (partition_key, execution_id, outcome, occurred_at_ms) \
-     VALUES (?1, ?2, 'resumable', ?3)";
+     (partition_key, execution_id, outcome, occurred_at_ms, namespace, instance_tag) \
+     SELECT ?1, ?2, 'resumable', ?3, \
+            json_extract(raw_fields, '$.namespace'), \
+            json_extract(raw_fields, '$.tags.\"cairn.instance_id\"') \
+       FROM ff_exec_core \
+      WHERE partition_key = ?1 AND execution_id = ?2 \
+     UNION ALL \
+     SELECT ?1, ?2, 'resumable', ?3, NULL, NULL \
+      WHERE NOT EXISTS ( \
+          SELECT 1 FROM ff_exec_core \
+           WHERE partition_key = ?1 AND execution_id = ?2 \
+      )";
