@@ -2737,6 +2737,49 @@ impl EngineBackend for SqliteBackend {
         retry_serializable(|| apply_dependency_to_child_impl(pool, &args)).await
     }
 
+    // ── RFC-019 Stage B/C — subscribe_* (Phase 3.1) ──────────────────
+    //
+    // Each method wraps the Phase 2b.2.2
+    // [`crate::outbox_cursor::OutboxCursorReader`] primitive against
+    // the matching outbox table + broadcast channel. Cursor encoding,
+    // `ScannerFilter` semantics, and event-type → typed-variant
+    // mapping all mirror the Postgres reference in
+    // `ff-backend-postgres/src/{lease,signal_delivery}_subscribe.rs`
+    // so cross-backend consumers see identical shapes.
+    //
+    // `subscribe_instance_tags` stays on the trait default
+    // (`Unavailable`) per RFC-020 §3.2 / the #311 deferral.
+
+    async fn subscribe_completion(
+        &self,
+        cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
+    ) -> Result<ff_core::stream_events::CompletionSubscription, EngineError> {
+        let pool = self.inner.pool.clone();
+        let wakeup = self.inner.pubsub.completion.subscribe();
+        crate::completion_subscribe::subscribe(pool, wakeup, cursor, filter.clone()).await
+    }
+
+    async fn subscribe_lease_history(
+        &self,
+        cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
+    ) -> Result<ff_core::stream_events::LeaseHistorySubscription, EngineError> {
+        let pool = self.inner.pool.clone();
+        let wakeup = self.inner.pubsub.lease_history.subscribe();
+        crate::lease_event_subscribe::subscribe(pool, wakeup, cursor, filter.clone()).await
+    }
+
+    async fn subscribe_signal_delivery(
+        &self,
+        cursor: ff_core::stream_subscribe::StreamCursor,
+        filter: &ff_core::backend::ScannerFilter,
+    ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
+        let pool = self.inner.pool.clone();
+        let wakeup = self.inner.pubsub.signal_delivery.subscribe();
+        crate::signal_delivery_subscribe::subscribe(pool, wakeup, cursor, filter.clone()).await
+    }
+
     // ── HMAC secret management (RFC-023 Phase 2b.2.1) ──
 
     async fn seed_waitpoint_hmac_secret(
