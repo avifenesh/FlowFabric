@@ -1,74 +1,107 @@
 # RFC-024: Wire `ff_reclaim_execution` + `ff_issue_reclaim_grant` to the consumer surface
 
 **Status:** DRAFT
-**Revision:** 1
+**Revision:** 2
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
-**Target release:** v0.12.0 (same wave as SQLite — Wave 10 folded)
-**Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-020 (Postgres Wave 9, shipped v0.11.0), RFC-023 (SQLite dev-only backend, v0.12.0 wave)
+**Target release:** v0.12.0 (joint wave with RFC-023 SQLite; all three backends folded)
+**Related RFCs:** RFC-012 (EngineBackend trait), RFC-017 (ff-server backend abstraction), RFC-018 (capability discovery), RFC-019 (lease events), RFC-020 (Postgres Wave 9), RFC-023 (SQLite dev-only backend)
 **Tracking issue:** #371
-**Consumer report:** avifenesh/cairn-rs → in-tree drafts `docs/design/ff-upstream/ff-lease-renewal-pull-mode.md`, `ff-renew-lease-mid-approval.md`, `ff-execution-phase-probe.md`, `ff-complete-run-lease-semantics.md`
+**Consumer report:** avifenesh/cairn-rs → in-tree drafts under `docs/design/ff-upstream/`
 
-> **Draft status.** Open questions in §7 list the two residual
-> owner forks after investigation. Every "Option A vs B" flagged as
-> DECIDED in-draft (§3, §4) is the drafter's recommendation under
-> the owner decisions summarised below; each remains open to owner
-> override.
+---
 
-### Owner decisions folded into Rev-1
+## Revision 2 changelog
 
-These four decisions were made before drafting and are treated as
-load-bearing throughout:
+Rev-2 folds six reviewer lenses' findings against Rev-1 (three parallel
+reviewers: A-technical, B-consumer, C-framing) plus four additional
+owner decisions locked on 2026-04-26. Seven load-bearing changes from
+Rev-1:
 
-1. **`ReclaimGrant` kind discriminant, not a second type.** The
-   existing `ff_core::contracts::ReclaimGrant` gains a `kind:
-   GrantKind` field; it does not fork into two separate grant
-   types. Additive, grep-able, ergonomic for consumers that want
-   one enum arm per path.
-2. **`max_reclaim_count` is configurable per-call, default 1000.**
-   The Lua primitive already accepts a per-execution policy
-   override and falls back to a hard-coded default of `100` at
-   `crates/ff-script/src/flowfabric.lua:3036`. The Rust surface
-   exposes this as an optional field on `IssueReclaimGrantArgs`
-   (pre-existing struct at `crates/ff-core/src/contracts/mod.rs:512`)
-   defaulting to **1000** when the caller passes `None`. Rationale:
-   long-running interactive cairn sessions (operator-paced tool
-   approvals, 30s+ per call) iterate dozens of reclaim cycles per
-   run in the degenerate case; 100 is a silent deadlock trap for
-   pull-mode consumers who walk away. 1000 turns the trap into a
-   loud, classifiable, terminal failure.
-3. **Valkey ↔ Postgres parity divergence documented, not hidden.**
-   Today `claim_from_reclaim` on Valkey routes through
-   `ff_claim_resumed_execution` (the suspend/resume path that gates
-   on `attempt_interrupted`); on Postgres it is a bespoke SQL path
-   that does NOT gate on `lifecycle_phase`; on SQLite the Phase
-   2a.3 port followed the Postgres pattern. The three backends
-   produce observably different behaviour under the same consumer
-   input, and consumers currently cannot tell which one they have.
-   §6 is a required section that names every divergence and states
-   the post-RFC-024 converged contract. Silent divergence is
-   worst-class UX; naming the gap is a prerequisite for shipping
-   the fix.
-4. **Wave 10 SQLite folded.** All three backends wire the new
-   trait method in the same release (v0.12.0 with RFC-023). No
-   deferred-backend phase. Parity matrix updates in the same PR
-   series.
+1. **Two grant types, not one with a discriminant.** Rev-1's
+   `GrantKind` field on `ClaimGrant` + `ReclaimGrant` is removed.
+   Instead: rename the existing `ReclaimGrant` → `ResumeGrant`
+   (its actual semantic — it already routes to
+   `ff_claim_resumed_execution`), and introduce a NEW `ReclaimGrant`
+   for the lease-reclaim path. Type IS the kind. The naming
+   inversion that made reviewers A + C flag Rev-1 as misleading
+   is resolved by swapping the name to the semantic it carries.
+2. **Trait method rename + new method.** Existing
+   `claim_from_reclaim` → `claim_from_resume_grant` on all three
+   backends (honest name for what it already does — resume via
+   `ff_claim_resumed_execution` on Valkey; attempt-epoch-bump
+   reconciler on PG/SQLite). New `claim_from_reclaim_grant` added
+   for the new lease-reclaim path. Both land in v0.12.0, no RFC-025
+   deferral.
+3. **New `ff_claim_grant` table on Postgres + SQLite.** Rev-1
+   relied on PG's pre-existing `ff_claim_grant` table — ground
+   truth is that no such table exists; PG stashes claim grants in
+   `ff_exec_core.raw_fields.claim_grant` JSON (scheduler.rs:252,
+   377). RFC-024 lands a properly-shaped table with discriminator
+   column (`kind IN ('claim','reclaim')`), backfills existing JSON
+   grants during migration, and flips scheduler.rs read/write
+   paths to the table. Parallel SQLite migration ships in the same
+   wave (RFC-023 N=1, no partitioning).
+4. **PG/SQLite `claim_from_reclaim` divergence from Valkey
+   `ff_reclaim_execution` resolved.** Rev-1 did not notice that
+   PG's current `claim_from_reclaim` reuses `attempt_index` and
+   only bumps `lease_epoch` (attempt.rs:286-396), while Valkey's
+   `ff_reclaim_execution` creates a new attempt row and bumps
+   `attempt_index`. Consumers reading `current_attempt_index` get
+   different numbers per backend. Fix: the renamed
+   `claim_from_resume_grant` keeps the existing PG/SQLite epoch-
+   bump behaviour (it was always a resume path, the name was the
+   bug); the new `reclaim_execution` method on PG/SQLite creates a
+   new attempt, bumps epoch, bumps `lease_reclaim_count` —
+   matching Valkey `ff_reclaim_execution` semantics.
+5. **New `lease_reclaim_count` column on PG + SQLite `ff_exec_core`.**
+   Required for §9 release-gate test (reclaim-cap-exceeded at
+   1000). Incremented by new `reclaim_execution` impl; Valkey
+   already tracks this field in its exec_core hash.
+6. **`max_reclaim_count` moves from `IssueReclaimGrantArgs` to
+   `ReclaimExecutionArgs`.** Ground truth: the field already lives
+   on `ReclaimExecutionArgs` at `contracts/mod.rs:553` (u32,
+   default 100). Rev-1 proposed adding it to the wrong struct.
+   Rev-2 flips the existing `u32` to `Option<u32>`; `None` → 1000
+   (the pull-mode-safe default). Per-call override preserved; Lua
+   per-execution policy override preserved (the two-default
+   coexistence is explicit: Lua fallback stays 100 for pre-RFC
+   call sites; Rust surface default is 1000 for RFC-024 callers).
+7. **New `HandleKind::Reclaimed` variant.** The enum is already
+   `#[non_exhaustive]` (`backend.rs:102`). Adding `Reclaimed`
+   lets downstream `complete`/`fail`/metrics paths distinguish
+   fresh (first claim), resumed (resume-after-suspend), and
+   reclaimed (lease-reclaim-after-expiry). Additive.
+
+Two Rev-1 residual forks resolved by owner decisions:
+
+- §6.3 (disposition of `claim_from_reclaim`): renamed in v0.12.0
+  per change #2 above — no RFC-025 follow-up needed.
+- §11.2 (`GrantKind::Default`): moot — `GrantKind` removed per
+  change #1.
+
+`§11 Residual forks` is now empty. Rev-2 carries no open owner
+questions.
 
 ---
 
 ## 1. Summary
 
-Add a new `EngineBackend` trait method + matching `ff-sdk::admin`
-method that wires two already-implemented Lua primitives
-(`ff_issue_reclaim_grant` and `ff_reclaim_execution`, both landed
-pre-RFC at `crates/ff-script/src/flowfabric.lua:2985` + `:3898`) to
-the consumer surface. Closes #371 pull-mode deadlock. Resolves
-three-way silent Valkey/PG/SQLite divergence on
-`claim_from_reclaim`. Wave 10 scope — ships in v0.12.0 alongside
-RFC-023 SQLite.
+Add two new `EngineBackend` trait methods (`issue_reclaim_grant`,
+`reclaim_execution`) + matching SDK admin surface that wire two
+already-implemented Lua primitives (`ff_issue_reclaim_grant` at
+`crates/ff-script/src/flowfabric.lua:3898`; `ff_reclaim_execution`
+at `:2985`) to the consumer surface. Closes #371 pull-mode
+deadlock. Resolves three-way silent Valkey/PG/SQLite divergence
+on the existing `claim_from_reclaim` method via a rename +
+parallel new method. Ships in v0.12.0 — all three backends in the
+same release, multiple PRs allowed (per owner decision: zero
+deferrals).
 
-No new Lua FCALL. No new DB migration. Purely additive trait
-method + additive grant-kind discriminant.
+New SQL migrations land on both Postgres and SQLite (`ff_claim_grant`
+table + `lease_reclaim_count` column on `ff_exec_core`). No new Lua
+FCALL; one existing Lua primitive (`ff_reclaim_execution`) gains one
+additional ARGV for the Rust-surface default threading.
 
 ---
 
@@ -76,207 +109,288 @@ method + additive grant-kind discriminant.
 
 ### 2.1 Pull-mode deadlock (issue #371)
 
-Cairn drives FlowFabric executions one HTTP request at a time,
-with operator-paced gaps between calls (30s+ per tool approval).
-Under the default 30s lease TTL, a sequence of productive
-iterations can leave an execution in a state where:
+Cairn drives FlowFabric one HTTP request at a time, with
+operator-paced gaps between calls (30s+ per tool approval). Under
+the default 30s lease TTL, a sequence of productive iterations can
+leave an execution in a state where:
 
 - `ff_complete_execution` rejects with `lease_expired`: the lease
   has drifted past `now_ms`, `mark_expired` ran, and the lease
   fence no longer matches.
 - Cairn retries via `POST /v1/runs/:id/claim` →
   `ff_issue_claim_grant`, which checks `lifecycle_phase ==
-  "runnable"` at `crates/ff-script/src/flowfabric.lua:3585`. The
-  execution is in `lifecycle_phase = "active"` post-`mark_expired`
-  (the attempt is still the same attempt; expiry only cleared the
-  lease, not the phase). `ff_issue_claim_grant` returns
-  `execution_not_eligible`.
+  "runnable"` at `flowfabric.lua:3585`. The execution is in
+  `lifecycle_phase = "active"` post-`mark_expired` (the attempt is
+  still the same attempt; expiry only cleared the lease, not the
+  phase). `ff_issue_claim_grant` returns `execution_not_eligible`.
 
 Both recovery doors are locked simultaneously. The execution
-cannot progress; the real work it represents (files written,
-code compiled on the host filesystem) cannot be persisted as a
-terminal write.
+cannot progress; the real work (files written, code compiled on
+the host filesystem) cannot be persisted as a terminal write.
+
+The two `ownership_state` values from which the post-RFC reclaim
+path is reachable:
+
+- `lease_expired_reclaimable` — reached via `ff_mark_lease_expired_if_due`
+  scanner tick when the lease's `expires_at_ms <= now_ms`.
+- `lease_revoked` — reached via `ff_revoke_lease` admin path when
+  an operator or supervisor explicitly releases a wedged lease.
+
+Both transition `lifecycle_phase` to `active` while leaving the
+execution ownerless; both are targets for `ff_issue_reclaim_grant`
+admission.
 
 ### 2.2 The primitives already exist and are correct
 
-The Lua primitives that do the right thing landed before this
-RFC:
-
 - **`ff_issue_reclaim_grant`** (`flowfabric.lua:3898`) validates
   `lifecycle_phase == "active"` AND `ownership_state IN
-  {"lease_expired_reclaimable", "lease_revoked"}`. It does NOT
-  require `runnable`. It issues the same
-  `claim_grant` hash shape that `ff_issue_claim_grant` uses —
-  consumers that already handle `ClaimGrant` handle this
-  identically, modulo the `kind` discriminant this RFC adds.
+  {"lease_expired_reclaimable", "lease_revoked"}`. Issues the same
+  `claim_grant` hash shape that `ff_issue_claim_grant` uses.
+  Applies the same capability match (`flowfabric.lua:3884`).
 - **`ff_reclaim_execution`** (`flowfabric.lua:2985`) atomically
   interrupts the old attempt, creates a new attempt + new lease,
   bumps the reclaim counter, and enforces per-execution
-  `max_reclaim_count` (default 100 in Lua; 1000 on the Rust
-  surface per §Owner-decisions). Wrong-state executions are
-  rejected with `execution_not_reclaimable`; exceeded-count
-  executions are transitioned to a terminal failure so consumers
-  see a loud, classifiable outcome — not a silent spin.
+  `max_reclaim_count` (default 100 in Lua today; 1000 on the Rust
+  surface per §4.6). Validates grant by `grant.worker_id ==
+  args.worker_id` — does NOT require matching `worker_instance_id`
+  (consumer implication: see §4.4).
 
 The bug in §2.1 is not a missing primitive; it is an unwired
 primitive. No Rust caller exists today.
 
 ### 2.3 Why the current Valkey `claim_from_reclaim` is not the fix
 
-`crates/ff-backend-valkey/src/lib.rs:4323` routes
-`claim_from_reclaim` through `ff_claim_resumed_execution`, the
-suspend/resume FCALL at `flowfabric.lua:5823`. That FCALL gates on
-`attempt_interrupted`, i.e. the explicit suspend/resume
-lifecycle — not the lease-expired-reclaimable state that the
-deadlock produces. For #371 inputs the existing trait method
-returns `Ok(None)` (grant-no-longer-available shape) because the
-execution is not in an attempt-interrupted state.
+`ff-backend-valkey/src/lib.rs:4323` routes `claim_from_reclaim`
+through `ff_claim_resumed_execution` (flowfabric.lua:5823). That
+FCALL gates on `attempt_interrupted` — the explicit suspend/resume
+lifecycle — not the `lease_expired_reclaimable` state that the
+deadlock produces. For #371 inputs Valkey `claim_from_reclaim`
+returns `Ok(None)`.
 
-This is a real bug on Valkey — the method name advertises reclaim
-semantics, the implementation delivers resume semantics. It
-predates this RFC (#371 catches it as a consumer-visible
-symptom). RFC-024 fixes it by introducing a new trait method with
-the correct semantic and retaining `claim_from_reclaim` as-is for
-the resume path (the name-vs-semantic issue is a follow-up
-addressed in §6.3).
+The method is misnamed: it advertises reclaim, delivers resume.
+Rev-2 addresses the naming directly via the rename in change #2 of
+the revision changelog (not deferred to RFC-025).
 
-### 2.4 Why Postgres doesn't hit the bug but has a silent divergent path
+### 2.4 Why PG/SQLite are silently different from Valkey
 
-Postgres `claim_from_reclaim` at
-`crates/ff-backend-postgres/src/attempt.rs:286–396` checks the
-latest attempt row for a lease that has expired (`expires_at <=
-now` or NULL), bumps the epoch, updates `ff_exec_core` to
-`lifecycle_phase = 'active'` + `ownership_state = 'leased'`, and
-mints a fresh handle. It does NOT gate on `lifecycle_phase`
-before acting; it writes the desired phase. Under #371 inputs
-Postgres unsticks the execution where Valkey does not. Same
-trait method, same consumer call, observably different behaviour.
-SQLite's Phase 2a.3 port followed the Postgres pattern and
-inherits the same silent divergence from Valkey. Consumers today
-cannot tell the backends apart.
+PG `claim_from_reclaim` at `attempt.rs:286-396` does NOT gate on
+`lifecycle_phase`. It locates the latest attempt row, verifies the
+lease has expired (`lease_expires_at_ms <= now` or NULL), bumps
+`lease_epoch`, updates `ff_exec_core` to `lifecycle_phase =
+'active'` + `ownership_state = 'leased'`, and mints a
+`HandleKind::Resumed` handle REUSING the same `attempt_index`.
+It does not create a new attempt row. It does not bump a reclaim
+counter (the column does not exist on PG).
+
+SQLite's Phase 2a.3 port follows the PG pattern.
+
+Three consequences:
+
+1. Same trait method, same consumer call, observably different
+   outcomes across backends (PG/SQLite unstick; Valkey deadlocks).
+2. Same trait method, same consumer call, observably different
+   `current_attempt_index` values (PG/SQLite keep N; Valkey new
+   attempt would be N+1 if it reached the reclaim primitive).
+3. `lease_reclaim_count` is unobservable on PG/SQLite — the column
+   doesn't exist — so §9's 1000-cap test cannot be written as-is.
+
+Rev-2 resolves all three by renaming the existing
+`claim_from_reclaim` to `claim_from_resume_grant` (honest name)
+and adding a new `reclaim_execution` that converges all three
+backends on the new-attempt + reclaim-count semantics that Valkey
+`ff_reclaim_execution` already implements.
 
 ### 2.5 Scope posture
 
-This RFC is the **narrowest fix** that resolves #371 and
-converges the three backends on a single documented contract. It
-is not a scheduler redesign, not a new reclaim-scanner, not an
-`attempt_interrupted` unification. Those are larger projects
-tracked elsewhere; RFC-024's job is to wire the correct primitive
-end-to-end.
+RFC-024 is the narrowest fix that resolves #371 AND converges the
+three backends on a single documented contract. It renames a
+pre-existing misleading method (to honest name), adds a new
+primitive-wiring method pair (to fix #371), and lands the SQL
+shape (table + column) the new method needs. It is not a
+scheduler redesign, not a new reclaim-scanner, not an
+`attempt_interrupted` unification. Those are tracked elsewhere.
 
 ---
 
 ## 3. Consumer surface
 
-### 3.1 Trait addition — `EngineBackend::issue_reclaim_grant`
+### 3.1 Grant types — rename existing, add new
 
-Added to `crates/ff-core/src/engine_backend.rs` alongside the
-existing scheduler-routed claim surface (row 18, RFC-017 §7):
+**Rename `ReclaimGrant` → `ResumeGrant`** (at
+`ff-core/src/contracts/mod.rs:186`). This type has always
+represented the resume-after-suspend semantic (the doc comment
+names `ff_claim_resumed_execution` as its consumer; the name was
+the bug). Carries `lane_id` per the existing asymmetry with
+`ClaimGrant`. Gains `#[non_exhaustive]` + an explicit `new()`
+constructor in the same PR.
+
+**Add new `ReclaimGrant`** representing the lease-reclaim
+semantic. Routes to `ff_reclaim_execution`. Carries `lane_id`
+(needed for the reclaim FCALL's `KEYS[*]` construction — same
+rationale as `ResumeGrant`). `#[non_exhaustive]` with explicit
+`new()`.
+
+**`ClaimGrant` unchanged** except for `#[non_exhaustive]` +
+`new()` (fresh-claim path, routes to `ff_claim_execution`).
+No lane_id (the existing asymmetry — admission caller already has
+the lane as a separate arg).
 
 ```rust
-#[cfg(feature = "core")]
+// contracts/mod.rs — renamed
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeGrant {
+    pub execution_id: ExecutionId,
+    pub partition_key: PartitionKey,
+    pub grant_key: String,
+    pub expires_at_ms: u64,
+    pub lane_id: LaneId,
+}
+
+impl ResumeGrant {
+    pub fn new(/* all fields required */) -> Self { … }
+    pub fn partition(&self) -> Result<Partition, PartitionKeyParseError> { … }
+}
+
+// contracts/mod.rs — new
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimGrant {
+    pub execution_id: ExecutionId,
+    pub partition_key: PartitionKey,
+    pub grant_key: String,
+    pub expires_at_ms: u64,
+    pub lane_id: LaneId,
+}
+
+impl ReclaimGrant {
+    pub fn new(/* all fields required */) -> Self { … }
+    pub fn partition(&self) -> Result<Partition, PartitionKeyParseError> { … }
+}
+```
+
+No `GrantKind` discriminant. The type IS the kind; at every
+dispatch site consumers match on the type (function arg or enum
+variant), not a field.
+
+**Rationale for two types over one with a discriminant.** A single
+`ReclaimGrant` with a `GrantKind` field (Rev-1 shape) hides the
+semantic divergence inside a runtime check — a consumer reaching
+for a reclaim grant and a consumer reaching for a resume grant do
+different things downstream (different FCALL, different handle
+kind, different invariants on the old attempt). Compile-time
+dispatch on the type pins the choice at the type system; the enum
+field deferred the choice to a runtime match that every consumer
+would write identically. Two types also clean up `HandleKind`'s
+mapping: `ResumeGrant` → `HandleKind::Resumed`, `ReclaimGrant` →
+`HandleKind::Reclaimed` (new variant, see §3.4).
+
+### 3.2 Trait surface — `EngineBackend`
+
+Three changes on `ff-core/src/engine_backend.rs`:
+
+**Rename** the existing `claim_from_reclaim` method →
+`claim_from_resume_grant`. Signature:
+
+```rust
+async fn claim_from_resume_grant(
+    &self,
+    token: ResumeToken, // renamed from ReclaimToken; carries ResumeGrant
+) -> Result<Option<Handle>, EngineError>;
+```
+
+Semantics unchanged: bumps `lease_epoch`, reuses `attempt_index`,
+mints `HandleKind::Resumed`. The rename is a compile break but a
+zero-semantic-change migration.
+
+**Add `issue_reclaim_grant`:**
+
+```rust
 async fn issue_reclaim_grant(
     &self,
     args: IssueReclaimGrantArgs,
 ) -> Result<IssueReclaimGrantOutcome, EngineError> {
-    Err(EngineError::Unavailable {
-        op: "issue_reclaim_grant",
-    })
+    Err(EngineError::Unavailable { op: "issue_reclaim_grant" })
 }
 ```
 
-Default impl returns `Unavailable` so pre-RFC out-of-tree
-backends keep compiling (same pattern as
-`claim_for_worker`, `subscribe_completion`, RFC-018/019 surface).
-All three in-tree backends (Valkey, Postgres, SQLite) override.
+Default impl returns `Unavailable` so pre-RFC out-of-tree backends
+keep compiling. All three in-tree backends override.
 
-`IssueReclaimGrantArgs` already exists at
-`crates/ff-core/src/contracts/mod.rs:512`. This RFC extends it
-additively:
+**Add `reclaim_execution`:**
 
 ```rust
-pub struct IssueReclaimGrantArgs {
-    pub execution_id: ExecutionId,
-    pub worker_id: WorkerId,
-    pub worker_instance_id: WorkerInstanceId,
-    pub lane_id: LaneId,
-    #[serde(default)]
-    pub capability_hash: Option<String>,
-    pub grant_ttl_ms: u64,
-    #[serde(default)]
-    pub route_snapshot_json: Option<String>,
-    #[serde(default)]
-    pub admission_summary: Option<String>,
-    #[serde(default)]
-    pub worker_capabilities: BTreeSet<String>, // new, parity with IssueClaimGrantArgs
-    /// Maximum reclaim count before the Lua primitive transitions
-    /// the execution to terminal_failed. `None` uses the surface
-    /// default of 1000 (see §Owner-decisions #2); explicit
-    /// `Some(n)` overrides per-call. The Lua primitive reads the
-    /// per-execution policy override first and falls back to the
-    /// value passed here — callers who want a lower cap for a
-    /// specific lane set a small explicit value.
-    #[serde(default)]
-    pub max_reclaim_count: Option<u32>, // new, Rev-1
-    pub now: TimestampMs,
+async fn reclaim_execution(
+    &self,
+    args: ReclaimExecutionArgs,
+) -> Result<ReclaimExecutionOutcome, EngineError> {
+    Err(EngineError::Unavailable { op: "reclaim_execution" })
 }
 ```
 
-`worker_capabilities` is added to the existing struct for parity
-with `IssueClaimGrantArgs` (both FCALLs apply identical
-capability-matching per the comment at `flowfabric.lua:3884`).
-This is additive — the `#[serde(default)]` default is an empty
-set, which preserves the pre-RFC behaviour for callers that did
-not set it. The Lua FCALL already reads
-`ARGV[9] = worker_capabilities_csv`; the Rust shim only ever
-passed an empty string, which incidentally worked because no
-in-tree caller existed. RFC-024 is the first caller and must pass
-the real set.
+Default impl returns `Unavailable`. All three in-tree backends
+override; mints `HandleKind::Reclaimed` on success.
 
-`IssueReclaimGrantResult` (already in tree) is extended additively
-into `IssueReclaimGrantOutcome`:
+`IssueReclaimGrantArgs` (existing, at `contracts/mod.rs:512`) is
+extended additively with `worker_capabilities: BTreeSet<String>`
+(parity with `IssueClaimGrantArgs` — the FCALL already reads
+`ARGV[9]`; pre-RFC Rust callers passed empty because no caller
+existed). `#[serde(default)]` preserves wire compat. Gains
+`#[non_exhaustive]` + explicit `new()`.
+
+`ReclaimExecutionArgs` (existing, at `contracts/mod.rs:540`) is
+modified:
+
+- `max_reclaim_count: u32` (existing, default 100 via
+  `default_max_reclaim_count()`) → `max_reclaim_count: Option<u32>`
+  (new, `None` means use Rust-surface default of 1000). The Lua
+  per-execution policy override still dominates when set;
+  unset-policy callers hit 1000 via the Rust surface.
+- Gains `#[non_exhaustive]` + explicit `new()`.
+
+`IssueReclaimGrantOutcome`:
 
 ```rust
+#[non_exhaustive]
 pub enum IssueReclaimGrantOutcome {
-    /// Grant issued; carries the ReclaimGrant the caller hands to
-    /// `claim_from_reclaim_grant` next. Same opacity contract as
-    /// the existing `IssueClaimGrantResult::Granted` → `ClaimGrant`
-    /// pair.
+    /// Grant issued. Hand this to `claim_from_reclaim_grant`.
     Granted(ReclaimGrant),
-    /// Execution is not in a reclaimable state (not
-    /// `lease_expired_reclaimable` / `lease_revoked`). Maps the Lua
-    /// `execution_not_reclaimable` error.
+    /// Execution not in a reclaimable state
+    /// (not `lease_expired_reclaimable` / `lease_revoked`).
     NotReclaimable { execution_id: ExecutionId, detail: String },
-    /// Per-execution `max_reclaim_count` exceeded and the Lua
-    /// primitive has transitioned the execution to terminal_failed.
-    /// The execution is permanently done; consumers should stop
+    /// `max_reclaim_count` exceeded; execution transitioned to
+    /// terminal_failed by the Lua/SQL primitive. Consumers stop
     /// retrying and surface a structural failure.
     ReclaimCapExceeded { execution_id: ExecutionId, reclaim_count: u32 },
 }
 ```
 
-Rationale for an outcome enum rather than `Result<ReclaimGrant,
-EngineError>`:
+`ReclaimExecutionOutcome`:
 
-- `NotReclaimable` is a classifiable state, not an engine error —
-  consumers can legitimately observe it (raced with a competing
-  reclaimer, execution already terminal). Shape matches
-  `IssueClaimGrantResult::Granted` which is also an enum (Rust
-  surface uses an enum for forward-compat even when there's one
-  variant today).
-- `ReclaimCapExceeded` is a terminal, classifiable signal. Hiding
-  it inside `EngineError` forces consumers into string-matching
-  error detail, which is the UX the consumer drafts (#371 issue
-  body) explicitly called out as painful. An enum variant with a
-  `reclaim_count` field is greppable and machine-classifiable.
+```rust
+#[non_exhaustive]
+pub enum ReclaimExecutionOutcome {
+    Claimed(Handle),  // HandleKind::Reclaimed
+    NotReclaimable { execution_id: ExecutionId, detail: String },
+    ReclaimCapExceeded { execution_id: ExecutionId, reclaim_count: u32 },
+    GrantNotFound { execution_id: ExecutionId },
+}
+```
 
-Non-Lua-classifiable faults (transport, unexpected FCALL shape,
-serialization) still return `Err(EngineError::*)`.
+**worker_capabilities source (B-2 resolution).** The capabilities
+vector is SDK-owned, plumbed from the registered worker's
+`WorkerRegistration::capabilities` at grant issuance. Consumers do
+not pass capabilities at each admin call; the SDK reads them from
+worker state. Rationale: pull-mode consumer ergonomics (one less
+thing to thread through every HTTP handler) and prevents drift
+between registered capabilities and per-call-asserted capabilities.
+The `IssueReclaimGrantArgs.worker_capabilities` field is populated
+by the SDK's `admin.issue_reclaim_grant` method before the trait
+dispatch; it is not exposed on the wire request type.
 
-### 3.2 SDK addition — `FlowFabricAdminClient::issue_reclaim_grant`
+### 3.3 SDK surface — `FlowFabricAdminClient::issue_reclaim_grant`
 
-Added to `crates/ff-sdk/src/admin.rs` alongside
-`claim_for_worker`:
+Added to `ff-sdk/src/admin.rs` alongside `claim_for_worker`:
 
 ```rust
 pub async fn issue_reclaim_grant(
@@ -285,15 +399,7 @@ pub async fn issue_reclaim_grant(
 ) -> Result<IssueReclaimGrantResponse, SdkError>;
 ```
 
-`IssueReclaimGrantRequest` mirrors `IssueReclaimGrantArgs` 1:1 as
-a wire struct (serde-serializable, `#[serde(rename_all =
-"camelCase")]` to match the rest of the admin surface). The HTTP
-route is **new**: `POST /v1/executions/{execution_id}/reclaim`.
-`execution_id` rides the URL path, the rest rides the body.
-`percent-encoded` per the `claim_for_worker` precedent at
-`admin.rs:140-157`.
-
-Response body mirrors `IssueReclaimGrantOutcome`:
+HTTP route: `POST /v1/executions/{execution_id}/reclaim`.
 
 ```rust
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -304,133 +410,58 @@ pub enum IssueReclaimGrantResponse {
         grant_key: String,
         expires_at_ms: u64,
         lane_id: LaneId,
-        kind: GrantKind, // always `GrantKind::Reclaim` for this endpoint
     },
     NotReclaimable { execution_id: ExecutionId, detail: String },
     ReclaimCapExceeded { execution_id: ExecutionId, reclaim_count: u32 },
 }
 ```
 
-Existing HTTP error classifications on the admin client
-(`SdkError::AdminApi { status, kind, retryable, ... }`) cover the
-out-of-band transport + 5xx cases; the outcome enum handles
-FF-level classifiable states.
+No `GrantKind` field — the endpoint always returns a reclaim
+grant; consumers construct a `ReclaimGrant` from the `Granted`
+variant.
 
-### 3.3 `GrantKind` discriminant — Owner-decision #1
+### 3.4 `HandleKind::Reclaimed` variant
 
-`ReclaimGrant` (existing type at
-`crates/ff-core/src/contracts/mod.rs:186`) gains a `kind:
-GrantKind` field:
+`HandleKind` at `ff-core/src/backend.rs:102` is already
+`#[non_exhaustive]`. Add variant:
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum GrantKind {
-    /// Fresh-claim grant — produced by `ff_issue_claim_grant`,
-    /// consumed by `ff_claim_execution`. Semantically: admission
-    /// of a runnable execution to a worker.
-    Claim,
-    /// Reclaim grant — produced by `ff_issue_reclaim_grant`,
-    /// consumed by `ff_reclaim_execution`. Semantically: recovery
-    /// of a lease-expired-reclaimable (or revoked) execution by a
-    /// capable worker.
-    Reclaim,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReclaimGrant {
-    pub execution_id: ExecutionId,
-    pub partition_key: crate::partition::PartitionKey,
-    pub grant_key: String,
-    pub expires_at_ms: u64,
-    pub lane_id: LaneId,
-    pub kind: GrantKind, // new, Rev-1
+pub enum HandleKind {
+    Fresh,        // existing
+    Resumed,      // existing — from claim_from_resume_grant
+    Suspended,    // existing
+    Reclaimed,    // new — from reclaim_execution
 }
 ```
 
-`ClaimGrant` (the fresh-claim type at `contracts/mod.rs:110`)
-also gains the same field; grant types remain separate on the
-Rust surface to preserve the lane-carrying asymmetry documented
-at `contracts/mod.rs:170-176`. The `kind` field is load-bearing
-for downstream consumers that want a single match site across
-both grant paths:
+Additive. Downstream `complete`/`fail`/metrics paths that match
+exhaustively add a `Reclaimed` arm (or rely on `_ =>` fallthrough
+per the `#[non_exhaustive]` contract for untouched consumers).
 
-```rust
-match grant.kind {
-    GrantKind::Claim => {
-        // worker dispatches ff_claim_execution flow
-    }
-    GrantKind::Reclaim => {
-        // worker dispatches ff_reclaim_execution flow
-    }
-}
-```
+### 3.5 Worker SDK — `claim_from_reclaim_grant`
 
-**Why on both types, not one sum type.** A `Grant` sum type
-(`enum Grant { Claim(ClaimGrant), Reclaim(ReclaimGrant) }`) was
-considered and rejected: it would break every existing caller of
-`claim_from_grant(ClaimGrant)` on a type that was stable at
-v0.11. The field-on-existing-type shape is additive with
-`#[non_exhaustive]` on `GrantKind` — callers that construct via
-the existing `pub` fields get a compile error pointing at the
-missing field (breaking) OR, if we use a builder / constructor
-wrapper, migrate with `..Default::default()` (non-breaking on the
-struct-literal front). See §8 for the migration shape.
+The existing `FlowFabricWorker::claim_from_reclaim_grant` method
+(`ff-sdk/src/worker.rs:1337`) currently consumes a `ReclaimGrant`
+and dispatches to the resume path. Post-rename:
 
-### 3.4 Trait surface — `claim_from_reclaim_grant` wiring
+- `FlowFabricWorker::claim_from_resume_grant(ResumeGrant)` —
+  existing method, renamed. Dispatches to
+  `EngineBackend::claim_from_resume_grant`.
+- `FlowFabricWorker::claim_from_reclaim_grant(ReclaimGrant)` —
+  new method (shape). Dispatches to
+  `EngineBackend::reclaim_execution`.
 
-The SDK worker path for consuming a `ReclaimGrant { kind:
-Reclaim, .. }` uses the existing
-`FlowFabricWorker::claim_from_reclaim_grant` shape
-(`ff-sdk/src/worker.rs:1337`) — with one behavioural change: when
-the grant's `kind` is `GrantKind::Reclaim`, the worker calls a
-new backend trait method `reclaim_execution` (routing to
-`ff_reclaim_execution`); when `kind` is `GrantKind::Claim` (the
-resume-path semantic that pre-RFC `ReclaimGrant` carried), the
-worker continues to call `claim_from_reclaim`
-(`ff_claim_resumed_execution`). The two primitives coexist on
-separate trait methods; the grant `kind` discriminates which path
-the worker dispatches.
+The pre-RFC method name `claim_from_reclaim_grant` retires its
+resume-path semantic; consumers migrate call sites to the new
+name per §8.
 
-Net trait surface added in RFC-024:
+### 3.6 Capability discovery — RFC-018 flag
 
-```rust
-// ff-core::engine_backend — new methods
-async fn issue_reclaim_grant(
-    &self,
-    args: IssueReclaimGrantArgs,
-) -> Result<IssueReclaimGrantOutcome, EngineError>;
-
-async fn reclaim_execution(
-    &self,
-    args: ReclaimExecutionArgs, // existing at contracts/mod.rs:540
-) -> Result<ReclaimExecutionOutcome, EngineError>;
-```
-
-Both have default impls returning `Unavailable` so pre-RFC
-out-of-tree backends keep compiling. All three in-tree backends
-override.
-
-`ReclaimExecutionOutcome` (new enum):
-
-```rust
-pub enum ReclaimExecutionOutcome {
-    Claimed(Handle), // new handle, matches claim_from_reclaim's Handle shape
-    NotReclaimable { execution_id: ExecutionId, detail: String },
-    ReclaimCapExceeded { execution_id: ExecutionId, reclaim_count: u32 },
-    GrantNotFound { execution_id: ExecutionId },
-}
-```
-
-### 3.5 Capability discovery — RFC-018 flag
-
-A new `Supports::issue_reclaim_grant: bool` flag on the
-`Capabilities::supports` matrix. All three in-tree backends
-report `true` at v0.12.0. Pre-RFC out-of-tree backends report
-`false` via the `Supports::none()` default. Consumer flow:
-feature-detect via `capabilities().supports.issue_reclaim_grant`
-at connect time; fall back to existing retry + eventual-terminal
-logic if absent.
+New `Supports::issue_reclaim_grant: bool` flag on the
+`Capabilities::supports` matrix. All three in-tree backends report
+`true` at v0.12.0. Pre-RFC out-of-tree backends report `false` via
+the `Supports::none()` default.
 
 ---
 
@@ -438,105 +469,179 @@ logic if absent.
 
 ### 4.1 Valkey wiring
 
-Direct forward to `ff_issue_reclaim_grant` at
-`flowfabric.lua:3898`. KEYS + ARGV match the FCALL signature
+Direct forward of both new methods to the existing FCALLs:
+
+**`issue_reclaim_grant`** → `ff_issue_reclaim_grant`
+(`flowfabric.lua:3898`). KEYS + ARGV match the FCALL signature
 exactly:
 
 ```
 KEYS[1] = exec_core
 KEYS[2] = claim_grant
 KEYS[3] = lease_expiry_zset
-ARGV[1-9] = execution_id, worker_id, worker_instance_id, lane_id,
-            capability_hash, grant_ttl_ms, route_snapshot_json,
-            admission_summary, worker_capabilities_csv
+ARGV[1..9] = execution_id, worker_id, worker_instance_id, lane_id,
+             capability_hash, grant_ttl_ms, route_snapshot_json,
+             admission_summary, worker_capabilities_csv
 ```
 
-Key construction reuses the existing `ExecKeyContext` shape at
-`crates/ff-backend-valkey/src/lib.rs` (same context as
-`ff_issue_claim_grant`, different target function). No new key
-schema.
+Key construction reuses `ExecKeyContext` (same shape as
+`ff_issue_claim_grant`). No new key schema.
+
+**`reclaim_execution`** → `ff_reclaim_execution`
+(`flowfabric.lua:2985`). KEYS[1..14] and ARGV[1..8] match the
+existing FCALL. **One Lua edit:** add `ARGV[9] =
+default_max_reclaim_count`, which the Lua reads as the fallback
+when the per-execution policy override (at `:3036-3045`) is
+absent. Today the Lua hardcodes `100` as the fallback; post-RFC it
+reads `ARGV[9]` with an `or "100"` default (so pre-RFC call sites
+with fewer args still parse). The Rust surface passes the
+user-supplied `max_reclaim_count.unwrap_or(1000)` or the value the
+caller set explicitly.
+
+**Lease-expiry scanner interaction.** On successful reclaim the
+Lua primitive ZADDs the execution at the new lease's expiry into
+`lease_expiry_zset`; subsequent `mark_lease_expired_if_due`
+scanner ticks re-use this entry without special-case logic.
 
 Capability-mismatch behaviour mirrors the Lua doc at
-`flowfabric.lua:3884-3896`: on `capability_mismatch` the Lua does
-NOT remove the exec from `lease_expiry`, and the RFC-024 surface
-returns `IssueReclaimGrantOutcome::NotReclaimable { detail:
+`flowfabric.lua:3884-3896`: on mismatch the Lua does NOT remove
+from `lease_expiry`; the Rust surface returns
+`IssueReclaimGrantOutcome::NotReclaimable { detail:
 "capability_mismatch" }`. There is no Batch-C reclaim scanner
-today (flowfabric.lua:3865 TODO); the RFC-024 surface is
-consumer-initiated only. A future scheduler-side reclaim scanner
-tracked elsewhere is out of scope for this RFC.
-
-`reclaim_execution` forwards to `ff_reclaim_execution` at
-`flowfabric.lua:2985` with the 14 keys + 8 args the FCALL
-requires. `max_reclaim_count` from the Rust call threads through
-as an additional ARGV (10th) — pre-RFC the Lua reads the
-per-execution policy override and falls back to a hard-coded
-`100`; the RFC changes the Lua fallback to read from a new
-`ARGV[9] = default_max_reclaim_count` (Rust surface default
-1000), which the Lua uses only when the per-execution policy
-override is absent. This is the only Lua-side edit in the RFC;
-KEYS shape and success path are unchanged.
+today; RFC-024 is consumer-initiated only. A future scheduler-
+side reclaim scanner is tracked elsewhere.
 
 ### 4.2 Postgres wiring
 
-Two new methods in `crates/ff-backend-postgres/src/attempt.rs`:
+**Migration `0015_claim_grant_table.sql`** (next sequence number
+after `0014_cancel_backlog.sql`):
 
-- `issue_reclaim_grant(&PgPool, IssueReclaimGrantArgs) -> ...`:
-  validates `ff_exec_core.lifecycle_phase = 'active'` AND
-  `ownership_state IN ('lease_expired_reclaimable',
-  'lease_revoked')` in a single `SELECT ... FOR UPDATE`, then
-  `INSERT` into a new `ff_claim_grant` row (same shape as the
-  existing fresh-claim grant row, `kind` column set to
-  `'reclaim'`). Wraps in `retry_serializable` per the existing
-  PG transient-error pattern.
-- `reclaim_execution(&PgPool, ReclaimExecutionArgs) -> ...`:
-  consumes the `ff_claim_grant` row (delete in the same tx),
-  inserts a new `ff_attempt` row (new attempt_index), updates
-  `ff_exec_core` to `lifecycle_phase = 'active'` +
-  `ownership_state = 'leased'` + `eligibility_state =
-  'not_applicable'` + `attempt_state = 'running_attempt'`, bumps
-  `lease_reclaim_count` on core, emits the RFC-019 `reclaimed`
-  lease event via the outbox, commits, and mints a handle. The
-  existing `claim_from_reclaim` at `attempt.rs:286-396` shares
-  code structure — the new method factors the lease-bump +
-  phase-flip + handle-mint into a shared helper; the two methods
-  differ only in the validation predicate and the
-  grant-consumption step.
+```sql
+CREATE TABLE ff_claim_grant (
+    partition_key   SMALLINT   NOT NULL,
+    grant_id        BYTEA      NOT NULL,
+    execution_id    BYTEA      NOT NULL,
+    kind            TEXT       NOT NULL CHECK (kind IN ('claim','reclaim')),
+    worker_id       TEXT       NOT NULL,
+    worker_instance_id TEXT    NOT NULL,
+    lane_id         TEXT,            -- NULL for fresh-claim grants; set for reclaim
+    capability_hash TEXT,
+    worker_capabilities JSONB   NOT NULL DEFAULT '[]'::jsonb,
+    route_snapshot_json TEXT,
+    admission_summary TEXT,
+    grant_ttl_ms    BIGINT     NOT NULL,
+    issued_at_ms    BIGINT     NOT NULL,
+    expires_at_ms   BIGINT     NOT NULL,
+    PRIMARY KEY (partition_key, grant_id)
+);
+CREATE INDEX ix_claim_grant_execution ON ff_claim_grant (partition_key, execution_id);
+CREATE INDEX ix_claim_grant_expiry    ON ff_claim_grant (expires_at_ms);
 
-**No new migration.** The `ff_claim_grant` table already exists
-(Wave 9 scope); adding `kind TEXT NOT NULL DEFAULT 'claim'` is
-done by extending migration `0015_*.sql` (next available
-sequence number after v0.11.0's `0014_*`) in the same v0.12.0
-PR. Default `'claim'` preserves existing-row semantics for
-upgrade correctness; new RFC-024 rows write `'reclaim'` explicitly.
+-- Backfill existing JSON-stashed grants
+INSERT INTO ff_claim_grant (partition_key, grant_id, execution_id, kind,
+                            worker_id, worker_instance_id, lane_id,
+                            grant_ttl_ms, issued_at_ms, expires_at_ms,
+                            worker_capabilities)
+SELECT
+    c.partition_key,
+    decode(c.raw_fields->'claim_grant'->>'grant_id', 'hex'),
+    c.execution_id,
+    'claim',
+    c.raw_fields->'claim_grant'->>'worker_id',
+    c.raw_fields->'claim_grant'->>'worker_instance_id',
+    NULL,
+    (c.raw_fields->'claim_grant'->>'grant_ttl_ms')::BIGINT,
+    (c.raw_fields->'claim_grant'->>'issued_at_ms')::BIGINT,
+    (c.raw_fields->'claim_grant'->>'expires_at_ms')::BIGINT,
+    '[]'::jsonb
+  FROM ff_exec_core c
+ WHERE c.raw_fields ? 'claim_grant'
+   AND (c.raw_fields->'claim_grant'->>'grant_id') IS NOT NULL;
 
-**Convergence with existing `claim_from_reclaim`.** PG's current
-`claim_from_reclaim` at `attempt.rs:286` is the internal-reconciler
-path (no grant involved — it operates on the attempt row
-directly). RFC-024 introduces `reclaim_execution` as the
-grant-consuming path. The two coexist; the reconciler path is
-unchanged by this RFC (see §6.2 for the parity contract).
+-- Leave raw_fields.claim_grant in place for one release; scheduler.rs
+-- read path writes to the table going forward and stops consulting JSON.
+-- Migration 0017 in v0.13.0 strips the JSON residue.
+
+ALTER TABLE ff_exec_core
+    ADD COLUMN lease_reclaim_count INTEGER NOT NULL DEFAULT 0;
+```
+
+`worker_capabilities` uses JSONB (not `TEXT[]`) for SQLite parity
+— SQLite has no array type. Migration folds the `ff_claim_grant`
+table AND the `lease_reclaim_count` column into a single file to
+minimize sequence-number churn (one PR, one migration file).
+
+**Scheduler.rs updates.** The three-site JSON stash (`scheduler.rs:
+35`, `:252`, `:377`) is replaced:
+
+- Write path (`:252`) — `INSERT INTO ff_claim_grant ... VALUES (...,
+  'claim', ...)` instead of writing into `ff_exec_core.raw_fields`.
+- Read path (`:377`) — `SELECT ... FROM ff_claim_grant WHERE
+  partition_key = $1 AND execution_id = $2 AND kind = 'claim'`.
+- Delete path (grant consumption) — DELETE from the table.
+
+**New method impls in `attempt.rs`:**
+
+- `issue_reclaim_grant_impl`: validates `ff_exec_core.lifecycle_phase
+  = 'active'` AND `ownership_state IN ('lease_expired_reclaimable',
+  'lease_revoked')` via `SELECT ... FOR UPDATE`. Applies the
+  same capability-match logic as `issue_claim_grant`. On match:
+  `INSERT INTO ff_claim_grant (kind='reclaim', lane_id=<from
+  core>, ...)`. Wraps in `retry_serializable`.
+- `reclaim_execution_impl`: consumes the `kind='reclaim'` grant
+  row (DELETE in tx), inserts a **new** `ff_attempt` row with
+  `attempt_index = (prev_max + 1)`, updates `ff_exec_core` to
+  `lifecycle_phase = 'active'` + `ownership_state = 'leased'` +
+  `eligibility_state = 'not_applicable'` + `attempt_state =
+  'running_attempt'`, increments `lease_reclaim_count`, checks the
+  new count against `max_reclaim_count` (from args; default 1000
+  if `None`) — if exceeded, transitions to terminal_failed and
+  returns `ReclaimCapExceeded` without minting a handle. Emits
+  RFC-019 `reclaimed` lease event via the outbox. Commits. Mints
+  `Handle { kind: Reclaimed, .. }`.
+
+**Renamed method.** `claim_from_reclaim` in `attempt.rs:286` is
+renamed `claim_from_resume_grant_impl`. Body unchanged.
 
 ### 4.3 SQLite wiring
 
-The Phase 2a.3 `claim_from_reclaim` already ships the SQLite
-equivalent of the PG reconciler path (see
-`crates/ff-backend-sqlite/src/backend.rs:1328-1430` +
-`crates/ff-backend-sqlite/src/queries/lease.rs`). RFC-024 ports
-the new grant-based methods using the same pattern:
+Parallel migration `0015_claim_grant_table.sql` in
+`crates/ff-backend-sqlite/migrations/`. Same shape as PG, adjusted
+for SQLite types:
 
-- `issue_reclaim_grant_impl` constructs
-  `ff_backend_sqlite::queries::lease::issue_reclaim_grant` (new
-  query fn), runs under `retry_serializable`, and returns the
-  outcome.
-- `reclaim_execution_impl` mirrors the PG shape: consume grant,
-  insert attempt, flip core, emit outbox `reclaimed` lease event
-  via the `insert_lease_event` helper (already at `backend.rs:1409`).
+```sql
+CREATE TABLE ff_claim_grant (
+    partition_key   INTEGER NOT NULL,
+    grant_id        BLOB    NOT NULL,
+    execution_id    BLOB    NOT NULL,
+    kind            TEXT    NOT NULL CHECK (kind IN ('claim','reclaim')),
+    worker_id       TEXT    NOT NULL,
+    worker_instance_id TEXT NOT NULL,
+    lane_id         TEXT,
+    capability_hash TEXT,
+    worker_capabilities TEXT NOT NULL DEFAULT '[]',   -- JSON text
+    route_snapshot_json TEXT,
+    admission_summary TEXT,
+    grant_ttl_ms    INTEGER NOT NULL,
+    issued_at_ms    INTEGER NOT NULL,
+    expires_at_ms   INTEGER NOT NULL,
+    PRIMARY KEY (partition_key, grant_id)
+);
+CREATE INDEX ix_claim_grant_execution ON ff_claim_grant (partition_key, execution_id);
+CREATE INDEX ix_claim_grant_expiry    ON ff_claim_grant (expires_at_ms);
 
-Migrations are hand-ported per RFC-023 §4.1 parity-drift lint —
-the PG `0015` gets a SQLite sibling `0015_*.sql`. Scanner
-supervisor on SQLite stays `N=1` per RFC-023 §4.1; no partition
-fan-out. `retry_serializable` wraps the same transient-busy
-classifier shape as every other Wave-9 SERIALIZABLE op on SQLite.
+ALTER TABLE ff_exec_core ADD COLUMN lease_reclaim_count INTEGER NOT NULL DEFAULT 0;
+```
+
+No partition fan-out (RFC-023 N=1). Backfill follows the same
+JSON-extraction shape as PG but using `json_extract` instead of
+`->>`. Scanner supervisor stays `N=1`.
+
+Method impls mirror PG: `issue_reclaim_grant_impl`,
+`reclaim_execution_impl`, and the rename of
+`claim_from_reclaim` → `claim_from_resume_grant_impl`. Each wraps
+in `retry_serializable` with the transient-busy classifier from
+the Wave-9 pattern.
 
 ### 4.4 Consumer pattern (cairn example)
 
@@ -546,199 +651,152 @@ Pre-RFC-024 deadlock flow:
 POST /v1/runs/:id/complete → lease_expired
   → consumer retries via POST /v1/runs/:id/claim
     → ff_issue_claim_grant rejects: execution_not_eligible
-      (lifecycle_phase != runnable)
-        → deadlock
+      → deadlock
 ```
 
 Post-RFC-024 recovery flow:
 
 ```
 POST /v1/runs/:id/complete → lease_expired
-  → consumer detects lease_expired class via SdkError::AdminApi.kind
+  → consumer detects lease_expired class via SdkError
     → POST /v1/executions/:id/reclaim (new endpoint)
-      → ff_issue_reclaim_grant returns Granted(ReclaimGrant { kind: Reclaim, .. })
-        → worker calls claim_from_reclaim_grant(grant)
-          → backend dispatches to reclaim_execution (because kind = Reclaim)
+      → ff_issue_reclaim_grant returns Granted(ReclaimGrant)
+        → worker.claim_from_reclaim_grant(grant)
+          → backend.reclaim_execution
             → ff_reclaim_execution creates new attempt + new lease
               → worker retries terminal write on the fresh lease
                 → POST /v1/runs/:id/complete succeeds
 ```
 
-No changes to the worker's core loop beyond the one additional
-match arm on `GrantKind`. The lease-id / attempt-id state that
-the worker tracks rotates through the fresh lease the reclaim
-minted.
+**Worker-instance-identity contract (B-1 resolution).** The Lua
+`ff_reclaim_execution` validates grant consumption via
+`grant.worker_id == args.worker_id` at `flowfabric.lua:3088` — it
+does NOT compare `worker_instance_id`. So a reclaiming worker
+process with a different `worker_instance_id` from the expired
+lease's holder can consume a reclaim grant it issued itself. This
+is load-bearing for cairn's per-request-spawn model: each HTTP
+request spawns a fresh worker process with a fresh
+`worker_instance_id`; the reclaim flow must work across
+instances. PG/SQLite `reclaim_execution` impls honour the same
+contract (grant-consumer's `worker_id` must match the grant's;
+`worker_instance_id` on the grant is informational only, written
+into the new attempt row as the new lease holder).
 
 ### 4.5 Error classification shape
 
-The new admin endpoint returns structured outcomes for the three
-classifiable states (`Granted`, `NotReclaimable`,
-`ReclaimCapExceeded`) as 200-status responses with `status`
-discriminator in the body, per `admin.rs:302`'s
-`RotateWaitpointSecretResponse` precedent. Out-of-band faults
-(transport, 5xx, malformed body) surface as
-`SdkError::AdminApi` / `SdkError::Http` per the existing
-classifier pattern.
-
-Cairn's F64 bridge-retry classifier today pattern-matches
-`lease_expired` + `execution_not_eligible` string codes. Post-
-RFC-024 the classifier matches `kind` on
-`SdkError::AdminApi`:
-
-- `"execution_not_reclaimable"` → structural state, stop retrying
-- `"reclaim_cap_exceeded"` → terminal, escalate
-- `"execution_not_eligible"` during reclaim path → bug, report
-
-The explicit `reclaim_cap_exceeded` terminal signal is the
-replacement for the silent-deadlock pattern — consumers get a
-loud, classifiable failure at 1000 reclaims rather than an
-unending retry loop.
+Admin endpoint returns structured outcomes as 200-status responses
+with `status` discriminator body (per
+`RotateWaitpointSecretResponse` precedent at `admin.rs:302`).
+Out-of-band faults (transport, 5xx, malformed body) surface as
+`SdkError::AdminApi` / `SdkError::Http`.
 
 ### 4.6 `max_reclaim_count = 1000` default — why 1000, not 100
 
 The Lua primitive ships with `max_reclaim = 100` at
-`flowfabric.lua:3036` as the fallback when no per-execution
-policy override is set. That ceiling was chosen for the
-batch-C scheduler-driven scanner (crash recovery), where each
-reclaim fires within a single scanner tick and 100 reclaims is a
-generous upper bound for "worker has crashed many times". In
-pull-mode consumer traffic, each reclaim fires at operator
-cadence (one per HTTP request after lease expiry) — a 30-minute
-interactive session under a 30s lease can realistically iterate
-60+ reclaims, and a multi-hour session with operator breaks more.
-100 is a silent trap; 1000 is the smallest round number
-comfortably above any observed pull-mode sessions the consumer
-drafts describe while still catching genuine infinite loops.
+`flowfabric.lua:3036` as the fallback when no per-execution policy
+override is set. That ceiling suits the batch-C scanner
+(scheduler-driven crash recovery, many reclaims per scanner tick,
+100 = "worker has crashed many times"). In pull-mode consumer
+traffic each reclaim fires at operator cadence (one per HTTP
+request after lease expiry) — a 30-minute interactive session at
+30s TTL can realistically iterate 60+ reclaims; multi-hour
+sessions more. 100 is a silent trap; 1000 is the smallest round
+number comfortably above observed pull-mode sessions while still
+catching genuine infinite loops.
 
-Per-call override is the escape valve: consumers who want a
-tighter ceiling for a specific lane pass `max_reclaim_count:
-Some(50)`; consumers who want a looser ceiling for an
-admin-approved session pass `Some(5000)`. The default of 1000 is
-what the trap-free majority gets.
+**Two-default coexistence, explicit.** The Lua-side fallback stays
+100 (for pre-RFC call sites that may construct a
+`ReclaimExecutionArgs` without the new field — `Option<u32> =
+None` on deserialize old wire shape; the Lua's `or "100"` on
+ARGV[9] catches the case of an old Rust caller omitting the
+arg). The Rust surface default is 1000 for any new construction
+via the new `ReclaimExecutionArgs::new()` builder or explicit
+`None`. This is dissonant by design: the Lua's 100 is the
+scheduler-scanner ceiling; the Rust's 1000 is the pull-mode
+consumer ceiling. A periodic warn-log fires at `reclaim_count %
+100 == 0` so operators observe long-running reclaim sessions
+before hitting the terminal cap.
+
+**Per-call override** remains the escape valve: consumers set
+`Some(n)` for a tighter (or looser) ceiling specific to a lane.
 
 ---
 
 ## 5. Non-goals
 
-1. **NOT a change to `ff_issue_claim_grant` semantics.** The
-   fresh-claim path stays lifecycle-phase-gated at
-   `flowfabric.lua:3585`. That gate is correct for fresh claims —
-   a `runnable` execution is the only state where a fresh-claim
-   admission makes sense. Relaxing it (cairn's Option 1) would
-   let a reclaim masquerade as a fresh claim and skip the
-   attempt-renumbering + reclaim-counter enforcement that
-   `ff_reclaim_execution` does.
-2. **NOT a change to `ff_claim_resumed_execution` semantics.**
-   The suspend/resume path (attempt_interrupted →
-   running_attempt) stays as-is. RFC-024 does not unify
-   suspend/resume with lease-reclaim; those are distinct lifecycle
-   events with distinct invariants.
-3. **NOT a new Lua FCALL.** RFC-024 wires existing FCALLs. The
-   one Lua edit is §4.1's `ARGV[9]` threading for the
-   `default_max_reclaim_count`, which preserves every pre-RFC
-   call shape.
-4. **NOT a new database migration beyond the `kind` column on
-   `ff_claim_grant`.** Both backends' schema is otherwise
-   untouched.
-5. **NOT a Batch-C-style reclaim scanner.** The scheduler-driven
-   periodic reclaim that would recover from worker crashes is
-   out of scope — RFC-024's surface is consumer-initiated. The
-   Lua TODO at `flowfabric.lua:3865` remains open.
-6. **NOT a merger of `claim_from_reclaim` (resume) and
-   `reclaim_execution` (lease-reclaim) into one trait method.**
-   The two primitives have different invariants and the surface
-   keeps them distinct. Future consolidation, if any, is a
-   separate RFC.
-7. **NOT the name-fix for the Valkey `claim_from_reclaim` →
-   `ff_claim_resumed_execution` mislabeling.** The existing
-   trait method name is semantically wrong (it advertises reclaim
-   and delivers resume), but renaming it is a breaking-API change
-   that's trivially scheduled as a v0.13.0 follow-up. RFC-024
-   leaves it as-is and adds the correctly-named
-   `reclaim_execution` alongside.
+1. **NOT a change to `ff_issue_claim_grant` semantics.** Fresh
+   claims stay `lifecycle_phase`-gated at `flowfabric.lua:3585`.
+   Relaxing it (cairn's Option 1 — see §7) would let a reclaim
+   masquerade as a fresh claim and skip attempt-renumbering +
+   reclaim-counter enforcement.
+2. **NOT a change to `ff_claim_resumed_execution` semantics.** The
+   suspend/resume path (attempt_interrupted → running_attempt)
+   stays as-is. RFC-024 does not unify suspend/resume with
+   lease-reclaim.
+3. **NOT a new Lua FCALL.** One existing FCALL
+   (`ff_reclaim_execution`) gains one additional ARGV for
+   configurable max-reclaim-count default threading. All other
+   FCALL shapes unchanged.
+4. **NOT a Batch-C-style reclaim scanner.** The scheduler-driven
+   periodic reclaim that would recover from worker crashes is out
+   of scope — RFC-024's surface is consumer-initiated. The Lua
+   TODO at `flowfabric.lua:3865` remains open.
+5. **NOT a merger of resume and reclaim trait methods.** The two
+   primitives have different invariants (resume re-uses attempt;
+   reclaim creates new attempt). The surface keeps them distinct
+   via two trait methods + two grant types.
+6. **NOT a `ff_exec_core.raw_fields.claim_grant` JSON removal.**
+   Migration `0015` backfills JSON → table but leaves the JSON in
+   place for one release. A follow-up migration in v0.13.0
+   strips the JSON residue once all consumers have caught up.
 
 ---
 
-## 6. Backend parity notes (required — Owner-decision #3)
+## 6. Backend parity notes
 
 ### 6.1 Divergence inventory (pre-RFC-024)
 
-| Backend  | Method                         | Primitive                                           | Gates on `lifecycle_phase`? | Bug class on #371 inputs |
-|----------|--------------------------------|-----------------------------------------------------|-----------------------------|--------------------------|
-| Valkey   | `claim_from_reclaim`           | `ff_claim_resumed_execution`                        | Gates on `attempt_interrupted` — not lease-expired | Returns `Ok(None)`; deadlock visible |
-| Postgres | `claim_from_reclaim`           | Bespoke SQL (`attempt.rs:286`)                      | No                          | Works; unsticks the execution     |
-| SQLite   | `claim_from_reclaim`           | Bespoke SQL (`backend.rs:1328`)                     | No                          | Works; matches PG                 |
+| Backend  | Method                | Primitive                        | Attempt-index on return | Reclaim count tracked? | Bug class on #371 inputs |
+|----------|-----------------------|----------------------------------|-------------------------|------------------------|--------------------------|
+| Valkey   | `claim_from_reclaim`  | `ff_claim_resumed_execution`     | Reuses (attempt_interrupted gate fails anyway) | N/A (method doesn't reach reclaim path) | Returns `Ok(None)`; deadlock |
+| Postgres | `claim_from_reclaim`  | Bespoke SQL (`attempt.rs:286`)   | Reuses `attempt_index`; bumps epoch only       | No column exists             | Works; unsticks but under resume semantics |
+| SQLite   | `claim_from_reclaim`  | Bespoke SQL (`backend.rs:1328`)  | Reuses `attempt_index`; bumps epoch only       | No column exists             | Works; matches PG |
 
-The method name is the same, the behaviour is three different
-things. Consumers testing against one backend get different
-outcomes against another. This is the "silent divergence is
-worst-class UX" failure mode.
+Same method name, three different semantics (Valkey resume-only,
+PG/SQLite epoch-bump-only reconciler). Consumers observing
+`current_attempt_index` or querying a reclaim counter get
+different answers per backend.
 
 ### 6.2 Convergence contract (post-RFC-024)
 
-| Backend  | Method                      | Primitive                                         | Behaviour on #371 inputs                                                   |
-|----------|-----------------------------|---------------------------------------------------|----------------------------------------------------------------------------|
-| Valkey   | `issue_reclaim_grant`       | `ff_issue_reclaim_grant`                          | Grants reclaim; reclaim counter bumps; consumer proceeds                    |
-| Postgres | `issue_reclaim_grant`       | New bespoke SQL (§4.2)                            | Same outcome; identical enum shape                                          |
-| SQLite   | `issue_reclaim_grant`       | New bespoke SQL (§4.3)                            | Same outcome; identical enum shape                                          |
-| Valkey   | `reclaim_execution`         | `ff_reclaim_execution`                            | Fresh attempt + fresh lease; consumer retries terminal                      |
-| Postgres | `reclaim_execution`         | New bespoke SQL (§4.2)                            | Same outcome; identical enum shape                                          |
-| SQLite   | `reclaim_execution`         | New bespoke SQL (§4.3)                            | Same outcome; identical enum shape                                          |
+| Backend  | Method                     | Primitive                                | Attempt-index | Reclaim count | Handle kind |
+|----------|----------------------------|------------------------------------------|---------------|---------------|-------------|
+| Valkey   | `claim_from_resume_grant`  | `ff_claim_resumed_execution`             | Reuses        | N/A (resume)  | `Resumed`   |
+| Postgres | `claim_from_resume_grant`  | Bespoke SQL (attempt.rs, renamed)        | Reuses        | N/A (resume)  | `Resumed`   |
+| SQLite   | `claim_from_resume_grant`  | Bespoke SQL (backend.rs, renamed)        | Reuses        | N/A (resume)  | `Resumed`   |
+| Valkey   | `issue_reclaim_grant`      | `ff_issue_reclaim_grant`                 | —             | —             | (no handle) |
+| Postgres | `issue_reclaim_grant`      | New SQL (ff_claim_grant insert)          | —             | —             | (no handle) |
+| SQLite   | `issue_reclaim_grant`      | New SQL (ff_claim_grant insert)          | —             | —             | (no handle) |
+| Valkey   | `reclaim_execution`        | `ff_reclaim_execution`                   | New (bumped)  | Bumped        | `Reclaimed` |
+| Postgres | `reclaim_execution`        | New SQL (attempt.rs)                     | New (bumped)  | Bumped        | `Reclaimed` |
+| SQLite   | `reclaim_execution`        | New SQL (backend.rs)                     | New (bumped)  | Bumped        | `Reclaimed` |
 
-All three backends deliver the same observable contract on the
-new methods at v0.12.0. RFC-018 capability snapshot test
-(`docs/POSTGRES_PARITY_MATRIX.md` updated to track
-`issue_reclaim_grant` + `reclaim_execution` rows) enforces this
-mechanically — if any backend flips its `Supports` flag to
-`false` in a future release, the test fails and the owner
-reviews.
+All three backends deliver identical observable contracts on the
+new methods at v0.12.0. No residual divergence.
 
-### 6.3 Disposition of the pre-existing `claim_from_reclaim`
-divergence
+### 6.3 Migration for existing `claim_from_reclaim` callers
 
-The three existing `claim_from_reclaim` trait implementations
-remain semantically divergent after RFC-024 ships. Options:
+The rename `claim_from_reclaim` → `claim_from_resume_grant` is a
+straight find/replace for call sites. No known production consumer
+relies on Valkey's `claim_from_reclaim` routing to
+`ff_claim_resumed_execution` for the `lease_expired_reclaimable`
+state (it returns `Ok(None)` on those inputs, indistinguishable
+from "no grant available"). PG/SQLite consumers using the method
+for suspend/resume continue to work under the renamed method.
 
-- **(a) Leave as-is, document it as a known bug, fix in
-  v0.13.0.** The Valkey impl at `lib.rs:4323` is measurably
-  wrong (advertises reclaim, delivers resume); the PG + SQLite
-  impls deliver a PG-flavoured reclaim-reconciler that has no
-  Valkey equivalent. Renaming `claim_from_reclaim` →
-  `claim_from_resume_grant` on Valkey + adding a PG/SQLite
-  reconciler for the same semantic is a separate v0.13.0 PR
-  tracked as RFC-025. No consumer break in v0.12.0.
-- **(b) Deprecate `claim_from_reclaim` on Valkey immediately
-  (v0.12.0) and remove in v0.13.0.** Reduces the window of
-  silent divergence but pays a deprecation-cycle cost for a
-  method that has no known production consumer (pre-RFC it was
-  effectively unreachable for the lease-expired-reclaimable
-  state).
-- **(c) Rename `claim_from_reclaim` → `claim_from_resume_grant`
-  on all three backends in v0.12.0 (breaking).** Fastest
-  convergence; pays a breaking-API cost in the same release
-  that already ships new breaking surface (RFC-023's
-  `ServerError` + `ServerConfig` `#[non_exhaustive]` flips).
-
-**Drafter recommendation: (a).** RFC-024 is already wide enough
-(new admin endpoint, new trait methods, new grant-kind
-discriminant); adding a breaking rename in the same release
-balloons migration impact for consumers. RFC-025 in v0.13.0
-does the rename cleanly under a focused deprecation cycle. Open
-for owner override in §7.
-
-### 6.4 Migration for existing Valkey consumers
-
-No known consumer relies on the Valkey `claim_from_reclaim`
-routing to `ff_claim_resumed_execution` for the
-lease-expired-reclaimable case — the method shape returns
-`Ok(None)` on those inputs, which is indistinguishable from "no
-reclaim grant available". Consumers using
-`claim_from_reclaim_grant` for the suspend/resume path continue
-to work unchanged because RFC-024's grant-kind dispatch (§3.4)
-uses `GrantKind::Claim` as the discriminator for the resume
-shape (the existing pre-RFC `ReclaimGrant` was semantically a
-resume grant; consumers migrate by setting
-`kind = GrantKind::Claim` on construction).
+CONSUMER_MIGRATION_0.12.md documents the rename with `cargo fix`
+guidance (`cargo +nightly fix --broken-code` handles the
+method-name change cleanly on most codebases).
 
 ---
 
@@ -746,328 +804,336 @@ resume grant; consumers migrate by setting
 
 ### 7.1 Cairn Option 1 — relax `ff_renew_lease` phase gate
 
-The consumer drafts floated allowing `renew_lease` to succeed
-when the execution is in a post-tool sub-phase but the caller
-still holds the lease. Rejected: `mark_expired` clears
-`current_lease_id`, so the subsequent `renew_lease` would fail
-on `stale_lease` before the phase gate ever fires. The bug is
-not a gate-relax problem; it is a missing-recovery-path problem.
+Consumer drafts floated allowing `renew_lease` to succeed when the
+execution is in a post-tool sub-phase but the caller still holds
+the lease. Rejected: `mark_expired` clears `current_lease_id`, so
+`renew_lease` fails on `stale_lease` before the phase gate fires.
+The bug is not a gate-relax problem; it is a missing-recovery-path
+problem.
 
 ### 7.2 Cairn Option 2 — `ff_describe_execution_phase` probe FCALL
 
-Adds a read-only FCALL that returns `lifecycle_phase` +
-`valid_operation_bitmask`. Diagnostic only — the consumer learns
-"reclaim not possible" but has no action to take. Does not unstick
-the execution. Rejected as insufficient, though potentially
-useful as a future observability addition (separate RFC).
+Read-only FCALL returning `lifecycle_phase` +
+`valid_operation_bitmask`. Diagnostic only — consumer learns
+"reclaim not possible" but has no action. Does not unstick.
+Rejected as insufficient; tracked separately as a future
+observability addition.
 
 ### 7.3 Cairn Option 3 — `ff_complete_with_reclaim` atomic FCALL
 
-A single FCALL that atomically reclaims + completes. Rejected
-as over-scoped: ~150 LOC × 3 terminal variants (complete, fail,
+Single FCALL that atomically reclaims + completes. Rejected as
+over-scoped: ~150 LOC × 3 terminal variants (complete, fail,
 cancel) + a new atomic invariant ("terminal write accepted
-post-reclaim") that has no precedent in the Lua surface. The
-two-FCALL flow (`ff_reclaim_execution` → `ff_complete_execution`)
-delivers the same outcome under a well-understood pair of
-existing invariants; the atomic version offers no semantic win
-and a substantially larger maintenance tax.
+post-reclaim") with no precedent. The two-FCALL flow
+(`ff_reclaim_execution` → `ff_complete_execution`) delivers the
+same outcome under existing invariants.
 
-### 7.4 Rename `claim_from_reclaim` on Valkey now
+**Two-FCALL timing window.** The reclaim issues a fresh lease at
+the default TTL (30s+ in typical configurations); the operator
+gap between `reclaim_execution` and `complete_execution` in
+cairn's flow is sub-100ms (the two happen in-process after the
+reclaim succeeds, before returning the HTTP response). The timing
+window is orders-of-magnitude smaller than #371's original gap
+class (30s+ operator waits). No `ff_complete_with_reclaim`
+atomicity needed in practice; the RFC documents this assumption
+so future scheduler changes that lengthen the gap re-evaluate.
 
-Discussed in §6.3. Rejected for v0.12.0 scope reasons.
+### 7.4 Extend `ff_issue_claim_grant` input predicate
 
-### 7.5 Merge `ClaimGrant` and `ReclaimGrant` into one `Grant`
-sum type
+Reviewer C asked whether `ff_issue_claim_grant` could accept a
+flag (`allow_reclaim: true`) to serve both admission paths from
+one FCALL. Rejected: grant-issuance already gates on
+`lifecycle_phase`, and reclaim consumption is semantically
+distinct (new attempt + reclaim_count bump vs. fresh attempt).
+Collapsing them conflates the admission predicates and forces the
+consuming FCALL (`ff_claim_execution` vs. `ff_reclaim_execution`)
+to branch on grant metadata — which is exactly the runtime-
+dispatch shape Rev-2 rejected with the two-types decision (§3.1).
 
-Discussed in §3.3. Rejected as a breaking-API change that would
-ripple through every worker consumer. The `kind` discriminant
-on both existing types delivers the same classification surface
-additively.
+### 7.5 Merge `ClaimGrant` and new `ReclaimGrant` into one sum type
 
-### 7.6 Expose `max_reclaim_count` as only a per-execution
-policy override (not per-call arg)
+A single `enum Grant { Claim(...), Reclaim(...) }`. Rejected: the
+fresh-claim path does not carry `lane_id` (the caller has it
+separately); the reclaim path needs `lane_id` on the grant for the
+FCALL's KEYS construction. A sum type with divergent
+variants-shape is uglier than two types; consumers who want a
+single match site at dispatch can wrap them in a crate-local enum.
 
-The Lua primitive already supports per-execution policy
-override. Rejected as sole surface: per-execution policy
-requires the consumer to write the policy before issuing the
-grant, which adds a round-trip and couples reclaim posture to
-execution creation. Per-call arg (with per-execution override
-still supported on the Lua side) is the ergonomic win.
+### 7.6 Keep Rev-1 `GrantKind` discriminant on a single `ReclaimGrant`
 
-### 7.7 Default `max_reclaim_count = 100` (Lua-parity)
+Rev-1's shape. Rejected for Rev-2 per change #1 of the revision
+changelog: the naming inversion (existing `ReclaimGrant` is
+semantically a resume grant) would propagate forever; fixing it in
+v0.13.0 is twice the migration pain and reviewer A/C consensus
+was that the rename should happen in the same PR as the new type.
 
-Discussed in §Owner-decisions + §4.6. Rejected — silent
-deadlock trap for pull-mode consumers.
+### 7.7 `max_reclaim_count = 100` default at Rust surface (Lua-parity)
+
+Rev-1's default. Rejected — silent deadlock trap for pull-mode
+consumers per §4.6.
+
+### 7.8 Defer SQLite to v0.12.1
+
+Rejected by owner decision #3 (revision changelog). All three
+backends ship in v0.12.0.
 
 ---
 
 ## 8. Migration impact (consumer-facing)
 
-**Mostly additive, with two minor breaking changes on the existing
-grant types (`ClaimGrant` + `ReclaimGrant` gain a `kind` field).**
-
 ### 8.1 Unchanged
 
-- Every v0.11.0 behaviour for Valkey + Postgres + SQLite on the
-  existing trait surface. No pre-RFC call shape changes
-  observable outcome.
+- Every v0.11.0 behaviour for Valkey + Postgres + SQLite on
+  surfaces not touched by RFC-024.
 - `ff_issue_claim_grant` + `ff_claim_execution` +
   `ff_claim_resumed_execution` Lua semantics unchanged.
-- Postgres `claim_from_reclaim` (internal reconciler path at
-  `attempt.rs:286`) unchanged.
-- SQLite `claim_from_reclaim` (matches PG) unchanged.
+- The pre-RFC `claim_from_reclaim` semantic is preserved under the
+  new name `claim_from_resume_grant` on all three backends.
 
 ### 8.2 Breaking at v0.12.0
 
-1. **`ClaimGrant` + `ReclaimGrant` gain a `kind: GrantKind`
-   field.** The types are not `#[non_exhaustive]` today
-   (`contracts/mod.rs:110` + `:186`). Consumers constructing via
-   struct literal (no known production consumer — both types are
-   minted by `ff-scheduler` / `ff-sdk` and consumed, not hand-
-   constructed) must either add `kind: GrantKind::Claim` /
-   `kind: GrantKind::Reclaim` explicitly, or the RFC adds a
-   `Default` impl for `GrantKind` that returns
-   `GrantKind::Claim` (preserving pre-RFC semantics under
-   `..Default::default()` spread).
-
-   Both types gain `#[non_exhaustive]` in the same v0.12.0 PR —
-   the attribute addition is paired with the field addition per
-   the RFC-023 §8 precedent (own the break once, lock in the
-   long-term shape).
+1. **`ReclaimGrant` renamed to `ResumeGrant`.** Use-site rename in
+   consumer code. `cargo fix` candidate. Type fields unchanged.
+   `ReclaimToken` (`ff-core::backend::ReclaimToken`) renamed to
+   `ResumeToken` for consistency.
+2. **Trait method `claim_from_reclaim` renamed to
+   `claim_from_resume_grant`** on `EngineBackend`. Every backend
+   impl updates the method name. Consumers of the
+   `FlowFabricWorker::claim_from_reclaim_grant` SDK method migrate
+   to `claim_from_resume_grant` (pre-RFC the SDK method always
+   dispatched to the resume path; the name matches the semantic
+   post-rename).
+3. **`ReclaimExecutionArgs.max_reclaim_count` type change**:
+   `u32` → `Option<u32>`. Existing callers passing an explicit
+   value wrap in `Some(...)`; callers wanting defaults pass
+   `None`. Wire shape unchanged under `#[serde(default)]`.
+4. **`IssueReclaimGrantArgs` gains `#[non_exhaustive]` +
+   constructor.** Adds `worker_capabilities: BTreeSet<String>`
+   field. No known production consumer (no pre-RFC Rust caller —
+   test fixtures only).
+5. **`ClaimGrant` + `ResumeGrant` + `ReclaimGrant` gain
+   `#[non_exhaustive]`.** Struct-literal construction migrates to
+   `::new()` constructors (all three types gain explicit
+   constructors in this PR per `feedback_non_exhaustive_needs_constructor`).
+6. **`HandleKind::Reclaimed` variant added.** Enum is already
+   `#[non_exhaustive]`; additive but downstream exhaustive
+   matches add an arm.
+7. **`ReclaimExecutionOutcome` + `IssueReclaimGrantOutcome` are
+   new enums, both `#[non_exhaustive]`** with explicit
+   constructor pattern (no `::new()` needed — variants are the
+   construction surface; consumers match, not construct).
+8. **Migration `0015_claim_grant_table.sql` on PG + SQLite.**
+   Applied on startup per existing migration runner. Backfills
+   existing JSON-stashed claim grants; adds
+   `lease_reclaim_count` column to `ff_exec_core`.
 
 ### 8.3 Additive (non-breaking)
 
-2. **New trait methods** (`issue_reclaim_grant`,
+1. **New trait methods** (`issue_reclaim_grant`,
    `reclaim_execution`) with default impls returning
-   `Unavailable`. Pre-RFC out-of-tree backends keep compiling;
-   in-tree backends override.
-3. **New admin endpoint** `POST /v1/executions/{id}/reclaim` and
-   matching `FlowFabricAdminClient::issue_reclaim_grant` SDK
-   method. No change to existing endpoints.
-4. **New `max_reclaim_count: Option<u32>` field** on
-   `IssueReclaimGrantArgs`. The struct is not `#[non_exhaustive]`
-   today either (`contracts/mod.rs:512`) but is serde-based with
-   every field `#[serde(default)]` or explicitly settable; the
-   new field carries `#[serde(default)]` and is absent from pre-
-   RFC serialized forms. `IssueReclaimGrantArgs` also gains
-   `#[non_exhaustive]` in this PR — the struct has no known
-   production consumer (it's only now being wired to the trait
-   surface).
-5. **New `Supports::issue_reclaim_grant: bool` flag** on the
+   `Unavailable`. Pre-RFC out-of-tree backends keep compiling.
+2. **New admin endpoint** `POST /v1/executions/{id}/reclaim` +
+   matching SDK method. No change to existing endpoints.
+3. **New `Supports::issue_reclaim_grant: bool` flag** on the
    RFC-018 capability matrix. Default `false`; in-tree backends
    set `true`.
-6. **Lua `ff_reclaim_execution` gains one additional ARGV
-   (`default_max_reclaim_count`) threaded from the Rust
-   surface.** Backwards-compatible — Lua reads `ARGV[9]` with a
-   `or "100"` fallback so pre-RFC call sites (if any existed)
-   still parse. In-tree RFC-024 callers pass the new ARGV;
-   out-of-tree Lua callers (none known) are unaffected.
+4. **Lua `ff_reclaim_execution` gains `ARGV[9] =
+   default_max_reclaim_count`.** Backwards-compatible — Lua reads
+   with `or "100"` fallback so pre-RFC call sites (no known
+   production callers) still parse.
 
 ### 8.4 Consumer migration path (cairn example)
 
 1. `cargo update -p flowfabric` to v0.12.0.
-2. Detect `capabilities().supports.issue_reclaim_grant == true`
-   at connect time.
-3. On `lease_expired` class from
-   `POST /v1/runs/:id/complete`: call
-   `admin.issue_reclaim_grant(req).await?` (new) instead of
-   falling through to the existing `ff_issue_grant`
-   claim-retry path.
-4. On `Granted(grant)` response: call
-   `worker.claim_from_reclaim_grant(grant).await?` (existing
-   shape; dispatches to `reclaim_execution` internally because
-   `grant.kind == GrantKind::Reclaim`).
-5. On `NotReclaimable` / `ReclaimCapExceeded`: classify and
+2. `cargo fix` for `ReclaimGrant` → `ResumeGrant` +
+   `claim_from_reclaim_grant` SDK call → `claim_from_resume_grant`
+   where applicable.
+3. Detect `capabilities().supports.issue_reclaim_grant == true` at
+   connect time.
+4. On `lease_expired` class from `POST /v1/runs/:id/complete`:
+   call `admin.issue_reclaim_grant(req).await?` (new) instead of
+   falling through to the existing `ff_issue_grant` claim-retry
+   path.
+5. On `Granted(grant)` response: call
+   `worker.claim_from_reclaim_grant(grant).await?` (new shape).
+6. On `NotReclaimable` / `ReclaimCapExceeded`: classify and
    terminal-log; do not retry.
-6. Remove the existing `F64 bridge-retry` classifier's
-   pattern-match on `lease_expired + execution_not_eligible`
-   string codes — the new flow produces structured outcomes.
-
-Cairn's in-tree `F64 bridge retry loop` at
-`cairn-rs/.../f64_bridge.rs` (marked `remove once FF#371 ships`
-per the consumer drafts) retires in the same migration PR.
-`docs/CONSUMER_MIGRATION_0.12.md` adds the §"RFC-024 reclaim
-wiring" section documenting this sequence.
-
-### 8.5 Struct-literal `ClaimGrant` / `ReclaimGrant`
-construction
-
-If a consumer DOES hand-construct either type, the migration is
-a one-line addition:
-
-```rust
-// before
-let grant = ClaimGrant {
-    execution_id, partition_key, grant_key, expires_at_ms,
-};
-
-// after v0.12.0
-let grant = ClaimGrant {
-    execution_id, partition_key, grant_key, expires_at_ms,
-    kind: GrantKind::Claim, // or GrantKind::Reclaim
-};
-```
-
-Both types also gain `#[non_exhaustive]` so future additions
-don't re-break consumers.
+7. Remove the existing `F64 bridge retry loop` at
+   `cairn-rs/.../f64_bridge.rs` (marked `remove once FF#371 ships`
+   per the consumer drafts).
+8. `docs/CONSUMER_MIGRATION_0.12.md` §"RFC-024 reclaim wiring"
+   documents this sequence.
 
 ---
 
 ## 9. Release readiness (hard gates)
 
 All of the following must be satisfied before v0.12.0 ships.
-RFC-024 ships in the same release as RFC-023; the release gate
-is joint.
+RFC-024 ships joint with RFC-023 (SQLite).
 
-- [ ] All three backends (Valkey, Postgres, SQLite) implement
-      `issue_reclaim_grant` + `reclaim_execution` and pass the
-      RFC-018 capability-matrix snapshot test with
+- [ ] All three backends implement `issue_reclaim_grant` +
+      `reclaim_execution` + `claim_from_resume_grant` (rename),
+      and pass the RFC-018 capability-matrix snapshot test with
       `supports.issue_reclaim_grant = true`.
-- [ ] `ff-test` suite extended with a deadlock-repro scenario
-      (drives the #371 repro shape: long gaps between
-      `complete_run` attempts, 50-iter run, 30s TTL) on all
-      three backends. Pre-RFC: the scenario deadlocks on
-      Valkey, unsticks on PG/SQLite. Post-RFC: the scenario
-      recovers via the new endpoint on all three with identical
-      observable outcomes.
+- [ ] Constructors landed in the same PR as each type gaining
+      `#[non_exhaustive]`: `ClaimGrant::new`, `ResumeGrant::new`,
+      `ReclaimGrant::new`, `IssueReclaimGrantArgs::new`,
+      `ReclaimExecutionArgs::new` (per
+      `feedback_non_exhaustive_needs_constructor`).
+- [ ] Migrations `0015_claim_grant_table.sql` applied on PG +
+      SQLite: fresh DB creates clean, existing DB with JSON-
+      stashed grants backfills cleanly, `lease_reclaim_count`
+      column populated with 0 on existing rows.
+- [ ] Scheduler.rs (PG) read/write/delete paths flipped to
+      `ff_claim_grant` table; three JSON sites (`scheduler.rs:35,
+      252, 377`) updated; existing integration tests green.
+- [ ] `ff-test` suite extended with a #371 deadlock-repro scenario
+      on all three backends: pre-RFC deadlocks on Valkey +
+      PG/SQLite divergent attempt_index; post-RFC all three
+      recover via new endpoint with identical
+      `current_attempt_index = N+1` + `lease_reclaim_count = 1`.
+- [ ] Per-backend reclaim-cap test: reclaim counter hits the
+      default (1000) and returns
+      `ReclaimCapExceeded { reclaim_count: 1000 }` on all three
+      backends; execution transitions to terminal_failed.
 - [ ] Cairn-fabric integration test migrates from the `F64
       bridge retry` shape to the new `issue_reclaim_grant` shape;
       PR merged into cairn-rs tree.
-- [ ] `docs/POSTGRES_PARITY_MATRIX.md` gains two rows
-      (`issue_reclaim_grant`, `reclaim_execution`) with all
-      three backends marked `supported` at v0.12.0.
+- [ ] `docs/POSTGRES_PARITY_MATRIX.md` gains three rows
+      (`issue_reclaim_grant`, `reclaim_execution`,
+      `claim_from_resume_grant`) with all three backends marked
+      `supported` at v0.12.0.
 - [ ] `docs/CONSUMER_MIGRATION_0.12.md` §"RFC-024 reclaim
-      wiring" section written, reviewed, and linked from
-      CHANGELOG.
-- [ ] `CHANGELOG.md [Unreleased] ### Added`: new trait methods,
-      new admin endpoint, new SDK method, new `GrantKind` enum,
-      new `Supports::issue_reclaim_grant` flag.
-      `### Changed`: `ClaimGrant` + `ReclaimGrant` +
-      `IssueReclaimGrantArgs` gain `#[non_exhaustive]`; both
-      grant types gain `kind` field.
-- [ ] `scripts/smoke-sqlite.sh` + the SQLite scenario in
-      `scripts/published-smoke.sh` extended with a reclaim
-      round-trip (issue grant → reclaim execution → complete
-      on the fresh lease). Must pass before tag (per
+      wiring" section includes: (a) type renames (ReclaimGrant →
+      ResumeGrant, new ReclaimGrant), (b) trait/SDK method
+      renames, (c) `max_reclaim_count` Option<u32> migration,
+      (d) new non_exhaustive constructors usage, (e) new
+      HandleKind::Reclaimed arm, (f) `cargo fix` guidance.
+- [ ] `CHANGELOG.md [Unreleased]`: `### Added` (new trait methods,
+      new admin endpoint, new SDK method, new `ReclaimGrant`,
+      new `HandleKind::Reclaimed`, new `Supports::issue_reclaim_grant`
+      flag, migration 0015). `### Changed` (ReclaimGrant →
+      ResumeGrant rename, claim_from_reclaim →
+      claim_from_resume_grant rename, ReclaimExecutionArgs
+      max_reclaim_count `u32` → `Option<u32>`, `#[non_exhaustive]`
+      on grant types + args).
+- [ ] `scripts/smoke-sqlite.sh` + SQLite scenario in
+      `scripts/published-smoke.sh` extended with reclaim
+      round-trip (issue grant → reclaim execution → complete on
+      the fresh lease). Must pass before tag (per
       `feedback_smoke_before_release`).
 - [ ] `scripts/smoke-v0.7.sh` or successor extended with the
       same reclaim round-trip against Valkey + Postgres.
-- [ ] Per-backend integration test: reclaim counter hits the
-      default (1000) and returns
-      `ReclaimCapExceeded { reclaim_count: 1000 }` on all
-      three backends; execution transitions to
-      terminal_failed as the Lua primitive + PG/SQLite ports
-      enforce.
-- [ ] `examples/` gets a new `reclaim-pull-mode/` example
-      (~150 LOC per CLAUDE.md §5) demonstrating the cairn
-      pull-mode recovery flow end-to-end. This is the new-
-      example requirement for v0.12.0 headlines.
-- [ ] RFC-018 capability snapshot JSON regenerated on the three
+- [ ] `examples/reclaim-pull-mode/` (~150 LOC per CLAUDE.md §5)
+      demonstrating the cairn pull-mode recovery flow
+      end-to-end. This is the new-example requirement for
+      v0.12.0 headlines.
+- [ ] RFC-018 capability snapshot JSON regenerated on all three
       in-tree backends.
 - [ ] `release.yml` + `release.toml` + `RELEASING.md` — no new
-      publishable crate is introduced by this RFC, so the
-      publish-list is unchanged. Confirmed in the release PR
-      body.
+      publishable crate introduced by RFC-024; publish-list
+      unchanged. Confirmed in the release PR body.
 
-Per `feedback_smoke_before_release`: smoke runs before tag,
-never after.
+PR partitioning (owner decision: multiple PRs allowed; all merge
+before tag):
+
+1. PR-A — RFC acceptance (doc-only).
+2. PR-B — type renames (ReclaimGrant → ResumeGrant, ReclaimToken
+   → ResumeToken); trait method rename; SDK method rename.
+   No behaviour change; compile-break only.
+3. PR-C — new grant types + non_exhaustive + constructors; new
+   trait methods with default-Unavailable impls.
+4. PR-D — Postgres migration 0015 + scheduler.rs table flip +
+   new method impls.
+5. PR-E — SQLite migration 0015 + new method impls.
+6. PR-F — Valkey Lua ARGV[9] + new method impls + ReclaimExecutionArgs
+   `max_reclaim_count: Option<u32>`.
+7. PR-G — SDK admin endpoint + consumer example + docs + RFC-018
+   capability flag + migration doc.
+8. PR-H — Cairn-rs consumer-side migration (upstreamed to
+   cairn-rs).
+
+Smoke gate runs against the sum of PR-B through PR-G merged to
+main before tag.
 
 ---
 
 ## 10. Maintenance tax commitment
 
-- **Two new trait methods** on `EngineBackend`. Every future
-  backend adds two impls; RFC-018 flags make the cost
-  machine-checkable.
-- **One new admin HTTP route** with a new body shape. Standard
-  ff-server route-table addition; no new auth posture (inherits
-  existing admin-bearer).
-- **One additional ARGV on `ff_reclaim_execution`.** Trivial;
-  the Lua primitive already had the framework for it (policy
-  override path).
-- **One `kind` field on each grant type.** Trivial on
-  consumers once migrated; the migration pain is one-time.
-- **Cross-backend reclaim-semantic divergence** (§6.1) does
-  NOT retire under RFC-024 alone — the existing
-  `claim_from_reclaim` stays as-is per §6.3 disposition (a).
-  RFC-025 in v0.13.0 retires it cleanly. Interim maintenance
-  cost: the RFC-018 matrix has two method rows ("reclaim-via-
-  grant" and "reclaim-via-reconciler") until RFC-025 collapses
-  them.
-- **Documentation drift.** Three docs paths carry RFC-024
-  references: `POSTGRES_PARITY_MATRIX.md`,
-  `CONSUMER_MIGRATION_0.12.md`, CHANGELOG. Any future rename /
-  shape change sweeps all three.
+| Item | Tax |
+|------|-----|
+| Two new trait methods on `EngineBackend` | Every new backend adds two impls; RFC-018 flags keep the cost machine-checkable. |
+| One new admin HTTP route | Standard ff-server route-table addition; no new auth posture. |
+| One new Lua ARGV on `ff_reclaim_execution` | Trivial; Lua already had the policy-override framework. |
+| One new SQL table on PG + SQLite | Migration 0015; one follow-up (v0.13.0 migration 0017) to strip the JSON residue from `raw_fields.claim_grant`. |
+| Two grant types replacing one | Constructor plumbing in each type; no ongoing cost after landing. |
 
-Owner has implicitly accepted this tax via the four
-Owner-decisions at the head. This section is the honest ledger.
+Owner has accepted this tax per the four locked decisions at the
+head. Cross-backend reclaim-semantic divergence (§6.1) retires
+completely post-RFC-024 — no deferred convergence work.
 
 ---
 
-## 11. Open questions (genuine forks for owner adjudication)
+## 11. Residual forks
 
-Two remain after the drafter's investigation + the four Owner-
-decisions already folded.
+None. All Rev-1 forks resolved by the four owner decisions
+applied in Rev-2:
 
-### 11.1 §6.3 — disposition of the existing `claim_from_reclaim`
-Valkey-vs-PG divergence
+- §6.3 disposition of `claim_from_reclaim` — resolved to option
+  (c) (rename in v0.12.0) per decision #1.
+- `GrantKind::Default` — moot; `GrantKind` removed per decision
+  reinforced by reviewers A-B6 + C framing.
+- SQLite deferral — resolved to in-wave per decision #3.
+- PR partitioning — resolved to multi-PR per decision #4.
 
-Three options (a / b / c) enumerated in §6.3. Drafter
-recommends **(a)** — leave as-is, retire in RFC-025 under a
-focused deprecation cycle. Open for owner override; (c) is
-viable if the owner prefers a single breaking release.
-
-### 11.2 `GrantKind::Default` — `Claim` or require explicit?
-
-Per §8.2 / §8.5, an `impl Default for GrantKind` returning
-`GrantKind::Claim` makes struct-literal consumers
-migrate via `..Default::default()` spread instead of an
-explicit field addition. Trade-off:
-
-- **A — `Default = Claim`.** Non-breaking for struct-literal
-  consumers under the spread pattern; but hides the grant-kind
-  decision from new code, which is exactly the discriminant the
-  RFC wants consumers to think about.
-- **B — No `Default` impl.** Consumers must set `kind`
-  explicitly; compile error pinpoints every construction site.
-  Slightly more migration pain; better ergonomics long-term.
-
-Drafter recommends **B** — the whole point of the
-discriminant is to force consumers to reason about which path
-they're on. Open for owner override.
+Any new factual gap surfacing during implementation STOPS the
+RFC acceptance + reports back; Rev-2 does not pre-authorize
+further drift.
 
 ---
 
 ## 12. References
 
-- Issue **#371** — tracking (pull-mode deadlock repro shape)
-- **RFC-023** (SQLite dev-only backend, v0.12.0 wave, accepted
-  2026-04-26) — release co-wave
-- **RFC-020** (Postgres Wave 9, shipped v0.11.0 2026-04-26) —
-  `claim_from_reclaim` reconciler precedent
+- Issue **#371** — tracking (pull-mode deadlock repro)
+- **RFC-023** (SQLite dev-only backend, v0.12.0 wave) — release
+  co-wave
+- **RFC-020** (Postgres Wave 9, v0.11.0) — `claim_from_reclaim`
+  reconciler precedent (renamed in RFC-024)
+- **RFC-019** lease events — `reclaimed` event emitted by new
+  path
 - **RFC-018** capability discovery — new flag target
 - **RFC-017** ff-server backend abstraction — trait surface
   precedent
 - `crates/ff-script/src/flowfabric.lua:2985` —
   `ff_reclaim_execution` Lua primitive
-- `crates/ff-script/src/flowfabric.lua:3898` —
-  `ff_issue_reclaim_grant` Lua primitive
+- `crates/ff-script/src/flowfabric.lua:3036` — Lua
+  `max_reclaim = 100` fallback
+- `crates/ff-script/src/flowfabric.lua:3088` — Lua grant
+  `worker_id` match (no worker_instance_id check)
 - `crates/ff-script/src/flowfabric.lua:3585` — the
-  `execution_not_eligible` gate that the pull-mode flow
-  currently hits
-- `crates/ff-backend-valkey/src/lib.rs:4323` — existing
-  Valkey `claim_from_reclaim` (routes to resume path, bug)
+  `execution_not_eligible` gate that pull-mode currently hits
+- `crates/ff-script/src/flowfabric.lua:3898` —
+  `ff_issue_reclaim_grant`
+- `crates/ff-backend-valkey/src/lib.rs:4323` — existing Valkey
+  `claim_from_reclaim` (renames to `claim_from_resume_grant`)
 - `crates/ff-backend-postgres/src/attempt.rs:286-396` — PG
-  reconciler `claim_from_reclaim` (no lifecycle gate)
-- `crates/ff-backend-sqlite/src/backend.rs:1328-1430` —
-  SQLite Phase 2a.3 `claim_from_reclaim`
-- `crates/ff-core/src/contracts/mod.rs:512` —
-  `IssueReclaimGrantArgs` (existing, extended Rev-1)
+  reconciler `claim_from_reclaim` (renames;
+  `attempt_index`-preserving + epoch-bump semantics preserved
+  under new name)
+- `crates/ff-backend-postgres/src/scheduler.rs:35,252,377` — PG
+  JSON-stashed `claim_grant` sites flipping to the new
+  `ff_claim_grant` table
+- `crates/ff-backend-sqlite/src/backend.rs:1328-1430` — SQLite
+  Phase 2a.3 `claim_from_reclaim` (renames)
 - `crates/ff-core/src/contracts/mod.rs:110,186` — `ClaimGrant`
-  + `ReclaimGrant` types (both gain `kind` field)
-- `crates/ff-sdk/src/admin.rs:125-201` — `claim_for_worker`
-  SDK precedent (route shape, error classification)
-- Cairn-rs consumer drafts under
-  `docs/design/ff-upstream/` — ff-lease-renewal-pull-mode.md,
-  ff-renew-lease-mid-approval.md, ff-execution-phase-probe.md,
-  ff-complete-run-lease-semantics.md
+  + `ReclaimGrant` (renaming to `ResumeGrant`) types
+- `crates/ff-core/src/contracts/mod.rs:512` —
+  `IssueReclaimGrantArgs` (extended)
+- `crates/ff-core/src/contracts/mod.rs:540-570` —
+  `ReclaimExecutionArgs` (`max_reclaim_count` flips to
+  `Option<u32>`)
+- `crates/ff-core/src/backend.rs:102` — `HandleKind` enum
+  (gains `Reclaimed` variant)
+- `crates/ff-sdk/src/admin.rs:125-201` — `claim_for_worker` SDK
+  precedent for new endpoint shape
+- Cairn-rs consumer drafts under `docs/design/ff-upstream/`
