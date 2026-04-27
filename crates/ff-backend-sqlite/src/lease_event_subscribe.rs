@@ -54,9 +54,12 @@ pub(crate) async fn subscribe(
     cursor: StreamCursor,
     filter: ScannerFilter,
 ) -> Result<LeaseHistorySubscription, EngineError> {
-    let start = decode_postgres_event_cursor(&cursor).map_err(|msg| EngineError::Validation {
+    // See completion_subscribe::subscribe — rewrite the underlying
+    // Postgres-branded detail so SQLite callers see a backend-fit
+    // message.
+    let start = decode_postgres_event_cursor(&cursor).map_err(|_| EngineError::Validation {
         kind: ValidationKind::InvalidInput,
-        detail: msg.to_string(),
+        detail: "invalid event_id cursor for sqlite.subscribe_lease_history".into(),
     })?;
 
     let last_seen: i64 = match start {
@@ -122,12 +125,20 @@ fn decode_row(
             detail: format!("event_id: {e}"),
         })?;
 
+    // Type-mismatch on denormalised filter columns is schema
+    // corruption, not a legitimate NULL; surface loudly.
     let namespace: Option<String> = row
         .try_get::<Option<String>, _>("namespace")
-        .unwrap_or(None);
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("namespace: {e}"),
+        })?;
     let instance_tag: Option<String> = row
         .try_get::<Option<String>, _>("instance_tag")
-        .unwrap_or(None);
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("instance_tag: {e}"),
+        })?;
     if !passes_filter(filter, namespace.as_deref(), instance_tag.as_deref()) {
         return Ok(None);
     }
@@ -144,17 +155,14 @@ fn decode_row(
             kind: ValidationKind::Corruption,
             detail: format!("partition_key: {e}"),
         })?;
-    let exec_uuid = match Uuid::parse_str(&exec_text) {
-        Ok(u) => u,
-        Err(_) => {
-            tracing::warn!(
-                execution_id = %exec_text,
-                event_id = event_id,
-                "sqlite.lease_history: skipping row with unparseable execution_id"
-            );
-            return Ok(None);
-        }
-    };
+    // Producers always write a parseable UUID into `execution_id`; an
+    // unparseable value is storage-level corruption, not an
+    // operational skip. Surface `Corruption` so the subscriber fails
+    // loudly rather than silently dropping state transitions.
+    let exec_uuid = Uuid::parse_str(&exec_text).map_err(|e| EngineError::Validation {
+        kind: ValidationKind::Corruption,
+        detail: format!("ff_lease_event.execution_id parse '{exec_text}': {e}"),
+    })?;
     let execution_id = ExecutionId::parse(&format!("{{fp:{partition_key}}}:{exec_uuid}"))
         .map_err(|e| EngineError::Validation {
             kind: ValidationKind::Corruption,
@@ -163,10 +171,20 @@ fn decode_row(
 
     let lease_id_str: Option<String> = row
         .try_get::<Option<String>, _>("lease_id")
-        .unwrap_or(None);
-    let lease_id = lease_id_str
-        .as_deref()
-        .and_then(|s| LeaseId::parse(s).ok());
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("lease_id column: {e}"),
+        })?;
+    // A present-but-malformed `lease_id` is schema corruption, not a
+    // legitimate absent value — surface via `?` instead of dropping
+    // the parse error.
+    let lease_id = match lease_id_str.as_deref() {
+        Some(s) => Some(LeaseId::parse(s).map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("lease_id parse '{s}': {e}"),
+        })?),
+        None => None,
+    };
 
     let event_type: String = row
         .try_get("event_type")

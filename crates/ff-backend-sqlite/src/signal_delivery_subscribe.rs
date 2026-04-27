@@ -49,9 +49,11 @@ pub(crate) async fn subscribe(
     cursor: StreamCursor,
     filter: ScannerFilter,
 ) -> Result<SignalDeliverySubscription, EngineError> {
-    let start = decode_postgres_event_cursor(&cursor).map_err(|msg| EngineError::Validation {
+    // Rewrite the underlying Postgres-branded cursor-decode detail so
+    // SQLite callers see a backend-appropriate message.
+    let start = decode_postgres_event_cursor(&cursor).map_err(|_| EngineError::Validation {
         kind: ValidationKind::InvalidInput,
-        detail: msg.to_string(),
+        detail: "invalid event_id cursor for sqlite.subscribe_signal_delivery".into(),
     })?;
 
     let last_seen: i64 = match start {
@@ -117,12 +119,20 @@ fn decode_row(
             detail: format!("event_id: {e}"),
         })?;
 
+    // Type-mismatch on denormalised filter columns is schema
+    // corruption, not a legitimate NULL — surface loudly.
     let namespace: Option<String> = row
         .try_get::<Option<String>, _>("namespace")
-        .unwrap_or(None);
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("namespace: {e}"),
+        })?;
     let instance_tag: Option<String> = row
         .try_get::<Option<String>, _>("instance_tag")
-        .unwrap_or(None);
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("instance_tag: {e}"),
+        })?;
     if !passes_filter(filter, namespace.as_deref(), instance_tag.as_deref()) {
         return Ok(None);
     }
@@ -139,17 +149,12 @@ fn decode_row(
             kind: ValidationKind::Corruption,
             detail: format!("partition_key: {e}"),
         })?;
-    let exec_uuid = match Uuid::parse_str(&exec_text) {
-        Ok(u) => u,
-        Err(_) => {
-            tracing::warn!(
-                execution_id = %exec_text,
-                event_id = event_id,
-                "sqlite.signal_delivery: skipping row with unparseable execution_id"
-            );
-            return Ok(None);
-        }
-    };
+    // Unparseable execution_id is storage-level corruption — fail
+    // loudly rather than silently skip the state transition.
+    let exec_uuid = Uuid::parse_str(&exec_text).map_err(|e| EngineError::Validation {
+        kind: ValidationKind::Corruption,
+        detail: format!("ff_signal_event.execution_id parse '{exec_text}': {e}"),
+    })?;
     let execution_id = ExecutionId::parse(&format!("{{fp:{partition_key}}}:{exec_uuid}"))
         .map_err(|e| EngineError::Validation {
             kind: ValidationKind::Corruption,
@@ -161,27 +166,31 @@ fn decode_row(
             kind: ValidationKind::Corruption,
             detail: format!("signal_id: {e}"),
         })?;
-    let signal_id = match SignalId::parse(&signal_id_text) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                event_id = event_id,
-                "sqlite.signal_delivery: skipping row with bad signal_id"
-            );
-            return Ok(None);
-        }
-    };
+    let signal_id = SignalId::parse(&signal_id_text).map_err(|e| EngineError::Validation {
+        kind: ValidationKind::Corruption,
+        detail: format!("signal_id parse '{signal_id_text}': {e}"),
+    })?;
 
     let waitpoint_text: Option<String> = row
         .try_get::<Option<String>, _>("waitpoint_id")
-        .unwrap_or(None);
-    let waitpoint_id = waitpoint_text
-        .as_deref()
-        .and_then(|s| WaitpointId::parse(s).ok());
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("waitpoint_id column: {e}"),
+        })?;
+    // Present-but-malformed waitpoint_id is corruption, not absence.
+    let waitpoint_id = match waitpoint_text.as_deref() {
+        Some(s) => Some(WaitpointId::parse(s).map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("waitpoint_id parse '{s}': {e}"),
+        })?),
+        None => None,
+    };
     let source_identity: Option<String> = row
         .try_get::<Option<String>, _>("source_identity")
-        .unwrap_or(None);
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("source_identity: {e}"),
+        })?;
     let delivered_at_ms: i64 =
         row.try_get("delivered_at_ms")
             .map_err(|e| EngineError::Validation {

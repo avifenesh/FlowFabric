@@ -73,9 +73,13 @@ pub(crate) async fn subscribe(
     cursor: StreamCursor,
     filter: ScannerFilter,
 ) -> Result<CompletionSubscription, EngineError> {
-    let start = decode_postgres_event_cursor(&cursor).map_err(|msg| EngineError::Validation {
+    // The underlying codec message names the Postgres family because
+    // SQLite reuses the `0x02` prefix; rewrite the detail so SQLite
+    // callers see a backend-appropriate hint instead of a confusing
+    // cross-backend name.
+    let start = decode_postgres_event_cursor(&cursor).map_err(|_| EngineError::Validation {
         kind: ValidationKind::InvalidInput,
-        detail: msg.to_string(),
+        detail: "invalid event_id cursor for sqlite.subscribe_completion".into(),
     })?;
 
     // Empty cursor → tail from `max(event_id)` at subscribe time. This
@@ -149,13 +153,21 @@ fn decode_row(
         })?;
 
     // Denormalised filter columns. NULL never matches a non-None
-    // filter dimension — parity with PG + Valkey.
+    // filter dimension — parity with PG + Valkey. A type-mismatch on
+    // these TEXT columns is a schema-level corruption surface, not a
+    // null; propagate as `Corruption` rather than silently defaulting.
     let namespace: Option<String> = row
         .try_get::<Option<String>, _>("namespace")
-        .unwrap_or(None);
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("namespace: {e}"),
+        })?;
     let instance_tag: Option<String> = row
         .try_get::<Option<String>, _>("instance_tag")
-        .unwrap_or(None);
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("instance_tag: {e}"),
+        })?;
     if !passes_filter(filter, namespace.as_deref(), instance_tag.as_deref()) {
         return Ok(None);
     }

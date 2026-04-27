@@ -496,11 +496,13 @@ async fn subscribe_signal_delivery_filter_by_instance_tag() {
 // ── lagged-broadcast recovery (shared) ────────────────────────────────
 //
 // Overwhelm the broadcast channel's 256-slot ring by producing a batch
-// of events with the subscriber task stalled; when it polls, `RecvError::Lagged`
-// fires and the cursor-select fallback catches every missed row via the
-// durable outbox. `subscribe_signal_delivery` is exercised because the
-// producer path is self-contained (no ff_exec_core hot-path dependence
-// beyond what `create_and_claim_tagged` sets up).
+// of events with the subscriber task stalled; when it polls,
+// `RecvError::Lagged` fires and the cursor-select fallback catches
+// every missed row via the durable outbox. `subscribe_completion` is
+// exercised because the producer path is the simplest end-to-end:
+// `create_and_claim` + `complete` in a tight loop — no suspend /
+// waitpoint setup needed per event — so saturating the 256-slot
+// broadcast ring takes a minimal number of iterations.
 
 #[tokio::test]
 #[serial(ff_dev_mode)]
