@@ -41,6 +41,11 @@ serde_json = { workspace = true }
 # dedup-replay cache and signal payload bytes for the member_map blob.
 # Matches the PG reference shape (`ff-backend-postgres/src/suspend_ops.rs`).
 hex = "0.4"
+# Phase 2b.2.2: outbox_cursor returns a `futures_core::Stream`-adapter
+# struct so Phase 3 `subscribe_*` trait impls can box it as
+# `Pin<Box<dyn Stream<Item=...>>>` — same dep shape as
+# `ff-backend-postgres` uses for its lease/completion subscribers.
+futures-core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

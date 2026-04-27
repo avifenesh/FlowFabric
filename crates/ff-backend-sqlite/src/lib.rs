@@ -29,6 +29,7 @@ mod backend;
 mod config;
 mod errors;
 mod handle_codec;
+mod outbox_cursor;
 #[doc(hidden)]
 pub mod pubsub;
 pub mod queries;
@@ -38,5 +39,5 @@ mod suspend_ops;
 mod tx_util;
 
 pub use backend::SqliteBackend;
-pub use errors::{is_retryable_sqlite_busy, MAX_ATTEMPTS};
-pub use retry::{retry_serializable, IsRetryableBusy};
+pub use errors::{MAX_ATTEMPTS, is_retryable_sqlite_busy};
+pub use retry::{IsRetryableBusy, retry_serializable};
