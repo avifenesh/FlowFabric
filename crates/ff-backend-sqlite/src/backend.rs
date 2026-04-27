@@ -61,8 +61,10 @@ use crate::registry;
 #[cfg(feature = "core")]
 use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
-    ApplyDependencyToChildResult, CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs,
-    CreateFlowResult, StageDependencyEdgeArgs, StageDependencyEdgeResult,
+    ApplyDependencyToChildResult, CancelExecutionArgs, CancelExecutionResult,
+    ChangePriorityArgs, ChangePriorityResult, CreateExecutionArgs, CreateExecutionResult,
+    CreateFlowArgs, CreateFlowResult, ReplayExecutionArgs, ReplayExecutionResult,
+    RevokeLeaseArgs, RevokeLeaseResult, StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 #[cfg(feature = "core")]
 use ff_core::state::PublicState;
@@ -635,6 +637,9 @@ async fn insert_lease_event(
         .bind(event_type)
         .bind(now)
         .bind(part)
+        // BLOB bind for the co-transactional exec_core lookup that
+        // back-fills namespace + instance_tag (Phase 3.2 fix).
+        .bind(exec_uuid)
         .execute(&mut **conn)
         .await
         .map_err(map_sqlx_error)?;
@@ -2735,6 +2740,46 @@ impl EngineBackend for SqliteBackend {
     ) -> Result<ApplyDependencyToChildResult, EngineError> {
         let pool = &self.inner.pool;
         retry_serializable(|| apply_dependency_to_child_impl(pool, &args)).await
+    }
+
+    // ── RFC-020 Wave 9 — Operator control (Phase 3.2) ────────────────
+    //
+    // Each body lives in `crate::operator` and follows the §4.2 shared
+    // spine adapted for SQLite (BEGIN IMMEDIATE + WHERE-clause CAS +
+    // post-commit broadcast). Outbox rows populate namespace +
+    // instance_tag via co-transactional SELECT so tag-filtered
+    // subscribers do not silently drop events.
+
+    #[cfg(feature = "core")]
+    async fn cancel_execution(
+        &self,
+        args: CancelExecutionArgs,
+    ) -> Result<CancelExecutionResult, EngineError> {
+        crate::operator::cancel_execution_impl(&self.inner.pool, &self.inner.pubsub, args).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn revoke_lease(
+        &self,
+        args: RevokeLeaseArgs,
+    ) -> Result<RevokeLeaseResult, EngineError> {
+        crate::operator::revoke_lease_impl(&self.inner.pool, &self.inner.pubsub, args).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn change_priority(
+        &self,
+        args: ChangePriorityArgs,
+    ) -> Result<ChangePriorityResult, EngineError> {
+        crate::operator::change_priority_impl(&self.inner.pool, &self.inner.pubsub, args).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn replay_execution(
+        &self,
+        args: ReplayExecutionArgs,
+    ) -> Result<ReplayExecutionResult, EngineError> {
+        crate::operator::replay_execution_impl(&self.inner.pool, &self.inner.pubsub, args).await
     }
 
     // ── RFC-019 Stage B/C — subscribe_* (Phase 3.1) ──────────────────

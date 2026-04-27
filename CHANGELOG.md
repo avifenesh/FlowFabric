@@ -7,6 +7,48 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 3.2 Wave 9 operator control
+  (RFC-023 Phase 3.2 / RFC-020 §4.2.1-5).** Replaces the 4 `Unavailable`
+  trait defaults for `cancel_execution`, `revoke_lease`,
+  `change_priority`, and `replay_execution` with real SQLite bodies
+  ported from the Postgres reference (`ff-backend-postgres/src/operator.rs`
+  v0.11.0). Each method runs under the §4.2 shared spine adapted for
+  SQLite (`BEGIN IMMEDIATE` RESERVED-lock for the RMW window, WHERE-
+  clause CAS fencing, `rows_affected()`-driven contention branches,
+  outbox INSERT in-tx + post-commit broadcast wakeup) and rides the
+  Phase 2a.1 `retry::retry_serializable` wrapper for SQLITE_BUSY /
+  SQLITE_LOCKED absorption. Semantics match PG Revision 7 exactly:
+  `cancel_execution` emits `ff_lease_event revoked` only (no
+  operator_event — the migration 0010 CHECK allow-list gates on
+  `priority_changed` / `replayed` / `flow_cancel_requested`);
+  `revoke_lease` returns `AlreadySatisfied` on `no_active_lease` /
+  `different_worker_instance_id` / `lease_id_mismatch` / `epoch_moved`;
+  `change_priority` surfaces `Contention(ExecutionNotEligible)` on the
+  Valkey-canonical gate (`lifecycle_phase='runnable' AND
+  eligibility_state='eligible_now'`) failing; `replay_execution` picks
+  the skipped-flow-member branch iff the current attempt's
+  `outcome='skipped' AND exec_core.flow_id IS NOT NULL` (Valkey
+  `flowfabric.lua:8555`) and resets downstream `ff_edge_group`
+  skip/fail/running counters to 0 while preserving `success_count` per
+  Revision 7 Option A. Replay bumps `raw_fields.replay_count` via a
+  nested `json_set(json_set(...))` (SQLite JSON1 analogue of PG's
+  `jsonb_set(..., to_jsonb(... + 1))`).
+- `crates/ff-backend-sqlite/src/operator.rs` — 4 `_once` bodies + 4
+  `_impl` retry wrappers + in-file helpers (`split_eid`,
+  `synthetic_lease_id`, `insert_lease_event`, `insert_operator_event`,
+  post-commit broadcast dispatchers).
+- `crates/ff-backend-sqlite/src/queries/operator.rs` — dialect-forked
+  SQL for the 4 methods (pre-reads, CAS UPDATEs, edge-group reset,
+  co-transactional `INSERT_OPERATOR_EVENT_SQL` that back-fills
+  `namespace` + `instance_tag` from `ff_exec_core.raw_fields`).
+- `crates/ff-backend-sqlite/tests/wave9_operator.rs` — 13-test
+  integration harness: happy-path + fence-failure + gate-failure +
+  outbox-verify for each method, the two replay branches (normal
+  resumes to `Waiting`, skipped-flow-member resumes to
+  `WaitingChildren` and resets edge-group counters with
+  `success_count` preserved), and a concurrent-cancel serialization
+  test that verifies SERIALIZABLE-retry absorbs cross-tx SQLITE_BUSY
+  under the single-writer envelope.
 - **`crates/ff-backend-sqlite` — Phase 3.1 subscribe methods (RFC-023
   Wave 9 / RFC-019 Stage B/C).** Replaces the 3 `Unavailable` defaults
   for `subscribe_completion`, `subscribe_lease_history`, and
@@ -123,6 +165,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   single Rust implementation (Valkey continues to sign inside Lua).
   The PG `signal.rs` re-exports from ff-core for backward
   compatibility of internal call sites.
+
+### Fixed
+
+- **`crates/ff-backend-sqlite` — outbox producer tag back-fill
+  (Phase 3.1-flagged regression, fixed in Phase 3.2).** Prior to
+  Phase 3.2 the SQLite `ff_lease_event` + `ff_completion_event`
+  producers hard-coded `namespace` + `instance_tag` to `NULL` on every
+  insert, causing any `ScannerFilter::instance_tag(...)` subscriber
+  to silently drop every lease + completion event (the
+  `subscribe_*_filter_drops_null_tag_rows` tests pinned this shape;
+  the signal producer had already been ported correctly in Phase
+  2b.2.1). Phase 3.2 replaces the hard-coded NULLs with a
+  co-transactional `SELECT ... FROM ff_exec_core UNION ALL SELECT ...
+  WHERE NOT EXISTS (...)` (mirror of
+  `queries/signal.rs::INSERT_SIGNAL_EVENT_SQL`) so every outbox row
+  carries the denormalised tag columns. Touched producers:
+  `queries/dispatch.rs::INSERT_LEASE_EVENT_SQL`,
+  `queries/attempt.rs::INSERT_COMPLETION_EVENT_SQL`,
+  `queries/signal.rs::INSERT_COMPLETION_RESUMABLE_SQL`. The 3
+  call-sites on `INSERT_LEASE_EVENT_SQL`
+  (`backend::insert_lease_event`,
+  `suspend_ops::claim_resumed_execution_impl`, new
+  `operator::insert_lease_event`) now bind the exec UUID twice: once
+  stringified for the outbox row and once as the 16-byte BLOB for the
+  exec_core lookup. The two previously-xfailing subscribe tests
+  (`subscribe_*_filter_drops_null_tag_rows`) flip to positive
+  filter-through
+  (`subscribe_*_filter_by_instance_tag_receives_events`).
 
 ### Changed
 

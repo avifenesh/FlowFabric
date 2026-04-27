@@ -15,6 +15,7 @@ pub mod exec_core;
 pub mod flow;
 pub mod flow_staging;
 pub mod lease;
+pub mod operator;
 pub mod signal;
 pub mod stream;
 pub mod suspend;

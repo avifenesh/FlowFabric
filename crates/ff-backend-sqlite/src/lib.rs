@@ -31,6 +31,7 @@ mod config;
 mod errors;
 mod handle_codec;
 mod lease_event_subscribe;
+mod operator;
 mod outbox_cursor;
 mod signal_delivery_subscribe;
 #[doc(hidden)]
