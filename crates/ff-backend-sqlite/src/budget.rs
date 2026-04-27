@@ -601,6 +601,111 @@ async fn reset_budget_once(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// §4.4.3 — `budget_reset` reconciler entry point (RFC-023 Phase 3.5)
+// ───────────────────────────────────────────────────────────────────
+
+/// Called per row returned by the SQLite `budget_reset` reconciler
+/// scan. Looks up the policy's `reset_interval_ms` from
+/// `policy_json`, zeroes usage rows + clears `last_breach_*` +
+/// reschedules `next_reset_at_ms`, all under a single
+/// `BEGIN IMMEDIATE` txn wrapped in [`retry_serializable`] (§4.3).
+///
+/// Matches the PG twin `budget_reset_reconciler_apply` at
+/// `ff-backend-postgres/src/budget.rs`:
+///   * defensive re-read of `next_reset_at_ms` — a concurrent
+///     `reset_budget` admin call may have already advanced the
+///     schedule past `now`; if so this tick is a no-op.
+///   * breach counters (`breach_count`, `soft_breach_count`) are
+///     NOT zeroed — they are lifetime totals (PG parity +
+///     `reset_budget_impl` parity).
+pub(crate) async fn budget_reset_reconciler_apply(
+    pool: &SqlitePool,
+    budget_id: &str,
+    now: i64,
+) -> Result<(), EngineError> {
+    retry_serializable(|| budget_reset_reconciler_once(pool, budget_id, now)).await
+}
+
+async fn budget_reset_reconciler_once(
+    pool: &SqlitePool,
+    budget_id: &str,
+    now: i64,
+) -> Result<(), EngineError> {
+    let mut conn = begin_immediate(pool).await?;
+
+    let result: Result<(), EngineError> = async {
+        let policy_row = sqlx::query(
+            "SELECT policy_json, next_reset_at_ms \
+               FROM ff_budget_policy \
+              WHERE partition_key = ? AND budget_id = ?",
+        )
+        .bind(PART)
+        .bind(budget_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some(policy_row) = policy_row else {
+            return Ok(());
+        };
+
+        // Defensive re-check: skip if a concurrent admin reset
+        // already advanced `next_reset_at_ms` past `now`.
+        let next_reset: Option<i64> = policy_row
+            .try_get::<Option<i64>, _>("next_reset_at_ms")
+            .map_err(map_sqlx_error)?;
+        if !matches!(next_reset, Some(n) if n <= now) {
+            return Ok(());
+        }
+
+        let policy_text: String = policy_row.try_get("policy_json").map_err(map_sqlx_error)?;
+        let policy_json = parse_policy_text(&policy_text);
+        let reset_interval_ms: i64 = policy_json
+            .get("reset_interval_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        // Zero all usage rows for this budget.
+        sqlx::query(q_budget::UPDATE_USAGE_ZERO_ALL_SQL)
+            .bind(now)
+            .bind(now)
+            .bind(PART)
+            .bind(budget_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        // Reset policy metadata + reschedule. Uses the same
+        // `UPDATE_BUDGET_RESET_SQL` as `reset_budget_impl` so the
+        // admin + reconciler paths produce identical rows.
+        sqlx::query(q_budget::UPDATE_BUDGET_RESET_SQL)
+            .bind(now)
+            .bind(reset_interval_ms)
+            .bind(now)
+            .bind(reset_interval_ms)
+            .bind(PART)
+            .bind(budget_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(())
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
 // §4.4.1 — `create_quota_policy`
 // ───────────────────────────────────────────────────────────────────
 

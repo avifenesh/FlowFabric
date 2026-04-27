@@ -7,6 +7,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 3.5 scanner supervisor (N=1) +
+  `budget_reset` reconciler (RFC-023 Phase 3.5 / RFC-020 Wave 9
+  Standalone-1).** Ports the Postgres `scanner_supervisor` +
+  `reconcilers::budget_reset` to SQLite, collapsed to N=1 per §4.1
+  (SQLite is single-writer / single-process → no partition
+  fan-out). Supervisor = one `tokio::time::interval` tick task per
+  reconciler with a `watch` shutdown channel; drained on
+  `EngineBackend::shutdown_prepare`. `ff-server::start_sqlite_branch`
+  installs the supervisor using the same `budget_reset_interval`
+  env knob that drives the Valkey + Postgres backends.
+- `crates/ff-backend-sqlite/src/scanner_supervisor.rs` — supervisor
+  handle + tick loop + `shutdown(grace)` API.
+- `crates/ff-backend-sqlite/src/reconcilers/{mod,budget_reset}.rs` —
+  `budget_reset` reconciler body (partial-index-backed bounded batch
+  scan at `BATCH_SIZE = 20`; delegates per-row to the shared
+  `budget::budget_reset_reconciler_apply` helper).
+- `SqliteBackend::with_scanners(cfg) -> bool` — idempotent
+  supervisor install; `shutdown_prepare(grace)` override to drain.
+
 - **`crates/ff-backend-sqlite` — Phase 3.4 Wave 9 budget/quota admin
   (RFC-023 Phase 3.4 / RFC-020 §4.4 Rev 6).** Replaces 5
   `Unavailable` trait defaults with real SQLite bodies ported from
