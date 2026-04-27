@@ -7,17 +7,21 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
 
 use ff_core::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
-    FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    ReclaimToken, ResumeSignal, UsageDimensions,
+    FailOutcome, FailureClass, FailureReason, Frame, Handle, HandleKind, LeaseRenewal,
+    PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions,
 };
+use ff_core::caps::{matches as caps_matches, CapabilityRequirement};
+use ff_core::handle_codec::HandlePayload;
+use ff_core::types::{AttemptId, AttemptIndex, LeaseEpoch, LeaseId};
 use ff_core::capability::{BackendIdentity, Capabilities, Supports, Version};
 #[cfg(feature = "core")]
 use ff_core::contracts::{
@@ -33,11 +37,14 @@ use ff_core::contracts::{
 use ff_core::contracts::{StreamCursor, StreamFrames};
 use ff_core::backend::PrepareOutcome;
 use ff_core::engine_backend::EngineBackend;
-use ff_core::engine_error::{BackendError, EngineError};
+use ff_core::engine_error::{BackendError, ContentionKind, EngineError, ValidationKind};
+
+use crate::errors::map_sqlx_error;
+use crate::handle_codec::{decode_handle, encode_handle};
+use crate::queries::{attempt as q_attempt, exec_core as q_exec};
+use crate::retry::retry_serializable;
 #[cfg(feature = "core")]
 use ff_core::partition::PartitionKey;
-#[cfg(feature = "streaming")]
-use ff_core::types::AttemptIndex;
 #[cfg(feature = "core")]
 use ff_core::types::EdgeId;
 use ff_core::types::{BudgetId, ExecutionId, FlowId, LaneId, TimestampMs};
@@ -51,6 +58,515 @@ use crate::registry;
 fn unavailable<T>(op: &'static str) -> Result<T, EngineError> {
     Err(EngineError::Unavailable { op })
 }
+
+// ── Phase 2a.2 helpers: hot-path shared logic ──────────────────────────
+
+/// Unix-millis wall clock. Matches the PG reference shape
+/// (`ff-backend-postgres/src/attempt.rs:55-63`); SQLite stores the
+/// same `*_ms` fields so the value is directly comparable.
+fn now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// Decompose an [`ff_core::types::ExecutionId`] formatted `{fp:N}:<uuid>`
+/// into `(partition_index, uuid_bytes)` — SQLite stores the UUID as a
+/// 16-byte `BLOB` (§4.1) so we bind via `uuid::Uuid`.
+fn split_exec_id(
+    eid: &ff_core::types::ExecutionId,
+) -> Result<(i64, Uuid), EngineError> {
+    let s = eid.as_str();
+    let rest = s.strip_prefix("{fp:").ok_or_else(|| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("execution_id missing `{{fp:` prefix: {s}"),
+    })?;
+    let close = rest.find("}:").ok_or_else(|| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("execution_id missing `}}:`: {s}"),
+    })?;
+    let part: i64 = rest[..close]
+        .parse()
+        .map_err(|_| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("execution_id partition index not u16: {s}"),
+        })?;
+    let uuid = Uuid::parse_str(&rest[close + 2..]).map_err(|_| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("execution_id UUID invalid: {s}"),
+    })?;
+    Ok((part, uuid))
+}
+
+/// Acquire a pooled connection and issue `BEGIN IMMEDIATE`, escalating
+/// the txn to RESERVED so §4.1 A3's single-writer invariant holds for
+/// the full read-modify-write window.
+///
+/// The caller MUST arrange an explicit `commit()` on success and a
+/// `rollback_quiet()` on every error path. Use
+/// [`commit_or_rollback`] as the single tail-call so a `COMMIT`
+/// failure deterministically rolls back — otherwise a half-open txn
+/// could return to the pool and poison a later borrower.
+///
+/// sqlx's `Transaction` abstraction opens a plain `BEGIN` on SQLite
+/// (no `IMMEDIATE` escalation on the public API today); we manage
+/// the lock here manually and the per-op helpers in this file close
+/// the rollback loop.
+async fn begin_immediate(
+    pool: &SqlitePool,
+) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, EngineError> {
+    let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(conn)
+}
+
+/// Commit the pending txn; on `COMMIT` failure issue a best-effort
+/// `ROLLBACK` so the connection is returned to the pool in a clean
+/// state (otherwise a pool-reuse borrower observes a half-open txn).
+/// A secondary rollback error is swallowed — SQLite auto-rolls-back
+/// on connection close, which happens when the pool drops an
+/// unhealthy connection, so correctness is preserved.
+async fn commit_or_rollback(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+) -> Result<(), EngineError> {
+    if let Err(e) = sqlx::query("COMMIT")
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)
+    {
+        let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Best-effort rollback on an error path. A failed rollback is
+/// swallowed so the original error surfaces unchanged.
+async fn rollback_quiet(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+    let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
+}
+
+/// Fence check: under the `BEGIN IMMEDIATE` lock, read the attempt
+/// row's `lease_epoch` and compare against the handle-embedded epoch.
+/// Mismatch ⇒ [`ContentionKind::LeaseConflict`] (terminal for this
+/// call; caller does not retry a fence mismatch).
+async fn fence_check(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    attempt_index: i64,
+    expected_epoch: u64,
+) -> Result<(), EngineError> {
+    let row = sqlx::query(q_attempt::SELECT_ATTEMPT_EPOCH_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    let Some(row) = row else {
+        return Err(EngineError::NotFound { entity: "attempt" });
+    };
+    let epoch_i: i64 = row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+    let observed = u64::try_from(epoch_i).unwrap_or(0);
+    if observed != expected_epoch {
+        return Err(EngineError::Contention(ContentionKind::LeaseConflict));
+    }
+    Ok(())
+}
+
+// ── Phase 2a.2 hot-path bodies ─────────────────────────────────────────
+
+async fn claim_impl(
+    pool: &SqlitePool,
+    lane: &ff_core::types::LaneId,
+    capabilities: &CapabilitySet,
+    policy: &ClaimPolicy,
+) -> Result<Option<Handle>, EngineError> {
+    // RFC-023 §4.1 A3: SQLite is single-writer with
+    // `num_flow_partitions = 1`, so we scan only partition 0 rather
+    // than iterating 0..256 as the PG path does.
+    let part: i64 = 0;
+
+    let mut conn = begin_immediate(pool).await?;
+    let result = claim_inner(&mut conn, part, lane, capabilities, policy).await;
+    match result {
+        Ok(Some(handle)) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(Some(handle))
+        }
+        Ok(None) => {
+            rollback_quiet(&mut conn).await;
+            Ok(None)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+/// Inside-txn body of [`claim_impl`] — any `?` short-circuit surfaces
+/// to the caller which guarantees `rollback_quiet` via
+/// [`claim_impl`]'s match arms.
+async fn claim_inner(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    lane: &ff_core::types::LaneId,
+    capabilities: &CapabilitySet,
+    policy: &ClaimPolicy,
+) -> Result<Option<Handle>, EngineError> {
+    // Scan up to CAP_SCAN_BATCH eligible rows in priority order and
+    // walk until we find the first capability-satisfying one. Under
+    // §4.1 A3 SQLite runs on a single partition, so a high-priority
+    // row whose required caps the worker lacks would starve
+    // downstream-priority matches if we only inspected the top
+    // candidate (caught in PR-375 review). Bounded scan budget keeps
+    // the lock window predictable.
+    const CAP_SCAN_BATCH: i64 = 16;
+
+    let candidate_rows = sqlx::query(q_attempt::SELECT_ELIGIBLE_EXEC_SQL)
+        .bind(part)
+        .bind(lane.as_str())
+        .bind(CAP_SCAN_BATCH)
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    if candidate_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut claimable: Option<(Uuid, i64)> = None;
+    for row in &candidate_rows {
+        let exec_uuid: Uuid = row.try_get("execution_id").map_err(map_sqlx_error)?;
+        let attempt_index_i: i64 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
+
+        // Capability subset check (§4.1 A4): junction table read +
+        // Rust-side `caps::matches`. Same post-lock Rust match as the
+        // PG path at `ff-backend-postgres/src/attempt.rs:170-182`.
+        let cap_rows = sqlx::query(q_attempt::SELECT_EXEC_CAPABILITIES_SQL)
+            .bind(exec_uuid)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        let tokens: Vec<String> = cap_rows
+            .iter()
+            .map(|r| r.try_get::<String, _>("capability"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlx_error)?;
+        let req = CapabilityRequirement::new(tokens);
+        if caps_matches(&req, capabilities) {
+            claimable = Some((exec_uuid, attempt_index_i));
+            break;
+        }
+    }
+
+    let Some((exec_uuid, attempt_index_i)) = claimable else {
+        // Every candidate in the batch required a capability the
+        // worker lacks; surface `None` so the caller's retry cadence
+        // re-enters later. A different-caps worker takes the batch
+        // when it claims.
+        return Ok(None);
+    };
+
+    let now = now_ms();
+    let lease_ttl_ms = i64::from(policy.lease_ttl_ms);
+    let expires = now.saturating_add(lease_ttl_ms);
+
+    // UPSERT the attempt row. `RETURNING lease_epoch` round-trips
+    // the post-UPSERT epoch in one statement (SQLite >= 3.35).
+    let epoch_row = sqlx::query(q_attempt::UPSERT_ATTEMPT_ON_CLAIM_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index_i)
+        .bind(policy.worker_id.as_str())
+        .bind(policy.worker_instance_id.as_str())
+        .bind(expires)
+        .bind(now)
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    let epoch_i: i64 = epoch_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+
+    sqlx::query(q_exec::UPDATE_EXEC_CORE_CLAIM_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    // RFC-019 Stage B outbox parity (PG reference at
+    // `ff-backend-postgres/src/lease_event.rs`): record a lease
+    // lifecycle event so a later `subscribe_lease_history` reader
+    // observes the acquisition. The PG `pg_notify` trigger is dropped
+    // per §4.2; in-Rust broadcast wiring lands in a later phase.
+    insert_lease_event(conn, part, exec_uuid, "acquired", now).await?;
+
+    let attempt_index = AttemptIndex::new(u32::try_from(attempt_index_i.max(0)).unwrap_or(0));
+    let exec_id = ff_core::types::ExecutionId::parse(&format!("{{fp:{part}}}:{exec_uuid}"))
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("reassembling exec id: {e}"),
+        })?;
+    let payload = HandlePayload::new(
+        exec_id,
+        attempt_index,
+        AttemptId::new(),
+        LeaseId::new(),
+        LeaseEpoch(u64::try_from(epoch_i).unwrap_or(1)),
+        u64::from(policy.lease_ttl_ms),
+        lane.clone(),
+        policy.worker_instance_id.clone(),
+    );
+    Ok(Some(encode_handle(&payload, HandleKind::Fresh)))
+}
+
+async fn complete_impl(
+    pool: &SqlitePool,
+    handle: &Handle,
+    payload_bytes: Option<Vec<u8>>,
+) -> Result<(), EngineError> {
+    let payload = decode_handle(handle)?;
+    let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
+    let attempt_index = i64::from(payload.attempt_index.0);
+    let expected_epoch = payload.lease_epoch.0;
+
+    let mut conn = begin_immediate(pool).await?;
+    let result = complete_inner(
+        &mut conn,
+        part,
+        exec_uuid,
+        attempt_index,
+        expected_epoch,
+        payload_bytes,
+    )
+    .await;
+    match result {
+        Ok(()) => commit_or_rollback(&mut conn).await,
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+async fn complete_inner(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    attempt_index: i64,
+    expected_epoch: u64,
+    payload_bytes: Option<Vec<u8>>,
+) -> Result<(), EngineError> {
+    fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
+    let now = now_ms();
+
+    sqlx::query(q_attempt::UPDATE_ATTEMPT_COMPLETE_SQL)
+        .bind(now)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    sqlx::query(q_exec::UPDATE_EXEC_CORE_COMPLETE_SQL)
+        .bind(now)
+        .bind(payload_bytes.as_deref())
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    sqlx::query(q_attempt::INSERT_COMPLETION_EVENT_SQL)
+        .bind("success")
+        .bind(now)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut **conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
+    Ok(())
+}
+
+/// Classify whether a `fail()` call reschedules a retry or transitions
+/// to terminal. Mirrors the PG reference behaviour
+/// (`ff-backend-postgres/src/attempt.rs:622-626` — Transient /
+/// InfraCrash → retry; Permanent / Timeout / Cancelled → terminal),
+/// and handles the `#[non_exhaustive]` catch-all by defaulting future
+/// variants to the **least-destructive** retry path per the project's
+/// non-exhaustive-enum rule: terminal-failed is irreversible, so an
+/// unknown classification MUST NOT silently burn the attempt.
+fn classify_retryable(classification: FailureClass) -> bool {
+    match classification {
+        FailureClass::Transient | FailureClass::InfraCrash => true,
+        FailureClass::Permanent | FailureClass::Timeout | FailureClass::Cancelled => false,
+        // #[non_exhaustive]: unknown future variant → retry (least
+        // destructive). A deliberate terminal variant is fine to add
+        // here alongside Permanent in a follow-up PR; defaulting
+        // unknowns to terminal would regress outcomes on backend
+        // upgrades where a new variant lands before this classifier
+        // is taught about it.
+        _ => true,
+    }
+}
+
+async fn fail_impl(
+    pool: &SqlitePool,
+    handle: &Handle,
+    reason: FailureReason,
+    classification: FailureClass,
+) -> Result<FailOutcome, EngineError> {
+    let payload = decode_handle(handle)?;
+    let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
+    let attempt_index = i64::from(payload.attempt_index.0);
+    let expected_epoch = payload.lease_epoch.0;
+    let retryable = classify_retryable(classification);
+
+    let mut conn = begin_immediate(pool).await?;
+    let result = fail_inner(
+        &mut conn,
+        part,
+        exec_uuid,
+        attempt_index,
+        expected_epoch,
+        retryable,
+        &reason,
+        classification,
+    )
+    .await;
+    match result {
+        Ok(outcome) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // every arg is load-bearing attempt state
+async fn fail_inner(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    attempt_index: i64,
+    expected_epoch: u64,
+    retryable: bool,
+    reason: &FailureReason,
+    classification: FailureClass,
+) -> Result<FailOutcome, EngineError> {
+    fence_check(conn, part, exec_uuid, attempt_index, expected_epoch).await?;
+    let now = now_ms();
+
+    if retryable {
+        sqlx::query(q_attempt::UPDATE_ATTEMPT_FAIL_RETRY_SQL)
+            .bind(now)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index)
+            .execute(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(q_exec::UPDATE_EXEC_CORE_FAIL_RETRY_SQL)
+            .bind(&reason.message)
+            .bind(part)
+            .bind(exec_uuid)
+            .execute(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
+        // Log the transient failure so operators tracing a retry loop
+        // can correlate cause without re-reading the attempt row
+        // themselves (Gemini review #1).
+        tracing::warn!(
+            error.message = %reason.message,
+            classification = ?classification,
+            execution_id = %exec_uuid,
+            attempt_index = attempt_index,
+            "sqlite.fail: scheduling retry"
+        );
+        Ok(FailOutcome::RetryScheduled {
+            delay_until: ff_core::types::TimestampMs::from_millis(now),
+        })
+    } else {
+        sqlx::query(q_attempt::UPDATE_ATTEMPT_FAIL_TERMINAL_SQL)
+            .bind(now)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index)
+            .execute(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(q_exec::UPDATE_EXEC_CORE_FAIL_TERMINAL_SQL)
+            .bind(now)
+            .bind(&reason.message)
+            .bind(part)
+            .bind(exec_uuid)
+            .execute(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(q_attempt::INSERT_COMPLETION_EVENT_SQL)
+            .bind("failed")
+            .bind(now)
+            .bind(part)
+            .bind(exec_uuid)
+            .execute(&mut **conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+        insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
+        Ok(FailOutcome::TerminalFailed)
+    }
+}
+
+/// Emit one RFC-019 Stage B lease-lifecycle outbox row.
+///
+/// Mirrors `ff-backend-postgres/src/lease_event.rs`. The PG
+/// `pg_notify` trigger is dropped per RFC-023 §4.2 (broadcast moves
+/// into a Rust post-commit channel in a later phase); durable replay
+/// via `event_id > cursor` continues to ride against this table.
+async fn insert_lease_event(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    part: i64,
+    exec_uuid: Uuid,
+    event_type: &str,
+    now: i64,
+) -> Result<(), EngineError> {
+    sqlx::query(
+        r#"
+        INSERT INTO ff_lease_event (
+            execution_id, lease_id, event_type, occurred_at_ms, partition_key
+        ) VALUES (?1, NULL, ?2, ?3, ?4)
+        "#,
+    )
+    .bind(exec_uuid.to_string())
+    .bind(event_type)
+    .bind(now)
+    .bind(part)
+    .execute(&mut **conn)
+    .await
+    .map_err(map_sqlx_error)?;
+    Ok(())
+}
+
 
 /// Internal shared state. `Arc<SqliteBackendInner>` is what the
 /// registry stores weak references to and what `SqliteBackend`
@@ -276,11 +792,12 @@ impl EngineBackend for SqliteBackend {
 
     async fn claim(
         &self,
-        _lane: &LaneId,
-        _capabilities: &CapabilitySet,
-        _policy: ClaimPolicy,
+        lane: &LaneId,
+        capabilities: &CapabilitySet,
+        policy: ClaimPolicy,
     ) -> Result<Option<Handle>, EngineError> {
-        unavailable("sqlite.claim")
+        let pool = &self.inner.pool;
+        retry_serializable(|| claim_impl(pool, lane, capabilities, &policy)).await
     }
 
     async fn renew(&self, _handle: &Handle) -> Result<LeaseRenewal, EngineError> {
@@ -306,19 +823,21 @@ impl EngineBackend for SqliteBackend {
 
     async fn complete(
         &self,
-        _handle: &Handle,
-        _payload: Option<Vec<u8>>,
+        handle: &Handle,
+        payload: Option<Vec<u8>>,
     ) -> Result<(), EngineError> {
-        unavailable("sqlite.complete")
+        let pool = &self.inner.pool;
+        retry_serializable(|| complete_impl(pool, handle, payload.clone())).await
     }
 
     async fn fail(
         &self,
-        _handle: &Handle,
-        _reason: FailureReason,
-        _classification: FailureClass,
+        handle: &Handle,
+        reason: FailureReason,
+        classification: FailureClass,
     ) -> Result<FailOutcome, EngineError> {
-        unavailable("sqlite.fail")
+        let pool = &self.inner.pool;
+        retry_serializable(|| fail_impl(pool, handle, reason.clone(), classification)).await
     }
 
     async fn cancel(&self, _handle: &Handle, _reason: &str) -> Result<(), EngineError> {
