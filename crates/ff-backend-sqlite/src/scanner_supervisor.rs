@@ -13,8 +13,10 @@
 //! # Shutdown
 //!
 //! [`SqliteScannerHandle::shutdown`] flips the `watch` channel and
-//! awaits the underlying [`JoinSet`] up to `grace`. Ticks observe
-//! the signal at the next `select!` and exit. Mirrors the
+//! awaits the underlying [`JoinSet`] up to `grace`. Tasks are
+//! registered synchronously during [`spawn_scanners`] (before the
+//! handle is returned), so the drain contract holds even for an
+//! immediate shutdown after `with_scanners`. Mirrors the
 //! `PostgresScannerHandle::shutdown` shape so `ff-server`'s
 //! `Server::shutdown` drain logic stays backend-agnostic.
 
@@ -26,6 +28,7 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 
 use crate::reconcilers;
+use crate::tx_util::now_ms;
 
 /// Subset of `EngineConfig`'s interval knobs that the SQLite
 /// reconcilers honour. Only `budget_reset_interval` is wired today;
@@ -36,6 +39,10 @@ pub struct SqliteScannerConfig {
     /// RFC-020 Wave 9 Standalone-1 cadence. Matches the Valkey side's
     /// `ff-server::config::budget_reset_interval` knob so one env
     /// value drives all three backends.
+    ///
+    /// If set to zero (`FF_BUDGET_RESET_INTERVAL_S=0`) the reconciler
+    /// is treated as disabled and not spawned, mirroring
+    /// `tokio::time::interval`'s zero-duration panic safety.
     pub budget_reset_interval: Duration,
 }
 
@@ -91,93 +98,94 @@ impl Drop for SqliteScannerHandle {
 }
 
 /// Spawn all SQLite reconcilers as long-lived tick loops. Phase 3.5
-/// ships one: `budget_reset`.
+/// ships one: `budget_reset`. Tasks are registered into the
+/// `JoinSet` synchronously — the handle returned is always drainable
+/// via [`SqliteScannerHandle::shutdown`].
 pub fn spawn_scanners(pool: SqlitePool, cfg: SqliteScannerConfig) -> SqliteScannerHandle {
     let (tx, rx) = watch::channel(false);
-    let js = Arc::new(Mutex::new(JoinSet::new()));
+    let mut js = JoinSet::new();
 
-    spawn_reconciler(
-        &js,
-        rx,
-        pool,
-        cfg.budget_reset_interval,
-        "sqlite.budget_reset",
-        |pool| {
-            Box::pin(async move {
-                let now = now_ms();
-                reconcilers::budget_reset::scan_tick(&pool, now)
-                    .await
-                    .map(|_| ())
-            })
-        },
-    );
+    // Zero-interval guard: treat as disabled rather than panicking
+    // in `tokio::time::interval`. Matches `FF_BUDGET_RESET_INTERVAL_S=0`
+    // as an opt-out.
+    if !cfg.budget_reset_interval.is_zero() {
+        spawn_reconciler(
+            &mut js,
+            rx.clone(),
+            pool.clone(),
+            cfg.budget_reset_interval,
+            "sqlite.budget_reset",
+            |pool| {
+                Box::pin(async move {
+                    reconcilers::budget_reset::scan_tick(&pool, now_ms())
+                        .await
+                        .map(|_| ())
+                })
+            },
+        );
+    }
 
+    let scanners = js.len();
     tracing::info!(
-        scanners = 1,
+        scanners,
         "sqlite scanner supervisor spawned (RFC-023 Phase 3.5 — budget_reset N=1)"
     );
 
     SqliteScannerHandle {
         shutdown_tx: tx,
-        join_set: js,
+        join_set: Arc::new(Mutex::new(js)),
     }
 }
 
-type TickFut =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ff_core::engine_error::EngineError>> + Send>>;
+type TickFut = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), ff_core::engine_error::EngineError>> + Send>,
+>;
 
+/// Register one reconciler tick task synchronously into the
+/// supervisor's [`JoinSet`]. Tasks exit at the next `select!` once
+/// `shutdown` fires (or the watch channel is closed).
 fn spawn_reconciler<F>(
-    js: &Arc<Mutex<JoinSet<()>>>,
+    js: &mut JoinSet<()>,
     mut shutdown: watch::Receiver<bool>,
     pool: SqlitePool,
     interval: Duration,
     name: &'static str,
     tick: F,
 ) where
-    F: Fn(SqlitePool) -> TickFut + Send + Sync + 'static + Clone,
+    F: Fn(SqlitePool) -> TickFut + Send + Sync + 'static,
 {
-    let js_clone = js.clone();
-    tokio::spawn(async move {
-        let mut guard = js_clone.lock().await;
-        guard.spawn(async move {
-            let mut tk = tokio::time::interval(interval);
-            tk.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // First tick fires immediately; skip it so the first
-            // observable reconciler run happens `interval` after
-            // spawn. Matches the PG supervisor shape (which uses the
-            // same default interval behaviour).
-            tk.tick().await;
-            loop {
-                tokio::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            return;
-                        }
+    js.spawn(async move {
+        let mut tk = tokio::time::interval(interval);
+        tk.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `tokio::time::interval` yields an immediate first tick;
+        // drain it so the first observable reconciler run happens
+        // `interval` after spawn. Intentional SQLite startup-timing
+        // difference from the Postgres supervisor, which lets the
+        // first immediate tick fire. Safe: the watch shutdown signal
+        // is only delivered via `changed()`, so skipping this
+        // pre-drain tick has no shutdown-observability cost.
+        tk.tick().await;
+        loop {
+            tokio::select! {
+                res = shutdown.changed() => {
+                    // Channel closed (sender dropped) OR shutdown=true → exit.
+                    if res.is_err() || *shutdown.borrow() {
+                        return;
                     }
-                    _ = tk.tick() => {
-                        if *shutdown.borrow() {
-                            return;
-                        }
-                        if let Err(e) = tick(pool.clone()).await {
-                            tracing::warn!(
-                                scanner = name,
-                                error = %e,
-                                "sqlite reconciler tick failed"
-                            );
-                        }
+                }
+                _ = tk.tick() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                    if let Err(e) = tick(pool.clone()).await {
+                        tracing::warn!(
+                            scanner = name,
+                            error = %e,
+                            "sqlite reconciler tick failed"
+                        );
                     }
                 }
             }
-        });
+        }
     });
-}
-
-fn now_ms() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i64::MAX)
 }

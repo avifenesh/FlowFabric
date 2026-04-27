@@ -230,6 +230,41 @@ async fn supervisor_starts_and_stops_cleanly() {
 
 #[tokio::test]
 #[serial(ff_dev_mode)]
+async fn supervisor_shutdown_drains_immediately_after_install() {
+    // Regression guard: earlier drafts spawned tick tasks from a
+    // detached `tokio::spawn` acquiring an async mutex, which left a
+    // window where `shutdown()` could observe an empty JoinSet while
+    // the task was still queued. The final shape spawns synchronously
+    // during `spawn_scanners`, so an immediate shutdown MUST drain
+    // the task (timed_out == 0).
+    let b = fresh_backend("immediate-shutdown").await;
+    b.with_scanners(SqliteScannerConfig {
+        // 1h cadence — the task is parked at `select!`, not doing work.
+        budget_reset_interval: Duration::from_secs(3600),
+    });
+    b.shutdown_prepare(Duration::from_secs(2))
+        .await
+        .expect("shutdown_prepare drains registered tasks");
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn supervisor_zero_interval_is_disabled_not_panic() {
+    // `tokio::time::interval(Duration::ZERO)` panics; the supervisor
+    // must treat zero as "reconciler disabled" per
+    // FF_BUDGET_RESET_INTERVAL_S=0 semantics.
+    let b = fresh_backend("zero-interval").await;
+    b.with_scanners(SqliteScannerConfig {
+        budget_reset_interval: Duration::from_millis(0),
+    });
+    // Shutdown should still work and report zero timed-out tasks.
+    b.shutdown_prepare(Duration::from_secs(1))
+        .await
+        .expect("zero-interval supervisor must shut down cleanly");
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
 async fn supervisor_tick_advances_on_cadence() {
     let b = fresh_backend("cadence").await;
     let bid = BudgetId::new();

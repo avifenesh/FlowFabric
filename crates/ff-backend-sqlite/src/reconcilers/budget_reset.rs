@@ -10,16 +10,17 @@
 //!
 //! Fan-out: N=1. SQLite has one (logical) partition (§4.1
 //! `num_budget_partitions = 1`), so there is no outer partition
-//! loop — the supervisor calls `scan_tick(pool)` once per cadence
-//! tick.
+//! loop — the supervisor calls `scan_tick(pool, now_ms)` once per
+//! cadence tick.
 //!
-//! Race discipline: a manual `reset_budget` + the reconciler's
-//! reset resolve identically. Both run under `BEGIN IMMEDIATE` and
-//! re-read `next_reset_at_ms` inside the tx; the second commit
-//! zeroes the already-zeroed usage (no-op) and overwrites
-//! `next_reset_at_ms` with the later `now + interval`, which the
-//! next tick will re-process. Deterministic under the single-
-//! writer invariant.
+//! Race discipline: a manual `reset_budget` and the reconciler may
+//! target the same budget concurrently. Both run under
+//! `BEGIN IMMEDIATE` and re-read `next_reset_at_ms` inside the tx.
+//! If a concurrent admin reset has already advanced the schedule
+//! past `now`, [`crate::budget::budget_reset_reconciler_apply`]
+//! skips applying another reset; otherwise it performs the same
+//! reset transition as the admin path. Deterministic under the
+//! single-writer invariant.
 
 use sqlx::{Row, SqlitePool};
 
