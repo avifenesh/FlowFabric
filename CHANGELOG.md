@@ -7,6 +7,50 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 2b.2.2 stream readers + outbox
+  cursor-resume primitive (RFC-023 Group C + Group D.2; completes
+  Phase 2).** Replaces the 3 Group C `Unavailable` stubs with real
+  bodies: `read_stream` (XRANGE-equivalent over `(ts_ms, seq)`),
+  `tail_stream` (opportunistic SELECT + `stream_frame` broadcast park
+  + re-SELECT, `TailVisibility::ExcludeBestEffort` filters
+  `mode <> 'best_effort'` in SQL), and `read_summary` (row fetch from
+  `ff_stream_summary` with byte-normalized `document_json`). Every
+  body mirrors `ff-backend-postgres/src/stream.rs`; the broadcast
+  park replaces PG's `LISTEN/NOTIFY` (RFC-023 §4.2) and no pool
+  connection is held while parked.
+- `crates/ff-backend-sqlite/src/outbox_cursor.rs` — generic
+  cursor-resume + broadcast-wakeup reader primitive. One
+  `OutboxCursorConfig<T>` takes pool, per-outbox SELECT SQL,
+  partition key, cursor watermark, batch size, broadcast receiver,
+  row decoder, and event-id extractor; `spawn()` returns an
+  `OutboxCursorStream<T>` adapter over `futures_core::Stream`.
+  Handles the three steady-state paths that Phase 3 `subscribe_*`
+  impls need: (1) cursor-resume catch-up before attaching
+  broadcast, (2) `RecvError::Lagged(n)` → fall back to cursor-select
+  (outbox is durable so lagged wakeups are harmless), (3) clean
+  shutdown when the consumer drops the stream or the backend drops
+  the broadcast sender. Closure-based decoder keeps the primitive
+  column-agnostic so Phase 3's 5 outbox tables each plug in their
+  own row-typing without a shared `OutboxRow` trait zoo. Exercised
+  end-to-end by 3 unit tests against a real `stream_frame`
+  producer (`append_frame` → broadcast → reader yields typed
+  event): catch-up-then-live, cursor-resume skips seen rows, clean
+  shutdown on stream drop.
+- `crates/ff-backend-sqlite/src/queries/stream.rs` — read-side SQL
+  constants: `READ_STREAM_RANGE_SQL` (inclusive `(ts_ms, seq)`
+  range), `TAIL_STREAM_AFTER_SQL` + `TAIL_STREAM_AFTER_EXCLUDE_BE_SQL`
+  (strictly after cursor, with/without best-effort filter),
+  `READ_SUMMARY_FULL_SQL` (five-column summary fetch),
+  `OUTBOX_TAIL_STREAM_FRAME_SQL` (ROWID-based outbox tail).
+- `crates/ff-backend-sqlite/tests/stream_reader.rs` — 10-test
+  integration harness covering happy-path `read_stream`, cursor
+  pagination, per-attempt-index isolation, summary merge/missing,
+  `tail_stream` fast-path / wake-on-append / timeout / open-cursor
+  rejection / best-effort visibility filter. Seeds via the Phase 2a
+  producer path (`claim` + `append_frame`) so the tests double as
+  end-to-end coverage from the producer outbox emit through to the
+  reader surface.
+
 - **`crates/ff-backend-sqlite` — Phase 2b.2.1 suspend/signal/waitpoint
   producer (RFC-023 Group B, minus `list_pending_waitpoints` deferred
   to Phase 3).** Replaces 6 Group B `Unavailable` stubs with real

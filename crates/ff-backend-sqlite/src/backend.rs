@@ -21,6 +21,8 @@ use ff_core::backend::{
     PendingWaitpoint, ReclaimToken, ResumeSignal, SUMMARY_NULL_SENTINEL, StreamMode,
     UsageDimensions,
 };
+#[cfg(feature = "streaming")]
+use ff_core::backend::{SummaryDocument, TailVisibility};
 use ff_core::capability::{BackendIdentity, Capabilities, Supports, Version};
 use ff_core::caps::{CapabilityRequirement, matches as caps_matches};
 use ff_core::contracts::{
@@ -35,7 +37,7 @@ use ff_core::contracts::{
     ListLanesPage, ListSuspendedPage, SetEdgeGroupPolicyResult,
 };
 #[cfg(feature = "streaming")]
-use ff_core::contracts::{StreamCursor, StreamFrames};
+use ff_core::contracts::{STREAM_READ_HARD_CAP, StreamCursor, StreamFrame, StreamFrames};
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{BackendError, ContentionKind, EngineError, ValidationKind};
 use ff_core::handle_codec::HandlePayload;
@@ -602,7 +604,8 @@ async fn fail_inner(
             .await
             .map_err(map_sqlx_error)?;
 
-        let completion_ev = insert_completion_event_ev(conn, part, exec_uuid, "failed", now).await?;
+        let completion_ev =
+            insert_completion_event_ev(conn, part, exec_uuid, "failed", now).await?;
         emits.push((OutboxChannel::Completion, completion_ev));
 
         let lease_ev = insert_lease_event(conn, part, exec_uuid, "revoked", now).await?;
@@ -958,9 +961,7 @@ async fn append_frame_inner(
                 let parsed: serde_json::Value =
                     serde_json::from_str(&text).map_err(|e| EngineError::Validation {
                         kind: ValidationKind::Corruption,
-                        detail: format!(
-                            "corrupt summary document in ff_stream_summary: {e}"
-                        ),
+                        detail: format!("corrupt summary document in ff_stream_summary: {e}"),
                     })?;
                 (parsed, v)
             }
@@ -1063,6 +1064,256 @@ async fn append_frame_inner(
         out = out.with_summary_version(v);
     }
     Ok((out, emits))
+}
+
+// ── Phase 2b.2.2 stream readers (Group C) ─────────────────────────────
+
+/// Parse a [`StreamCursor`] into `(ts_ms, seq)`. Mirror of PG at
+/// `ff-backend-postgres/src/stream.rs:365-395`. `Start` maps to the
+/// smallest representable tuple (i64::MIN, i64::MIN) so the lower
+/// bound on `read_stream` is inclusive-from-earliest; `End` maps to
+/// (i64::MAX, i64::MAX) for the symmetric upper bound.
+#[cfg(feature = "streaming")]
+fn parse_cursor_bound(c: &StreamCursor) -> Result<(i64, i64), EngineError> {
+    match c {
+        StreamCursor::Start => Ok((i64::MIN, i64::MIN)),
+        StreamCursor::End => Ok((i64::MAX, i64::MAX)),
+        StreamCursor::At(s) => parse_concrete_cursor(s),
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn parse_concrete_cursor(s: &str) -> Result<(i64, i64), EngineError> {
+    let (ms, seq) = match s.split_once('-') {
+        Some((a, b)) => (a, b),
+        None => (s, "0"),
+    };
+    let ms: i64 = ms.parse().map_err(|_| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("bad stream cursor '{s}' (ms)"),
+    })?;
+    let sq: i64 = seq.parse().map_err(|_| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("bad stream cursor '{s}' (seq)"),
+    })?;
+    Ok((ms, sq))
+}
+
+#[cfg(feature = "streaming")]
+fn row_to_frame(ts_ms: i64, seq: i64, fields_text: &str) -> StreamFrame {
+    use std::collections::BTreeMap;
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    if let Ok(serde_json::Value::Object(map)) =
+        serde_json::from_str::<serde_json::Value>(fields_text)
+    {
+        for (k, v) in map {
+            let s = match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            out.insert(k, s);
+        }
+    }
+    StreamFrame {
+        id: format!("{ts_ms}-{seq}"),
+        fields: out,
+    }
+}
+
+#[cfg(feature = "streaming")]
+async fn read_stream_impl(
+    pool: &SqlitePool,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+    from: StreamCursor,
+    to: StreamCursor,
+    count_limit: u64,
+) -> Result<StreamFrames, EngineError> {
+    let (part, exec_uuid) = split_exec_id(execution_id)?;
+    let aidx: i64 = i64::from(attempt_index.0);
+    let (from_ms, from_seq) = parse_cursor_bound(&from)?;
+    let (to_ms, to_seq) = parse_cursor_bound(&to)?;
+    let lim = i64::try_from(count_limit.min(STREAM_READ_HARD_CAP)).unwrap_or(i64::MAX);
+
+    let rows = sqlx::query(q_stream::READ_STREAM_RANGE_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(aidx)
+        .bind(from_ms)
+        .bind(from_seq)
+        .bind(to_ms)
+        .bind(to_seq)
+        .bind(lim)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    let mut frames = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ts: i64 = row.try_get("ts_ms").map_err(map_sqlx_error)?;
+        let seq: i64 = row.try_get("seq").map_err(map_sqlx_error)?;
+        let fields_text: String = row.try_get("fields").map_err(map_sqlx_error)?;
+        frames.push(row_to_frame(ts, seq, &fields_text));
+    }
+    Ok(StreamFrames {
+        frames,
+        closed_at: None,
+        closed_reason: None,
+    })
+}
+
+#[cfg(feature = "streaming")]
+#[allow(clippy::too_many_arguments)] // mirrors the trait signature
+async fn tail_stream_impl(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+    after: StreamCursor,
+    block_ms: u64,
+    count_limit: u64,
+    visibility: TailVisibility,
+) -> Result<StreamFrames, EngineError> {
+    let (part, exec_uuid) = split_exec_id(execution_id)?;
+    let aidx: i64 = i64::from(attempt_index.0);
+    let (after_ms, after_seq) = match &after {
+        StreamCursor::At(s) => parse_concrete_cursor(s)?,
+        _ => {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "tail_stream requires concrete after cursor".into(),
+            });
+        }
+    };
+    let lim = i64::try_from(count_limit.min(STREAM_READ_HARD_CAP)).unwrap_or(i64::MAX);
+    let sql = match visibility {
+        TailVisibility::ExcludeBestEffort => q_stream::TAIL_STREAM_AFTER_EXCLUDE_BE_SQL,
+        _ => q_stream::TAIL_STREAM_AFTER_SQL,
+    };
+
+    // Subscribe BEFORE the first SELECT so we never miss a broadcast
+    // wake between SELECT and park. Matches PG's LISTEN-then-SELECT
+    // handshake at `ff-backend-postgres/src/stream.rs:496-498`.
+    let mut rx = pubsub.stream_frame.subscribe();
+
+    let do_select = || async {
+        sqlx::query(sql)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(aidx)
+            .bind(after_ms)
+            .bind(after_seq)
+            .bind(lim)
+            .fetch_all(pool)
+            .await
+            .map_err(map_sqlx_error)
+    };
+
+    let rows = do_select().await?;
+    if !rows.is_empty() || block_ms == 0 {
+        return Ok(rows_to_frames(rows));
+    }
+
+    // Park on the broadcast receiver — NO SQLite connection held here.
+    // Loop until timeout OR the re-SELECT returns a non-empty set:
+    // a broadcast tick may correspond to a frame that failed the
+    // visibility filter, in which case we re-park for the remainder.
+    let start = std::time::Instant::now();
+    let total = Duration::from_millis(block_ms);
+    loop {
+        let remaining = match total.checked_sub(start.elapsed()) {
+            Some(r) if !r.is_zero() => r,
+            _ => break,
+        };
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(_)) => {}
+            // Lagged → outbox is durable; just re-select.
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            // Producer closed → do one last re-select + return.
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                return Ok(rows_to_frames(do_select().await?));
+            }
+            // Timeout; fall through to break below.
+            Err(_) => break,
+        }
+        let rows = do_select().await?;
+        if !rows.is_empty() {
+            return Ok(rows_to_frames(rows));
+        }
+        if start.elapsed() >= total {
+            break;
+        }
+    }
+
+    Ok(StreamFrames::empty_open())
+}
+
+#[cfg(feature = "streaming")]
+fn rows_to_frames(rows: Vec<sqlx::sqlite::SqliteRow>) -> StreamFrames {
+    let mut frames = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ts: i64 = row.try_get("ts_ms").unwrap_or(0);
+        let seq: i64 = row.try_get("seq").unwrap_or(0);
+        let fields_text: String = row.try_get("fields").unwrap_or_default();
+        frames.push(row_to_frame(ts, seq, &fields_text));
+    }
+    StreamFrames {
+        frames,
+        closed_at: None,
+        closed_reason: None,
+    }
+}
+
+#[cfg(feature = "streaming")]
+async fn read_summary_impl(
+    pool: &SqlitePool,
+    execution_id: &ExecutionId,
+    attempt_index: AttemptIndex,
+) -> Result<Option<SummaryDocument>, EngineError> {
+    let (part, exec_uuid) = split_exec_id(execution_id)?;
+    let aidx: i64 = i64::from(attempt_index.0);
+
+    let row = sqlx::query(q_stream::READ_SUMMARY_FULL_SQL)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(aidx)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else { return Ok(None) };
+    let doc_text: String = row.try_get("document_json").map_err(map_sqlx_error)?;
+    let version: i64 = row.try_get("version").map_err(map_sqlx_error)?;
+    let patch_kind_wire: Option<String> = row
+        .try_get::<Option<String>, _>("patch_kind")
+        .unwrap_or(None);
+    let last_updated: i64 = row.try_get("last_updated_ms").map_err(map_sqlx_error)?;
+    let first_applied: i64 = row.try_get("first_applied_ms").map_err(map_sqlx_error)?;
+
+    // Re-serialize via serde_json to normalize whitespace so SQLite and
+    // PG observers receive byte-identical documents for equivalent
+    // stored state. A corrupt stored blob surfaces as Validation —
+    // matches the Phase 2a.3 `append_frame` strict-parse posture.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&doc_text).map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("corrupt summary document in ff_stream_summary: {e}"),
+        })?;
+    let bytes = serde_json::to_vec(&parsed).map_err(|e| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("summary document not serialisable: {e}"),
+    })?;
+    let patch_kind = match patch_kind_wire.as_deref() {
+        Some("json-merge-patch") => PatchKind::JsonMergePatch,
+        _ => PatchKind::JsonMergePatch,
+    };
+    Ok(Some(SummaryDocument::new(
+        bytes,
+        u64::try_from(version).unwrap_or(0),
+        patch_kind,
+        u64::try_from(last_updated).unwrap_or(0),
+        u64::try_from(first_applied).unwrap_or(0),
+    )))
 }
 
 // ── claim_from_reclaim ────────────────────────────────────────────────
@@ -1213,10 +1464,7 @@ fn build_create_execution_raw_fields(args: &CreateExecutionArgs) -> String {
         "last_mutation_at".into(),
         Value::String(args.now.0.to_string()),
     );
-    raw.insert(
-        "total_attempt_count".into(),
-        Value::String("0".to_owned()),
-    );
+    raw.insert("total_attempt_count".into(), Value::String("0".to_owned()));
     let tags_json: Map<String, Value> = args
         .tags
         .iter()
@@ -1394,9 +1642,7 @@ async fn add_execution_to_flow_impl(
     if exec_part != part {
         return Err(EngineError::Validation {
             kind: ValidationKind::InvalidInput,
-            detail: format!(
-                "execution partition mismatch: expected 0, got {exec_part}"
-            ),
+            detail: format!("execution partition mismatch: expected 0, got {exec_part}"),
         });
     }
     let now_ms = args.now.0;
@@ -1416,7 +1662,9 @@ async fn add_execution_to_flow_impl(
                 detail: "flow_not_found".into(),
             });
         };
-        let public_flow_state: String = flow_row.try_get("public_flow_state").map_err(map_sqlx_error)?;
+        let public_flow_state: String = flow_row
+            .try_get("public_flow_state")
+            .map_err(map_sqlx_error)?;
         if matches!(
             public_flow_state.as_str(),
             "cancelled" | "completed" | "failed" | "terminal"
@@ -1446,9 +1694,8 @@ async fn add_execution_to_flow_impl(
         // 3. Idempotent: already on this flow.
         if existing_flow_id == Some(flow_uuid) {
             // Read node_count from cached raw_fields (avoid a second SELECT).
-            let raw_val: serde_json::Value = serde_json::from_str(&raw_fields_text).unwrap_or_else(
-                |_| serde_json::Value::Object(serde_json::Map::new()),
-            );
+            let raw_val: serde_json::Value = serde_json::from_str(&raw_fields_text)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
             let nc = raw_val
                 .get("node_count")
                 .and_then(|v| v.as_u64())
@@ -1563,7 +1810,10 @@ async fn stage_dependency_edge_impl(
                 }),
                 Some(r) => {
                     let state: String = r.try_get("public_flow_state").map_err(map_sqlx_error)?;
-                    if matches!(state.as_str(), "cancelled" | "completed" | "failed" | "terminal") {
+                    if matches!(
+                        state.as_str(),
+                        "cancelled" | "completed" | "failed" | "terminal"
+                    ) {
                         Err(EngineError::Validation {
                             kind: ValidationKind::InvalidInput,
                             detail: "flow_already_terminal".into(),
@@ -1576,14 +1826,15 @@ async fn stage_dependency_edge_impl(
         }
 
         // 2. Membership check.
-        let member_rows = sqlx::query_scalar::<_, Uuid>(q_flow_staging::SELECT_FLOW_MEMBERSHIP_PAIR_SQL)
-            .bind(part)
-            .bind(flow_uuid)
-            .bind(upstream_uuid)
-            .bind(downstream_uuid)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(map_sqlx_error)?;
+        let member_rows =
+            sqlx::query_scalar::<_, Uuid>(q_flow_staging::SELECT_FLOW_MEMBERSHIP_PAIR_SQL)
+                .bind(part)
+                .bind(flow_uuid)
+                .bind(upstream_uuid)
+                .bind(downstream_uuid)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
         if !member_rows.contains(&upstream_uuid) || !member_rows.contains(&downstream_uuid) {
             return Err(EngineError::Validation {
                 kind: ValidationKind::InvalidInput,
@@ -1692,12 +1943,11 @@ async fn apply_dependency_to_child_impl(
             });
         };
         let policy_text: String = row.try_get("policy").map_err(map_sqlx_error)?;
-        let mut policy: serde_json::Value = serde_json::from_str(&policy_text).map_err(|e| {
-            EngineError::Validation {
+        let mut policy: serde_json::Value =
+            serde_json::from_str(&policy_text).map_err(|e| EngineError::Validation {
                 kind: ValidationKind::Corruption,
                 detail: format!("ff_edge.policy: {e}"),
-            }
-        })?;
+            })?;
 
         // 2. Idempotency.
         let already_applied = policy
@@ -2115,6 +2365,17 @@ impl SqliteBackend {
     ) -> tokio::sync::broadcast::Receiver<crate::pubsub::OutboxEvent> {
         self.inner.pubsub.completion.subscribe()
     }
+
+    /// Test-only broadcast accessor for the `stream_frame` channel.
+    /// Exposed so Phase 2b.2.2 `outbox_cursor::tests` can subscribe
+    /// before driving `append_frame`.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn stream_frame_receiver_for_test(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::pubsub::OutboxEvent> {
+        self.inner.pubsub.stream_frame.subscribe()
+    }
 }
 
 #[async_trait]
@@ -2186,10 +2447,8 @@ impl EngineBackend for SqliteBackend {
     ) -> Result<SuspendOutcome, EngineError> {
         let pool = &self.inner.pool;
         let pubsub = &self.inner.pubsub;
-        retry_serializable(|| {
-            crate::suspend_ops::suspend_impl(pool, pubsub, handle, args.clone())
-        })
-        .await
+        retry_serializable(|| crate::suspend_ops::suspend_impl(pool, pubsub, handle, args.clone()))
+            .await
     }
 
     async fn suspend_by_triple(
@@ -2329,10 +2588,8 @@ impl EngineBackend for SqliteBackend {
     ) -> Result<DeliverSignalResult, EngineError> {
         let pool = &self.inner.pool;
         let pubsub = &self.inner.pubsub;
-        retry_serializable(|| {
-            crate::suspend_ops::deliver_signal_impl(pool, pubsub, args.clone())
-        })
-        .await
+        retry_serializable(|| crate::suspend_ops::deliver_signal_impl(pool, pubsub, args.clone()))
+            .await
     }
 
     #[cfg(feature = "core")]
@@ -2386,35 +2643,49 @@ impl EngineBackend for SqliteBackend {
     #[cfg(feature = "streaming")]
     async fn read_stream(
         &self,
-        _execution_id: &ExecutionId,
-        _attempt_index: AttemptIndex,
-        _from: StreamCursor,
-        _to: StreamCursor,
-        _count_limit: u64,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        from: StreamCursor,
+        to: StreamCursor,
+        count_limit: u64,
     ) -> Result<StreamFrames, EngineError> {
-        unavailable("sqlite.read_stream")
+        let pool = &self.inner.pool;
+        read_stream_impl(pool, execution_id, attempt_index, from, to, count_limit).await
     }
 
     #[cfg(feature = "streaming")]
     async fn tail_stream(
         &self,
-        _execution_id: &ExecutionId,
-        _attempt_index: AttemptIndex,
-        _after: StreamCursor,
-        _block_ms: u64,
-        _count_limit: u64,
-        _visibility: ff_core::backend::TailVisibility,
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+        after: StreamCursor,
+        block_ms: u64,
+        count_limit: u64,
+        visibility: TailVisibility,
     ) -> Result<StreamFrames, EngineError> {
-        unavailable("sqlite.tail_stream")
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        tail_stream_impl(
+            pool,
+            pubsub,
+            execution_id,
+            attempt_index,
+            after,
+            block_ms,
+            count_limit,
+            visibility,
+        )
+        .await
     }
 
     #[cfg(feature = "streaming")]
     async fn read_summary(
         &self,
-        _execution_id: &ExecutionId,
-        _attempt_index: AttemptIndex,
-    ) -> Result<Option<ff_core::backend::SummaryDocument>, EngineError> {
-        unavailable("sqlite.read_summary")
+        execution_id: &ExecutionId,
+        attempt_index: AttemptIndex,
+    ) -> Result<Option<SummaryDocument>, EngineError> {
+        let pool = &self.inner.pool;
+        read_summary_impl(pool, execution_id, attempt_index).await
     }
 
     // ── RFC-017 Stage A — Ingress (create + flow staging) ──
@@ -2434,10 +2705,7 @@ impl EngineBackend for SqliteBackend {
     }
 
     #[cfg(feature = "core")]
-    async fn create_flow(
-        &self,
-        args: CreateFlowArgs,
-    ) -> Result<CreateFlowResult, EngineError> {
+    async fn create_flow(&self, args: CreateFlowArgs) -> Result<CreateFlowResult, EngineError> {
         let pool = &self.inner.pool;
         retry_serializable(|| create_flow_impl(pool, &args)).await
     }

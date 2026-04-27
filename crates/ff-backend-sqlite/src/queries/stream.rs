@@ -1,11 +1,11 @@
-//! SQLite dialect-forked queries for the RFC-015 stream append path.
+//! SQLite dialect-forked queries for the RFC-015 stream surface.
 //!
-//! Populated in Phase 2a.3 per RFC-023 §4.1. Mirrors
-//! `ff-backend-postgres/src/stream.rs` statement-for-statement for the
-//! write surface (`append_frame`). The read surface
-//! (`read_stream` / `tail_stream` / `read_summary`) lands in a later
-//! phase — it needs in-Rust notifier wiring that replaces PG's
-//! `LISTEN/NOTIFY` plumbing.
+//! Populated in Phase 2a.3 per RFC-023 §4.1 (write path) + Phase
+//! 2b.2.2 (read path). Mirrors `ff-backend-postgres/src/stream.rs`
+//! statement-for-statement: `append_frame`, `read_stream`,
+//! `tail_stream` (same SELECT shape; in-Rust broadcast replaces PG's
+//! `LISTEN/NOTIFY` at the backend layer — see
+//! `crate::pubsub::PubSub::stream_frame`), and `read_summary`.
 //!
 //! # Dialect notes
 //!
@@ -108,4 +108,77 @@ pub(crate) const TRIM_STREAM_FRAMES_SQL: &str = r#"
 pub(crate) const COUNT_STREAM_FRAMES_SQL: &str = r#"
     SELECT COUNT(*) AS c FROM ff_stream_frame
      WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3
+"#;
+
+// ── Phase 2b.2.2 read surface ─────────────────────────────────────────
+
+/// `read_stream` — XRANGE-equivalent over the `(ts_ms, seq)` tuple
+/// ordering. Binds: `?1=partition_key`, `?2=execution_id` (BLOB),
+/// `?3=attempt_index`, `?4=from_ts`, `?5=from_seq`, `?6=to_ts`,
+/// `?7=to_seq`, `?8=limit`. Mirror of PG at
+/// `ff-backend-postgres/src/stream.rs:414-418` — SQLite supports the
+/// same row-value comparison shape `(a, b) >= (x, y)` so the SQL
+/// ports verbatim.
+pub(crate) const READ_STREAM_RANGE_SQL: &str = r#"
+    SELECT ts_ms, seq, fields FROM ff_stream_frame
+     WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3
+       AND (ts_ms, seq) >= (?4, ?5) AND (ts_ms, seq) <= (?6, ?7)
+     ORDER BY ts_ms, seq
+     LIMIT ?8
+"#;
+
+/// `tail_stream` — rows strictly after `(after_ts, after_seq)`. Binds:
+/// `?1=partition_key`, `?2=execution_id` (BLOB), `?3=attempt_index`,
+/// `?4=after_ts`, `?5=after_seq`, `?6=limit`. Mirror of PG at
+/// `ff-backend-postgres/src/stream.rs:500-504`.
+pub(crate) const TAIL_STREAM_AFTER_SQL: &str = r#"
+    SELECT ts_ms, seq, fields FROM ff_stream_frame
+     WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3
+       AND (ts_ms, seq) > (?4, ?5)
+     ORDER BY ts_ms, seq
+     LIMIT ?6
+"#;
+
+/// `tail_stream` with `TailVisibility::ExcludeBestEffort` — additive
+/// `mode <> 'best_effort'` filter. Binds identical to
+/// [`TAIL_STREAM_AFTER_SQL`].
+pub(crate) const TAIL_STREAM_AFTER_EXCLUDE_BE_SQL: &str = r#"
+    SELECT ts_ms, seq, fields FROM ff_stream_frame
+     WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3
+       AND (ts_ms, seq) > (?4, ?5)
+       AND mode <> 'best_effort'
+     ORDER BY ts_ms, seq
+     LIMIT ?6
+"#;
+
+/// `read_summary` — fetch the full summary row for caller consumption.
+/// Binds: `?1=partition_key`, `?2=execution_id`, `?3=attempt_index`.
+/// Mirror of PG at `ff-backend-postgres/src/stream.rs:576-580`.
+pub(crate) const READ_SUMMARY_FULL_SQL: &str = r#"
+    SELECT document_json, version, patch_kind, last_updated_ms, first_applied_ms
+      FROM ff_stream_summary
+     WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3
+"#;
+
+// ── Phase 2b.2.2 outbox-cursor-reader SQL ─────────────────────────────
+
+/// Cursor-resume tail of `ff_stream_frame` for the OutboxCursorReader
+/// primitive. Unlike the row-value `(ts_ms, seq)` cursor used by
+/// `tail_stream`, the outbox-cursor reader uses the table's ROWID as
+/// the monotonic event id — matches the `last_insert_rowid()` shape
+/// the producer emits via the `stream_frame` broadcast channel.
+///
+/// Binds: `?1=partition_key`, `?2=cursor_rowid`, `?3=batch_size`.
+///
+/// Only referenced from `outbox_cursor::tests` today — Phase 3's
+/// `subscribe_stream_frame` trait impl will be the first non-test
+/// consumer.
+#[cfg(test)]
+pub(crate) const OUTBOX_TAIL_STREAM_FRAME_SQL: &str = r#"
+    SELECT _rowid_ AS event_id,
+           partition_key, execution_id, attempt_index, ts_ms, seq, fields, mode
+      FROM ff_stream_frame
+     WHERE partition_key = ?1 AND _rowid_ > ?2
+     ORDER BY _rowid_ ASC
+     LIMIT ?3
 "#;
