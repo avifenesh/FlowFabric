@@ -15,15 +15,17 @@
 
 use ff_backend_sqlite::SqliteBackend;
 use ff_core::backend::{
-    BackendTag, CapabilitySet, ClaimPolicy, FailureClass, FailureReason, Handle, HandleKind,
+    BackendTag, CapabilitySet, ClaimPolicy, FailureClass, FailureReason, Frame, FrameKind, Handle,
+    HandleKind, PatchKind, ReclaimToken, StreamMode,
 };
+use ff_core::contracts::ReclaimGrant;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{ContentionKind, EngineError, ValidationKind};
-use ff_core::handle_codec::{encode as encode_opaque, HandlePayload};
+use ff_core::handle_codec::{HandlePayload, encode as encode_opaque};
 use ff_core::partition::PartitionConfig;
+use ff_core::partition::{Partition, PartitionFamily, PartitionKey};
 use ff_core::types::{
-    AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseEpoch, LeaseId, WorkerId,
-    WorkerInstanceId,
+    AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseEpoch, LeaseId, WorkerId, WorkerInstanceId,
 };
 use serial_test::serial;
 use std::sync::Arc;
@@ -68,8 +70,7 @@ async fn seed_runnable_execution(
     let pool = backend.pool_for_test();
     let exec_uuid = Uuid::new_v4();
     // Partition 0 per RFC-023 §4.1 A3 — num_flow_partitions = 1.
-    let exec_id = ExecutionId::parse(&format!("{{fp:0}}:{exec_uuid}"))
-        .expect("construct exec_id");
+    let exec_id = ExecutionId::parse(&format!("{{fp:0}}:{exec_uuid}")).expect("construct exec_id");
 
     sqlx::query(
         r#"
@@ -153,8 +154,7 @@ async fn read_exec_phase(backend: &SqliteBackend, exec_uuid: Uuid) -> String {
 #[serial(ff_dev_mode)]
 async fn claim_happy_path_mints_handle_and_transitions_state() {
     let backend = fresh_backend().await;
-    let (_exec_id, exec_uuid) =
-        seed_runnable_execution(&backend, "default", &["capA"]).await;
+    let (_exec_id, exec_uuid) = seed_runnable_execution(&backend, "default", &["capA"]).await;
 
     let caps = CapabilitySet::new(["capA"]);
     let h = backend
@@ -476,4 +476,517 @@ async fn fail_permanent_writes_terminal_failed() {
         read_attempt_outcome(&backend, exec_uuid, 0).await,
         Some("failed".into())
     );
+}
+
+// ── Phase 2a.3 — progress ───────────────────────────────────────────────
+
+/// Helper: read `progress_pct` + `progress_message` back from the
+/// raw_fields JSON document.
+async fn read_progress(backend: &SqliteBackend, exec_uuid: Uuid) -> (Option<i64>, Option<String>) {
+    let pool = backend.pool_for_test();
+    let row: (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT json_extract(raw_fields, '$.progress_pct'), \
+                json_extract(raw_fields, '$.progress_message') \
+         FROM ff_exec_core WHERE partition_key = 0 AND execution_id = ?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read progress");
+    row
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn progress_writes_pct_and_message_to_raw_fields() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    backend
+        .progress(&h, Some(42), Some("halfway".into()))
+        .await
+        .expect("progress");
+
+    let (pct, msg) = read_progress(&backend, exec_uuid).await;
+    assert_eq!(pct, Some(42));
+    assert_eq!(msg, Some("halfway".into()));
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn progress_preserves_prior_values_on_partial_update() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    backend
+        .progress(&h, Some(10), Some("starting".into()))
+        .await
+        .expect("progress-1");
+
+    // Second call only sets pct — message must remain "starting".
+    backend
+        .progress(&h, Some(75), None)
+        .await
+        .expect("progress-2");
+    let (pct, msg) = read_progress(&backend, exec_uuid).await;
+    assert_eq!(pct, Some(75));
+    assert_eq!(msg, Some("starting".into()));
+
+    // Third call only sets message — pct stays at 75.
+    backend
+        .progress(&h, None, Some("winding down".into()))
+        .await
+        .expect("progress-3");
+    let (pct, msg) = read_progress(&backend, exec_uuid).await;
+    assert_eq!(pct, Some(75));
+    assert_eq!(msg, Some("winding down".into()));
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn progress_fence_mismatch_returns_contention() {
+    let backend = fresh_backend().await;
+    let (eid, _exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    let bad_payload = HandlePayload::new(
+        eid,
+        AttemptIndex::new(0),
+        AttemptId::new(),
+        LeaseId::new(),
+        LeaseEpoch(999),
+        30_000,
+        LaneId::new("default"),
+        WorkerInstanceId::new("test-worker-instance"),
+    );
+    let bad_opaque = encode_opaque(BackendTag::Sqlite, &bad_payload);
+    let bad_handle = Handle::new(BackendTag::Sqlite, HandleKind::Fresh, bad_opaque);
+
+    let err = backend
+        .progress(&bad_handle, Some(50), None)
+        .await
+        .expect_err("fence mismatch must surface");
+    assert!(
+        matches!(err, EngineError::Contention(ContentionKind::LeaseConflict)),
+        "expected LeaseConflict, got {err:?}"
+    );
+}
+
+// ── Phase 2a.3 — renew ─────────────────────────────────────────────────
+
+async fn read_lease_expiry(
+    backend: &SqliteBackend,
+    exec_uuid: Uuid,
+    attempt_index: i64,
+) -> Option<i64> {
+    let pool = backend.pool_for_test();
+    sqlx::query_scalar(
+        "SELECT lease_expires_at_ms FROM ff_attempt \
+         WHERE partition_key = 0 AND execution_id = ?1 AND attempt_index = ?2",
+    )
+    .bind(exec_uuid)
+    .bind(attempt_index)
+    .fetch_one(pool)
+    .await
+    .expect("read lease expiry")
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn renew_advances_lease_expiry_and_emits_event() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    let expiry_before = read_lease_expiry(&backend, exec_uuid, 0).await.unwrap();
+    // Sleep 2ms so the re-computed `now + ttl` advances beyond the
+    // claim's `now + ttl` by a strictly positive amount.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    let renewal = backend.renew(&h).await.expect("renew");
+    assert!(
+        renewal.expires_at_ms as i64 > expiry_before,
+        "renew must advance lease expiry (before={expiry_before}, after={})",
+        renewal.expires_at_ms,
+    );
+
+    let expiry_after = read_lease_expiry(&backend, exec_uuid, 0).await.unwrap();
+    assert_eq!(expiry_after, renewal.expires_at_ms as i64);
+
+    let pool = backend.pool_for_test();
+    let events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM ff_lease_event \
+         WHERE execution_id = ?1 ORDER BY event_id ASC",
+    )
+    .bind(exec_uuid.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read lease events");
+    assert_eq!(events, vec!["acquired", "renewed"]);
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn renew_fence_mismatch_returns_contention() {
+    let backend = fresh_backend().await;
+    let (eid, _exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    let bad_payload = HandlePayload::new(
+        eid,
+        AttemptIndex::new(0),
+        AttemptId::new(),
+        LeaseId::new(),
+        LeaseEpoch(999),
+        30_000,
+        LaneId::new("default"),
+        WorkerInstanceId::new("test-worker-instance"),
+    );
+    let bad_opaque = encode_opaque(BackendTag::Sqlite, &bad_payload);
+    let bad_handle = Handle::new(BackendTag::Sqlite, HandleKind::Fresh, bad_opaque);
+
+    let err = backend
+        .renew(&bad_handle)
+        .await
+        .expect_err("fence mismatch");
+    assert!(
+        matches!(err, EngineError::Contention(ContentionKind::LeaseConflict)),
+        "expected LeaseConflict, got {err:?}"
+    );
+}
+
+// ── Phase 2a.3 — append_frame ──────────────────────────────────────────
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn append_frame_durable_writes_frame_row() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    let frame = Frame::new(b"hello".to_vec(), FrameKind::Stdout);
+    let out = backend.append_frame(&h, frame).await.expect("append");
+    assert_eq!(out.frame_count, 1);
+    assert!(out.stream_id.contains('-'));
+    assert_eq!(out.summary_version, None);
+
+    let pool = backend.pool_for_test();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ff_stream_frame \
+         WHERE partition_key = 0 AND execution_id = ?1 AND attempt_index = 0",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 1);
+
+    // Append a second frame → count=2.
+    let frame2 = Frame::new(b"world".to_vec(), FrameKind::Stdout);
+    let out2 = backend.append_frame(&h, frame2).await.expect("append 2");
+    assert_eq!(out2.frame_count, 2);
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn append_frame_summary_merges_document_and_bumps_version() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    // First delta: {"a":1}
+    let f1 = Frame::new(br#"{"a":1}"#.to_vec(), FrameKind::Event).with_mode(
+        StreamMode::DurableSummary {
+            patch_kind: PatchKind::JsonMergePatch,
+        },
+    );
+    let out1 = backend.append_frame(&h, f1).await.expect("append 1");
+    assert_eq!(out1.summary_version, Some(1));
+
+    // Second delta: {"b":2} — merges with prior.
+    let f2 = Frame::new(br#"{"b":2}"#.to_vec(), FrameKind::Event).with_mode(
+        StreamMode::DurableSummary {
+            patch_kind: PatchKind::JsonMergePatch,
+        },
+    );
+    let out2 = backend.append_frame(&h, f2).await.expect("append 2");
+    assert_eq!(out2.summary_version, Some(2));
+
+    let pool = backend.pool_for_test();
+    let (doc, version): (String, i64) = sqlx::query_as(
+        "SELECT document_json, version FROM ff_stream_summary \
+         WHERE partition_key = 0 AND execution_id = ?1 AND attempt_index = 0",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read summary");
+    assert_eq!(version, 2);
+    let doc_val: serde_json::Value = serde_json::from_str(&doc).expect("parse doc");
+    assert_eq!(doc_val["a"], serde_json::Value::from(1));
+    assert_eq!(doc_val["b"], serde_json::Value::from(2));
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn append_frame_fence_mismatch_returns_contention() {
+    let backend = fresh_backend().await;
+    let (eid, _exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    let bad_payload = HandlePayload::new(
+        eid,
+        AttemptIndex::new(0),
+        AttemptId::new(),
+        LeaseId::new(),
+        LeaseEpoch(999),
+        30_000,
+        LaneId::new("default"),
+        WorkerInstanceId::new("test-worker-instance"),
+    );
+    let bad_opaque = encode_opaque(BackendTag::Sqlite, &bad_payload);
+    let bad_handle = Handle::new(BackendTag::Sqlite, HandleKind::Fresh, bad_opaque);
+
+    let frame = Frame::new(b"x".to_vec(), FrameKind::Stdout);
+    let err = backend
+        .append_frame(&bad_handle, frame)
+        .await
+        .expect_err("fence mismatch");
+    assert!(
+        matches!(err, EngineError::Contention(ContentionKind::LeaseConflict)),
+        "expected LeaseConflict, got {err:?}"
+    );
+}
+
+// ── Phase 2a.3 — claim_from_reclaim ────────────────────────────────────
+
+/// Set the current attempt's lease to expired (now - 1s) to simulate a
+/// stale lease eligible for reclaim.
+async fn expire_current_lease(backend: &SqliteBackend, exec_uuid: Uuid, attempt_index: i64) {
+    let pool = backend.pool_for_test();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    sqlx::query(
+        "UPDATE ff_attempt SET lease_expires_at_ms = ?1 \
+         WHERE partition_key = 0 AND execution_id = ?2 AND attempt_index = ?3",
+    )
+    .bind(now_ms - 1_000)
+    .bind(exec_uuid)
+    .bind(attempt_index)
+    .execute(pool)
+    .await
+    .expect("expire lease");
+}
+
+fn make_reclaim_token(exec_id: ExecutionId) -> ReclaimToken {
+    let partition = Partition {
+        family: PartitionFamily::Execution,
+        index: 0,
+    };
+    let grant = ReclaimGrant {
+        execution_id: exec_id,
+        partition_key: PartitionKey::from(&partition),
+        grant_key: "sqlite:test-grant".into(),
+        expires_at_ms: u64::MAX,
+        lane_id: LaneId::new("default"),
+    };
+    ReclaimToken::new(
+        grant,
+        WorkerId::new("reclaim-worker"),
+        WorkerInstanceId::new("reclaim-worker-instance"),
+        30_000,
+    )
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn claim_from_reclaim_expired_lease_mints_resumed_handle() {
+    let backend = fresh_backend().await;
+    let (eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    // Fence forward: the lease is currently live. Expire it.
+    expire_current_lease(&backend, exec_uuid, 0).await;
+
+    let token = make_reclaim_token(eid);
+    let h = backend
+        .claim_from_reclaim(token)
+        .await
+        .expect("claim_from_reclaim")
+        .expect("Some(handle)");
+    assert_eq!(h.backend, BackendTag::Sqlite);
+    assert_eq!(h.kind, HandleKind::Resumed);
+
+    // The attempt row's epoch bumped to 2 (initial acquire was 1, the
+    // reclaim step adds 1 more).
+    let pool = backend.pool_for_test();
+    let epoch: i64 = sqlx::query_scalar(
+        "SELECT lease_epoch FROM ff_attempt \
+         WHERE partition_key = 0 AND execution_id = ?1 AND attempt_index = 0",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read epoch");
+    assert_eq!(epoch, 2);
+
+    let events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM ff_lease_event \
+         WHERE execution_id = ?1 ORDER BY event_id ASC",
+    )
+    .bind(exec_uuid.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read lease events");
+    assert_eq!(events, vec!["acquired", "reclaimed"]);
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn claim_from_reclaim_live_lease_returns_none() {
+    let backend = fresh_backend().await;
+    let (eid, _exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    // Do not expire — lease is still live. Reclaim must return None.
+    let token = make_reclaim_token(eid);
+    let res = backend
+        .claim_from_reclaim(token)
+        .await
+        .expect("claim_from_reclaim");
+    assert!(res.is_none(), "live lease must block reclaim");
+}
+
+/// PR #376 Copilot review — with the prior field absent + a NULL bind,
+/// SQLite's `json_set(x, '$.k', coalesce(NULL, NULL))` could
+/// materialize an explicit JSON `null`, diverging from the PG
+/// `raw_fields ||` no-op semantics. Assert that a partial `progress`
+/// on a fresh row leaves the un-set field ABSENT, not JSON null.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn progress_partial_update_leaves_absent_field_absent() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    // Set only pct; message has never been written.
+    backend
+        .progress(&h, Some(25), None)
+        .await
+        .expect("progress pct-only");
+
+    // `json_type('$.progress_message')` on an absent key returns NULL.
+    // If the write path materialized `"progress_message": null`,
+    // `json_type` would return `'null'` (the string literal).
+    let pool = backend.pool_for_test();
+    let msg_type: Option<String> = sqlx::query_scalar(
+        "SELECT json_type(raw_fields, '$.progress_message') \
+         FROM ff_exec_core WHERE partition_key = 0 AND execution_id = ?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read json_type");
+    assert_eq!(
+        msg_type, None,
+        "absent field must remain absent, got json_type = {msg_type:?}"
+    );
+}
+
+/// PR #376 Copilot review — `progress(None, None)` must be a no-op.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn progress_both_none_is_no_op() {
+    let backend = fresh_backend().await;
+    let (_eid, exec_uuid) = seed_runnable_execution(&backend, "default", &[]).await;
+
+    let caps = CapabilitySet::new::<_, &str>([]);
+    let h = backend
+        .claim(&LaneId::new("default"), &caps, claim_policy())
+        .await
+        .expect("claim")
+        .expect("handle");
+
+    backend.progress(&h, None, None).await.expect("progress noop");
+
+    let pool = backend.pool_for_test();
+    let pct_type: Option<String> = sqlx::query_scalar(
+        "SELECT json_type(raw_fields, '$.progress_pct') \
+         FROM ff_exec_core WHERE partition_key = 0 AND execution_id = ?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read json_type");
+    assert_eq!(pct_type, None);
 }
