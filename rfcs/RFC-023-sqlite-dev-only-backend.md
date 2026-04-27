@@ -1001,7 +1001,7 @@ trait-implementation. Enumerated:
 framed this step as "flip `Supports::claim_for_worker` +
 `Supports::complete` + `Supports::fail` to `true`." Ground truth at
 `d351625`: `Supports` is a bool-per-field struct in
-`crates/ff-core/src/supports.rs` with a flag for
+`crates/ff-core/src/capability.rs` (defined at `:61`) with a flag for
 `claim_for_worker` (scheduler-routed claim) but NO flags for
 `complete` / `fail` — those are trait-mandatory hot-path ops, not
 capability-gated. SqliteBackend wires `complete` + `fail` as
@@ -1102,9 +1102,10 @@ own `handle_codec.rs` mirroring the Postgres + Valkey shape (see
 
 ```rust
 use ff_core::backend::{BackendTag, Handle, HandleKind, HandleOpaque};
-use ff_core::handle_codec::{decode as core_decode, encode as core_encode};
+use ff_core::handle_codec::{
+    decode as core_decode, encode as core_encode, HandlePayload,
+};
 use ff_core::engine_error::{EngineError, ValidationKind};
-use ff_core::payload::HandlePayload;
 
 pub(crate) fn encode_handle(payload: &HandlePayload, kind: HandleKind) -> Handle {
     let opaque: HandleOpaque = core_encode(BackendTag::Sqlite, payload);
