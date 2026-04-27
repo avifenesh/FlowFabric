@@ -24,8 +24,9 @@ use ff_core::backend::{
 use ff_core::capability::{BackendIdentity, Capabilities, Supports, Version};
 use ff_core::caps::{CapabilityRequirement, matches as caps_matches};
 use ff_core::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult, SuspendArgs,
-    SuspendOutcome,
+    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
+    SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
 };
 #[cfg(feature = "core")]
 use ff_core::contracts::{
@@ -38,7 +39,7 @@ use ff_core::contracts::{StreamCursor, StreamFrames};
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{BackendError, ContentionKind, EngineError, ValidationKind};
 use ff_core::handle_codec::HandlePayload;
-use ff_core::types::{AttemptId, AttemptIndex, LeaseEpoch, LeaseId};
+use ff_core::types::{AttemptId, AttemptIndex, LeaseEpoch, LeaseFence, LeaseId};
 
 use crate::errors::map_sqlx_error;
 use crate::handle_codec::{decode_handle, encode_handle};
@@ -2180,23 +2181,53 @@ impl EngineBackend for SqliteBackend {
 
     async fn suspend(
         &self,
-        _handle: &Handle,
-        _args: SuspendArgs,
+        handle: &Handle,
+        args: SuspendArgs,
     ) -> Result<SuspendOutcome, EngineError> {
-        unavailable("sqlite.suspend")
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| {
+            crate::suspend_ops::suspend_impl(pool, pubsub, handle, args.clone())
+        })
+        .await
+    }
+
+    async fn suspend_by_triple(
+        &self,
+        exec_id: ExecutionId,
+        triple: LeaseFence,
+        args: SuspendArgs,
+    ) -> Result<SuspendOutcome, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| {
+            crate::suspend_ops::suspend_by_triple_impl(
+                pool,
+                pubsub,
+                exec_id.clone(),
+                triple.clone(),
+                args.clone(),
+            )
+        })
+        .await
     }
 
     async fn create_waitpoint(
         &self,
-        _handle: &Handle,
-        _waitpoint_key: &str,
-        _expires_in: Duration,
+        handle: &Handle,
+        waitpoint_key: &str,
+        expires_in: Duration,
     ) -> Result<PendingWaitpoint, EngineError> {
-        unavailable("sqlite.create_waitpoint")
+        let pool = &self.inner.pool;
+        retry_serializable(|| {
+            crate::suspend_ops::create_waitpoint_impl(pool, handle, waitpoint_key, expires_in)
+        })
+        .await
     }
 
-    async fn observe_signals(&self, _handle: &Handle) -> Result<Vec<ResumeSignal>, EngineError> {
-        unavailable("sqlite.observe_signals")
+    async fn observe_signals(&self, handle: &Handle) -> Result<Vec<ResumeSignal>, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| crate::suspend_ops::observe_signals_impl(pool, handle)).await
     }
 
     async fn claim_from_reclaim(&self, token: ReclaimToken) -> Result<Option<Handle>, EngineError> {
@@ -2294,17 +2325,27 @@ impl EngineBackend for SqliteBackend {
     #[cfg(feature = "core")]
     async fn deliver_signal(
         &self,
-        _args: DeliverSignalArgs,
+        args: DeliverSignalArgs,
     ) -> Result<DeliverSignalResult, EngineError> {
-        unavailable("sqlite.deliver_signal")
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| {
+            crate::suspend_ops::deliver_signal_impl(pool, pubsub, args.clone())
+        })
+        .await
     }
 
     #[cfg(feature = "core")]
     async fn claim_resumed_execution(
         &self,
-        _args: ClaimResumedExecutionArgs,
+        args: ClaimResumedExecutionArgs,
     ) -> Result<ClaimResumedExecutionResult, EngineError> {
-        unavailable("sqlite.claim_resumed_execution")
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| {
+            crate::suspend_ops::claim_resumed_execution_impl(pool, pubsub, args.clone())
+        })
+        .await
     }
 
     async fn cancel_flow(
@@ -2426,6 +2467,30 @@ impl EngineBackend for SqliteBackend {
     ) -> Result<ApplyDependencyToChildResult, EngineError> {
         let pool = &self.inner.pool;
         retry_serializable(|| apply_dependency_to_child_impl(pool, &args)).await
+    }
+
+    // ── HMAC secret management (RFC-023 Phase 2b.2.1) ──
+
+    async fn seed_waitpoint_hmac_secret(
+        &self,
+        args: SeedWaitpointHmacSecretArgs,
+    ) -> Result<SeedOutcome, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| {
+            crate::suspend_ops::seed_waitpoint_hmac_secret_impl(pool, args.clone())
+        })
+        .await
+    }
+
+    async fn rotate_waitpoint_hmac_secret_all(
+        &self,
+        args: RotateWaitpointHmacSecretAllArgs,
+    ) -> Result<RotateWaitpointHmacSecretAllResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| {
+            crate::suspend_ops::rotate_waitpoint_hmac_secret_all_impl(pool, args.clone())
+        })
+        .await
     }
 
     // ── RFC-018 capability discovery ──
