@@ -18,9 +18,9 @@
 // ── cancel_execution ───────────────────────────────────────────────
 
 /// Pre-read: pin `exec_core` + current-attempt lease identity.
-/// Binds: ?1 partition_key, ?2 execution_id BLOB, ?3 attempt_index
-/// is re-bound separately on the attempt row via `attempt_index` from
-/// this read.
+/// Binds: ?1 partition_key, ?2 execution_id BLOB. `attempt_index` is
+/// returned by this read (not bound) and is re-bound separately on
+/// the attempt-row follow-up statements.
 pub(crate) const SELECT_CANCEL_PRE_SQL: &str = r#"
     SELECT ec.lifecycle_phase  AS lifecycle_phase,
            ec.public_state     AS public_state,
@@ -178,6 +178,13 @@ pub(crate) const RESET_EDGE_GROUP_COUNTERS_SQL: &str = r#"
 /// `replay_count`, the outer stamps `last_mutation_at`. The bump
 /// reads the current value via `json_extract` + `COALESCE(..., 0)`
 /// so the first replay initializes it from 0 → 1.
+///
+/// `replay_count` is stored as a JSON **number** (not a string): the
+/// SQLite integer result of the arithmetic flows directly into
+/// `json_set(...)` without a `CAST ... AS TEXT` wrapper, matching the
+/// PG reference's `to_jsonb(... + 1)` shape. `last_mutation_at` stays
+/// a JSON string to match how it is written elsewhere (e.g.
+/// `build_create_execution_raw_fields`).
 pub(crate) const UPDATE_EXEC_CORE_REPLAY_SQL: &str = r#"
     UPDATE ff_exec_core
        SET lifecycle_phase      = 'runnable',
@@ -193,7 +200,7 @@ pub(crate) const UPDATE_EXEC_CORE_REPLAY_SQL: &str = r#"
                json_set(
                    raw_fields,
                    '$.replay_count',
-                   CAST(COALESCE(CAST(json_extract(raw_fields, '$.replay_count') AS INTEGER), 0) + 1 AS TEXT)
+                   COALESCE(CAST(json_extract(raw_fields, '$.replay_count') AS INTEGER), 0) + 1
                ),
                '$.last_mutation_at',
                CAST(?5 AS TEXT)

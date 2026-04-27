@@ -4,7 +4,10 @@
 //! mutating ops:
 //!
 //!   * [`cancel_execution_impl`] — §4.2.1 + §4.2.7 outbox matrix
-//!     (ff_operator_event + ff_lease_event if lease active).
+//!     (ff_lease_event `revoked` iff a lease was active; NO
+//!     operator_event — the migration 0010 CHECK allow-list excludes
+//!     a `cancelled` event_type and the PG reference does not emit
+//!     one).
 //!   * [`revoke_lease_impl`] — §4.2.2 (ff_lease_event revoked).
 //!   * [`change_priority_impl`] — §4.2.4 Rev 7 Fork 3 Option C
 //!     (ff_operator_event priority_changed).
@@ -44,39 +47,11 @@ use crate::errors::map_sqlx_error;
 use crate::pubsub::{OutboxEvent, PubSub};
 use crate::queries::operator as q_op;
 use crate::retry::retry_serializable;
+use crate::tx_util::{
+    begin_immediate, commit_or_rollback, now_ms, rollback_quiet, split_exec_id,
+};
 
 // ─── shared helpers ────────────────────────────────────────────────
-
-/// Decompose an `ExecutionId` into `(partition_key, uuid_blob)`.
-/// SQLite stores `execution_id` as a 16-byte BLOB (see `backend::split_exec_id`).
-fn split_eid(
-    eid: &ff_core::types::ExecutionId,
-) -> Result<(i64, Uuid), EngineError> {
-    let s = eid.as_str();
-    let tail = s
-        .split_once("}:")
-        .map(|(_, t)| t)
-        .ok_or_else(|| EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: format!("execution_id missing `}}:`: {s}"),
-        })?;
-    let part_str = s
-        .strip_prefix("{fp:")
-        .and_then(|r| r.find("}:").map(|i| &r[..i]))
-        .ok_or_else(|| EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: format!("execution_id missing `{{fp:`: {s}"),
-        })?;
-    let part: i64 = part_str.parse().map_err(|_| EngineError::Validation {
-        kind: ValidationKind::InvalidInput,
-        detail: format!("execution_id partition index not u16: {s}"),
-    })?;
-    let uuid = Uuid::parse_str(tail).map_err(|_| EngineError::Validation {
-        kind: ValidationKind::InvalidInput,
-        detail: format!("execution_id UUID invalid: {s}"),
-    })?;
-    Ok((part, uuid))
-}
 
 /// Synthetic lease identity for the SQLite backend — same shape as
 /// the PG synthetic (`pg:<uuid>:<attempt>:<epoch>`) but tagged
@@ -84,31 +59,6 @@ fn split_eid(
 /// logs / traces.
 fn synthetic_lease_id(exec_uuid: Uuid, attempt_index: i32, lease_epoch: i64) -> String {
     format!("sqlite:{exec_uuid}:{attempt_index}:{lease_epoch}")
-}
-
-async fn begin_immediate(
-    pool: &SqlitePool,
-) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, EngineError> {
-    let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .map_err(map_sqlx_error)?;
-    Ok(conn)
-}
-
-async fn commit_or_rollback(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
-) -> Result<(), EngineError> {
-    if let Err(e) = sqlx::query("COMMIT").execute(&mut **conn).await.map_err(map_sqlx_error) {
-        let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
-        return Err(e);
-    }
-    Ok(())
-}
-
-async fn rollback_quiet(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>) {
-    let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
 }
 
 /// Co-transactional `last_insert_rowid()` → `OutboxEvent` for the
@@ -185,7 +135,7 @@ async fn cancel_execution_once(
     pubsub: &PubSub,
     args: &CancelExecutionArgs,
 ) -> Result<CancelExecutionResult, EngineError> {
-    let (part, exec_uuid) = split_eid(&args.execution_id)?;
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
     let now = args.now.0;
 
     let mut conn = begin_immediate(pool).await?;
@@ -327,14 +277,8 @@ async fn revoke_lease_once(
     pubsub: &PubSub,
     args: &RevokeLeaseArgs,
 ) -> Result<RevokeLeaseResult, EngineError> {
-    let (part, exec_uuid) = split_eid(&args.execution_id)?;
-    let now: i64 = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i64::MAX);
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let now = now_ms();
 
     let mut conn = begin_immediate(pool).await?;
 
@@ -483,7 +427,7 @@ async fn change_priority_once(
     pubsub: &PubSub,
     args: &ChangePriorityArgs,
 ) -> Result<ChangePriorityResult, EngineError> {
-    let (part, exec_uuid) = split_eid(&args.execution_id)?;
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
     let now = args.now.0;
 
     let mut conn = begin_immediate(pool).await?;
@@ -579,7 +523,7 @@ async fn replay_execution_once(
     pubsub: &PubSub,
     args: &ReplayExecutionArgs,
 ) -> Result<ReplayExecutionResult, EngineError> {
-    let (part, exec_uuid) = split_eid(&args.execution_id)?;
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
     let now = args.now.0;
 
     let mut conn = begin_immediate(pool).await?;

@@ -430,8 +430,8 @@ async fn replay_execution_normal_branch() {
 
     // lifecycle_phase flipped back to runnable.
     assert_eq!(read_lifecycle_phase(&b, exec_uuid).await, "runnable");
-    // raw_fields.replay_count bumped to 1.
-    let replay_count: String = sqlx::query_scalar(
+    // raw_fields.replay_count bumped to 1 (stored as JSON number).
+    let replay_count: i64 = sqlx::query_scalar(
         "SELECT json_extract(raw_fields, '$.replay_count') \
          FROM ff_exec_core WHERE partition_key=0 AND execution_id=?1",
     )
@@ -439,7 +439,7 @@ async fn replay_execution_normal_branch() {
     .fetch_one(b.pool_for_test())
     .await
     .unwrap();
-    assert_eq!(replay_count, "1");
+    assert_eq!(replay_count, 1);
     // operator_event 'replayed' emitted.
     assert_eq!(count_outbox(&b, "ff_operator_event", exec_uuid).await, 1);
 }
