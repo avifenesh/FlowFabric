@@ -29,7 +29,8 @@ mod backend;
 mod config;
 mod errors;
 mod handle_codec;
-mod pubsub;
+#[doc(hidden)]
+pub mod pubsub;
 pub mod queries;
 mod registry;
 pub mod retry;

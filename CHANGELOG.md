@@ -7,6 +7,57 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`crates/ff-backend-sqlite` — Phase 2b.1 producer exec/flow + pubsub
+  foundation (RFC-023 Group A + D.1).** Replaces 6 `Unavailable` stubs
+  with real bodies: `create_execution` (seeds `ff_exec_core` + the
+  `ff_execution_capabilities` junction + `ff_lane_registry`),
+  `create_flow` (idempotent `ff_flow_core` insert), `add_execution_to_flow`
+  (stamps `exec_core.flow_id` + bumps `graph_revision` /
+  `raw_fields.node_count`), `stage_dependency_edge` (CAS on
+  `graph_revision`, inserts into `ff_edge`), `apply_dependency_to_child`
+  (marks edge applied, upserts `ff_edge_group.running_count`), and
+  classic `cancel_flow` (flips flow header + member `ff_exec_core`
+  rows, writes completion + lease-revoked outbox rows per member,
+  queues `ff_pending_cancel_groups` under `CancelPending`). Every
+  body mirrors `ff-backend-postgres/src/flow{,_staging}.rs` +
+  `ff-backend-postgres/src/exec_core.rs::create_execution_impl`
+  statement-by-statement; SQLite dialect changes are contained to
+  `json_set` + `json_extract` (JSON1) replacing PG `jsonb_set` /
+  `jsonb_build_object`, and `BEGIN IMMEDIATE` single-writer
+  serialization replacing PG `FOR UPDATE` row locks. The `wait`
+  axis on `cancel_flow` always reports synchronous `Cancelled {..}`
+  — under single-writer SQLite every member flip commits in the
+  header transaction. Group B (suspend/signal/deliver_signal),
+  Group C (stream reads), and Group D.2 (subscribe trait surface)
+  land in Phase 2b.2.
+- **`crates/ff-backend-sqlite/src/pubsub.rs` — full post-commit
+  broadcast topology.** Five `tokio::sync::broadcast` channels,
+  one per outbox table (`lease_history`, `completion`,
+  `signal_delivery`, `stream_frame`, `operator_event`); the
+  `OutboxEvent` payload carries `(event_id, partition_key)` read
+  from `last_insert_rowid()` inside the writing transaction, with
+  `dispatch_pending_emits` firing AFTER `tx.commit()` returns
+  (RFC-023 §4.2 A2 — broadcast is wakeup only, durable replay
+  rides `event_id > cursor` on the outbox tables). Post-commit
+  emit wiring added to the 7 existing Phase 2a methods that
+  write outbox rows: `claim` / `complete` / `fail` / `renew` /
+  `append_frame` / `claim_from_reclaim`, plus the new
+  `cancel_flow` path's per-member completion + lease-revoked
+  emits.
+- `crates/ff-backend-sqlite/src/queries/flow.rs` (new) +
+  `crates/ff-backend-sqlite/src/queries/flow_staging.rs` (new)
+  carrying the SQLite-dialect SQL const block for the Group A
+  surface; `queries/exec_core.rs` extended with `INSERT_EXEC_CORE_SQL`
+  + `INSERT_EXEC_CAPABILITY_SQL` + `INSERT_LANE_REGISTRY_SQL`;
+  `queries/dispatch.rs` populated with `INSERT_LEASE_EVENT_SQL` +
+  scaffolding consts for `INSERT_SIGNAL_EVENT_SQL` /
+  `INSERT_OPERATOR_EVENT_SQL` (Phase 2b.2 consumers).
+- `crates/ff-backend-sqlite/tests/producer_flow.rs` (new) covering
+  `create_execution` + junction populate, idempotent `create_flow`,
+  3-member flow build + 2-edge stage + apply + `cancel_flow`
+  member fan-out, `stage_dependency_edge` stale-revision
+  rejection, and a `complete()` → outbox-row-present smoke that
+  exercises the pubsub post-commit path end-to-end.
 - **`crates/ff-backend-sqlite` — Phase 2a.3 lease-lifecycle + progress +
   append_frame (RFC-023).** Replaces the `Unavailable` stubs for `renew`,
   `progress`, `append_frame`, and `claim_from_reclaim` with real bodies
