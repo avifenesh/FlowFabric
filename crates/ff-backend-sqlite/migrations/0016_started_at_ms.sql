@@ -12,18 +12,31 @@
 ALTER TABLE ff_exec_core
     ADD COLUMN started_at_ms INTEGER;
 
--- Backfill. `MIN(started_at_ms)` over non-NULL attempts per execution
--- matches the pre-0016 read path's `ORDER BY attempt_index ASC
--- LIMIT 1` over `started_at_ms IS NOT NULL`.
+-- Backfill using the same semantics as the pre-0016 read path:
+-- pick `started_at_ms` from the earliest attempt row by
+-- `attempt_index ASC` with a non-NULL `started_at_ms`. MIN over the
+-- timestamp would drift if values are ever non-monotonic; ordering on
+-- `attempt_index` preserves the exact prior behaviour. The EXISTS
+-- guard skips exec rows without any matching attempt so the UPDATE
+-- doesn't touch (and re-NULL) submit-but-never-claimed rows on large
+-- tables.
 UPDATE ff_exec_core
    SET started_at_ms = (
-        SELECT MIN(a.started_at_ms)
+        SELECT a.started_at_ms
           FROM ff_attempt a
          WHERE a.partition_key = ff_exec_core.partition_key
            AND a.execution_id  = ff_exec_core.execution_id
            AND a.started_at_ms IS NOT NULL
+         ORDER BY a.attempt_index ASC
+         LIMIT 1
    )
- WHERE started_at_ms IS NULL;
+ WHERE started_at_ms IS NULL
+   AND EXISTS (
+        SELECT 1 FROM ff_attempt a
+         WHERE a.partition_key = ff_exec_core.partition_key
+           AND a.execution_id  = ff_exec_core.execution_id
+           AND a.started_at_ms IS NOT NULL
+   );
 
 INSERT INTO ff_migration_annotation (version, name, applied_at_ms, backward_compatible)
 VALUES (

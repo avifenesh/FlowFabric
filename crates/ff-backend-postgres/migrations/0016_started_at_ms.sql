@@ -11,12 +11,12 @@
 -- This migration adds `ff_exec_core.started_at_ms BIGINT` as a
 -- set-once column populated on first claim (see
 -- `attempt.rs::claim` — post-0016 writes use
--- `started_at_ms = COALESCE(ff_exec_core.started_at_ms, excluded)` so
--- reclaim and retry paths never overwrite the original first-claim
--- timestamp). Existing rows are backfilled from
--- `ff_attempt.started_at_ms` (earliest non-NULL attempt) so the
--- Spine-B read path can drop the LATERAL join without regressing
--- pre-existing executions.
+-- `started_at_ms = COALESCE(started_at_ms, $now)` so reclaim and retry
+-- paths never overwrite the original first-claim timestamp). Existing
+-- rows are backfilled from `ff_attempt.started_at_ms` (earliest
+-- non-NULL attempt by `attempt_index ASC`) so the Spine-B read path
+-- can drop the LATERAL join without regressing pre-existing
+-- executions.
 --
 -- Migration numbering: 0015 is reserved for RFC-024 (claim-grant
 -- table) which is queued but not yet shipped. This migration claims
@@ -31,21 +31,24 @@ ALTER TABLE ff_exec_core
     ADD COLUMN IF NOT EXISTS started_at_ms BIGINT;
 
 -- Section 2 — Backfill from existing `ff_attempt.started_at_ms`.
--- Uses the earliest attempt with a non-NULL started_at_ms (matches
--- the pre-0016 LATERAL-join selection: `ORDER BY attempt_index ASC
--- LIMIT 1` over rows where `started_at_ms IS NOT NULL`). Rows whose
--- executions never reached claim (pure submit / cancel-before-claim)
--- leave `started_at_ms` NULL, which the read path already tolerates
--- (`first_started_at_ms_opt.map(...)` → `Option<String>`).
+-- Uses DISTINCT ON to pick the earliest attempt row by
+-- `attempt_index ASC` with a non-NULL started_at_ms, matching the
+-- pre-0016 LATERAL-join selection exactly (`ORDER BY attempt_index
+-- ASC LIMIT 1`). MIN(started_at_ms) would drift if timestamps were
+-- ever non-monotonic. Rows whose executions never reached claim
+-- (pure submit / cancel-before-claim) leave `started_at_ms` NULL,
+-- which the read path already tolerates
+-- (`started_at_ms_opt.map(...)` → `Option<String>`).
 UPDATE ff_exec_core ec
    SET started_at_ms = sub.first_started_at_ms
   FROM (
-    SELECT a.partition_key,
+    SELECT DISTINCT ON (a.partition_key, a.execution_id)
+           a.partition_key,
            a.execution_id,
-           MIN(a.started_at_ms) AS first_started_at_ms
+           a.started_at_ms AS first_started_at_ms
       FROM ff_attempt a
      WHERE a.started_at_ms IS NOT NULL
-     GROUP BY a.partition_key, a.execution_id
+     ORDER BY a.partition_key, a.execution_id, a.attempt_index ASC
   ) sub
  WHERE ec.partition_key = sub.partition_key
    AND ec.execution_id  = sub.execution_id
