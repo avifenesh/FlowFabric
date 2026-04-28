@@ -6,7 +6,7 @@ This doc covers the operator workflow for cutting a release. Tooling lives in
 
 ## What gets published
 
-Twelve crates, all pinned to the same version, published in topological order:
+Thirteen crates, all pinned to the same version, published in topological order:
 
 1. `ferriskey`       — Valkey client (reparented fork of glide-core;
    the former `telemetrylib` sub-crate was inlined during the Tier 1
@@ -82,6 +82,13 @@ Before cutting a release, verify:
       RFC-011 §13 describes the dependency on Functions + RESP3 which
       both stabilised in 7.2). Ensure all production + CI targets
       are on 7.2+ before cutting.
+- [ ] SQLite minimum is 3.35+ (dev-only backend, RFC-023 §7.1).
+      `ff-backend-sqlite` uses `sqlx` with the **bundled build**,
+      which statically links SQLite into the binary — distro SQLite
+      version is irrelevant for consumers. Recommended floor 3.38+
+      for JSON1 ergonomics; modern distros ship 3.40+. The bundled-
+      build choice was locked at v0.12.0 to decouple SQLite version
+      from distro and to avoid an Ubuntu-22.04 contributor fork.
 - [ ] Postgres `max_locks_per_transaction >= 512` on all target
       deployments (default `64` is insufficient under concurrent
       bench/partition load — see
@@ -94,7 +101,7 @@ Before cutting a release, verify:
 - [ ] `CARGO_REGISTRY_TOKEN` is configured in repo settings (Settings →
       Secrets and variables → Actions). Generate at
       <https://crates.io/me> → API Tokens with scope `publish-new` +
-      `publish-update`. The token must have upload rights to all twelve
+      `publish-update`. The token must have upload rights to all thirteen
       crate names — claim them on crates.io first if they are new.
 - [ ] Working on a release branch (`main` or `release/*`).
 - [ ] Working tree is clean.
