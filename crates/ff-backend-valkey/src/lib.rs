@@ -926,10 +926,27 @@ async fn read_execution_context_impl(
 /// Point-read of the execution's current attempt-index from the
 /// `{exec}:core` hash. Single `HGET current_attempt_index` — the same
 /// pattern the SDK worker previously issued inline before it dispatched
-/// `ff_claim_resumed_execution`. Missing row surfaces as
-/// [`EngineError::Validation { kind: InvalidInput, .. }`] matching the
-/// PG + SQLite siblings; the SDK only calls this post-grant, so an
-/// absent core hash is an invariant violation rather than a silent 0.
+/// `ff_claim_resumed_execution`.
+///
+/// **Missing-data semantics (Valkey-specific — diverges from PG/SQLite).**
+/// Both the missing-field case (`exec_core` present but
+/// `current_attempt_index` absent / empty-string, i.e. pre-claim state)
+/// and the missing-row case (no `exec_core` hash at all) are mapped to
+/// `AttemptIndex(0)`. This preserves the pre-PR-3 inline-`HGET`
+/// semantic (`.and_then(parse).unwrap_or(0)`) so a resume-grant consumed
+/// against a not-yet-claimed execution reaches the downstream FCALL,
+/// which then surfaces the proper business-logic error
+/// (`NotAResumedExecution` / `ExecutionNotLeaseable`) instead of the
+/// pre-read blowing up with `Corruption`.
+///
+/// PG and SQLite siblings instead return
+/// [`EngineError::Validation { kind: InvalidInput, .. }`] on the
+/// missing-row case; the asymmetry is intentional — Valkey's happy
+/// path requires `exec_core` to exist (grant issuance is the only
+/// caller) so a missing row there is already prevented by the
+/// invariant. See the trait rustdoc on
+/// `EngineBackend::read_current_attempt_index` (see
+/// `ff_core::engine_backend`) for the cross-backend contract.
 #[tracing::instrument(
     name = "ff.read_current_attempt_index",
     skip_all,
