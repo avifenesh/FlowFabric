@@ -41,7 +41,7 @@ use ff_core::contracts::{
     AdditionalWaitpointBinding, CancelFlowArgs, CancelFlowResult, ClaimExecutionArgs,
     ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CompositeBody,
     CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
-    ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, IssueReclaimGrantArgs,
+    ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
     ListSuspendedPage, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
     ReportUsageResult, ResumeCondition, ResumePolicy, ResumeTarget,
@@ -846,6 +846,78 @@ async fn describe_execution_impl(
     }
     let tags_raw = tags_slot.value().map_err(transport_fk)?;
     build_execution_snapshot(id.clone(), &core, tags_raw)
+}
+
+/// Pipeline `GET :payload` + `HGETALL :core` +
+/// `HGETALL :tags` on the execution's partition.
+///
+/// Payload is stored as an opaque blob at the `:payload` key; an empty
+/// or absent value surfaces as an empty `Vec<u8>`. `execution_kind`
+/// lives on the `:core` hash; absence surfaces as the empty string.
+/// Tags come from the dedicated `:tags` hash, keyed by tag name.
+///
+/// A missing `:core` hash surfaces as
+/// `EngineError::Validation { kind: InvalidInput, .. }` — matching the
+/// PG + SQLite siblings. The SDK worker only calls this post-claim, so
+/// a missing row is an invariant violation rather than a silent empty.
+///
+/// All three keys share `{fp:N}` so cluster mode routes them to the
+/// same slot — matches [`describe_execution_impl`].
+#[tracing::instrument(
+    name = "ff.read_execution_context",
+    skip_all,
+    fields(backend = "valkey", execution_id = %id)
+)]
+async fn read_execution_context_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<ExecutionContext, EngineError> {
+    let partition = execution_partition(id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, id);
+    let payload_key = ctx.payload();
+    let core_key = ctx.core();
+    let tags_key = ctx.tags();
+
+    let mut pipe = client.pipeline();
+    let payload_slot = pipe
+        .cmd::<Option<Vec<u8>>>("GET")
+        .arg(&payload_key)
+        .finish();
+    let core_slot = pipe
+        .cmd::<HashMap<String, String>>("HGETALL")
+        .arg(&core_key)
+        .finish();
+    let tags_slot = pipe
+        .cmd::<HashMap<String, String>>("HGETALL")
+        .arg(&tags_key)
+        .finish();
+    pipe.execute().await.map_err(transport_fk)?;
+
+    let core = core_slot.value().map_err(transport_fk)?;
+    // Missing-execution parity with PG + SQLite siblings: the SDK worker
+    // only calls this post-claim, so an absent core hash is an invariant
+    // violation rather than a silent empty read. See
+    // `exec_core::read_execution_context_impl` (PG) and
+    // `reads::read_execution_context_impl` (SQLite).
+    if core.is_empty() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("read_execution_context: execution not found: {id}"),
+        });
+    }
+
+    let input_payload = payload_slot
+        .value()
+        .map_err(transport_fk)?
+        .unwrap_or_default();
+    let execution_kind = core
+        .get("execution_kind")
+        .cloned()
+        .unwrap_or_default();
+    let tags = tags_slot.value().map_err(transport_fk)?;
+
+    Ok(ExecutionContext::new(input_payload, execution_kind, tags))
 }
 
 /// List suspended executions in one partition, cursor-paginated,
@@ -4675,6 +4747,20 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "describe_execution: HGETALL exec_core + tags",
+                )
+            })
+    }
+
+    async fn read_execution_context(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        read_execution_context_impl(&self.client, &self.partition_config, execution_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "read_execution_context: GET payload + HGETALL core + HGETALL tags",
                 )
             })
     }

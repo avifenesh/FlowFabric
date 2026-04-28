@@ -42,7 +42,7 @@ use ff_core::contracts::{
     CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     DeliverSignalArgs, DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot,
-    ExecutionSnapshot, FlowSnapshot, ListExecutionsPage, ListFlowsPage, ListLanesPage,
+    ExecutionContext, ExecutionSnapshot, FlowSnapshot, ListExecutionsPage, ListFlowsPage, ListLanesPage,
     ListPendingWaitpointsArgs, ListPendingWaitpointsResult, ListSuspendedPage,
     PendingWaitpointInfo, ReplayExecutionArgs, ReplayExecutionResult, ReportUsageAdminArgs,
     ReportUsageResult, ResetBudgetArgs, ResetBudgetResult, RevokeLeaseArgs, RevokeLeaseResult,
@@ -180,6 +180,12 @@ impl EngineBackend for MockBackend {
         _id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
         Err(unavailable("mock::describe_execution"))
+    }
+    async fn read_execution_context(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        Err(unavailable("mock::read_execution_context"))
     }
     async fn describe_flow(
         &self,

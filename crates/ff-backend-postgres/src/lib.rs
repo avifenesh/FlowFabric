@@ -42,7 +42,7 @@ use ff_core::contracts::{
 #[cfg(feature = "core")]
 use ff_core::state::PublicState;
 use ff_core::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
+    CancelFlowResult, ExecutionContext, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReportUsageResult,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
@@ -582,6 +582,15 @@ impl EngineBackend for PostgresBackend {
         id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
         exec_core::describe_execution_impl(&self.pool, &self.partition_config, id).await
+    }
+
+    #[tracing::instrument(name = "pg.read_execution_context", skip_all)]
+    async fn read_execution_context(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        exec_core::read_execution_context_impl(&self.pool, &self.partition_config, execution_id)
+            .await
     }
 
     #[tracing::instrument(name = "pg.describe_flow", skip_all)]

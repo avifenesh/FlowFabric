@@ -27,7 +27,7 @@ use ff_core::capability::{BackendIdentity, Capabilities, Supports, Version};
 use ff_core::caps::{CapabilityRequirement, matches as caps_matches};
 use ff_core::contracts::{
     BudgetStatus, CancelFlowResult, CreateBudgetArgs, CreateBudgetResult, CreateQuotaPolicyArgs,
-    CreateQuotaPolicyResult, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
+    CreateQuotaPolicyResult, ExecutionContext, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReportUsageAdminArgs,
     ReportUsageResult, ResetBudgetArgs, ResetBudgetResult, RotateWaitpointHmacSecretAllArgs,
     RotateWaitpointHmacSecretAllResult, SeedOutcome, SeedWaitpointHmacSecretArgs, SuspendArgs,
@@ -2722,6 +2722,13 @@ impl EngineBackend for SqliteBackend {
         _id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
         unavailable("sqlite.describe_execution")
+    }
+
+    async fn read_execution_context(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        crate::reads::read_execution_context_impl(&self.inner.pool, execution_id).await
     }
 
     async fn describe_flow(&self, _id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {

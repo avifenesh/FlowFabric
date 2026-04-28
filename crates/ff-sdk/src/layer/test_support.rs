@@ -19,7 +19,7 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
-    DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
+    DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionContext, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
     SuspendOutcome, SuspendOutcomeDetails,
@@ -209,6 +209,18 @@ impl EngineBackend for PassthroughBackend {
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
         self.record("describe_execution")?;
         Ok(None)
+    }
+
+    async fn read_execution_context(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        self.record("read_execution_context")?;
+        Ok(ExecutionContext::new(
+            Vec::new(),
+            String::new(),
+            std::collections::HashMap::new(),
+        ))
     }
 
     async fn describe_flow(&self, _id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {

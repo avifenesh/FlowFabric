@@ -53,7 +53,7 @@ use crate::backend::{
     PrepareOutcome, ResumeSignal, ResumeToken, SummaryDocument, TailVisibility,
 };
 use crate::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
+    CancelFlowResult, ExecutionContext, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReportUsageResult,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
@@ -314,6 +314,36 @@ pub trait EngineBackend: Send + Sync + 'static {
         &self,
         id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError>;
+
+    /// Point-read of the execution-scoped `(input_payload,
+    /// execution_kind, tags)` bundle used by the SDK worker when
+    /// assembling a `ClaimedTask` (see `ff_sdk::ClaimedTask`) after a
+    /// successful claim.
+    ///
+    /// No default impl — every `EngineBackend` must answer this
+    /// explicitly. Distinct from [`Self::describe_execution`]
+    /// (read-model projection) because the SDK needs the raw payload
+    /// bytes + kind + tags immediately post-claim, and the snapshot
+    /// projection deliberately omits the payload bytes.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — pipelined `GET :payload` + `HGETALL :core`
+    ///   + `HGETALL :tags` on the execution's partition (same pattern
+    ///   as [`Self::describe_execution`]).
+    /// * **Postgres** — single `SELECT payload, raw_fields` on
+    ///   `ff_exec_core` keyed by `(partition_key, execution_id)`;
+    ///   `execution_kind` + `tags` live in `raw_fields` JSONB.
+    /// * **SQLite** — identical shape to Postgres.
+    ///
+    /// Returns [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+    /// when the execution does not exist — the SDK worker only calls
+    /// this after a successful claim, so a missing row is a loud
+    /// storage-tier invariant violation rather than a routine `Ok(None)`.
+    async fn read_execution_context(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError>;
 
     /// Snapshot a flow by id. `Ok(None)` ⇒ no such flow.
     async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError>;
@@ -1492,6 +1522,16 @@ mod tests {
             _id: &ExecutionId,
         ) -> Result<Option<ExecutionSnapshot>, EngineError> {
             unreachable!()
+        }
+        async fn read_execution_context(
+            &self,
+            _execution_id: &ExecutionId,
+        ) -> Result<ExecutionContext, EngineError> {
+            Ok(ExecutionContext::new(
+                Vec::new(),
+                String::new(),
+                std::collections::HashMap::new(),
+            ))
         }
         async fn describe_flow(
             &self,

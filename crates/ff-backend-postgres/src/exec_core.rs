@@ -36,7 +36,9 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ff_core::contracts::decode::build_execution_snapshot;
-use ff_core::contracts::{CreateExecutionArgs, ExecutionInfo, ExecutionSnapshot, ListExecutionsPage};
+use ff_core::contracts::{
+    CreateExecutionArgs, ExecutionContext, ExecutionInfo, ExecutionSnapshot, ListExecutionsPage,
+};
 use ff_core::engine_error::{EngineError, ValidationKind};
 use ff_core::partition::{PartitionConfig, PartitionKey};
 use ff_core::state::{
@@ -296,6 +298,74 @@ pub(super) async fn describe_execution_impl(
     };
 
     build_execution_snapshot(id.clone(), &core, tags_raw)
+}
+
+// ─── read_execution_context ──────────────────────────────────────
+
+/// Point-read of `(input_payload, execution_kind, tags)` from
+/// `ff_exec_core`. Used by the SDK worker to populate a freshly
+/// claimed [`ClaimedTask`](ff_sdk::ClaimedTask). Returns
+/// [`EngineError::Validation { kind: InvalidInput, .. }`](ff_core::engine_error::EngineError::Validation)
+/// when the execution does not exist (the SDK only calls this
+/// post-claim, so a missing row is an invariant violation).
+///
+/// Single `SELECT payload, raw_fields` on `(partition_key, execution_id)`;
+/// `execution_kind` + `tags` are projected out of `raw_fields`. The
+/// payload lives in its own `BYTEA` column so we don't round-trip the
+/// bytes through JSON encoding.
+pub(super) async fn read_execution_context_impl(
+    pool: &PgPool,
+    _partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<ExecutionContext, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let row = sqlx::query(
+        r#"
+        SELECT payload, raw_fields
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("read_execution_context: execution not found: {id}"),
+        });
+    };
+
+    let payload: Option<Vec<u8>> = row.try_get("payload").map_err(map_sqlx_error)?;
+    let raw_fields: JsonValue = row.try_get("raw_fields").map_err(map_sqlx_error)?;
+
+    let input_payload = payload.unwrap_or_default();
+
+    let (execution_kind, tags) = match &raw_fields {
+        JsonValue::Object(map) => {
+            let kind = map
+                .get("execution_kind")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+                .unwrap_or_default();
+            let tags: HashMap<String, String> = match map.get("tags") {
+                Some(JsonValue::Object(tag_map)) => tag_map
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                    .collect(),
+                _ => HashMap::new(),
+            };
+            (kind, tags)
+        }
+        _ => (String::new(), HashMap::new()),
+    };
+
+    Ok(ExecutionContext::new(input_payload, execution_kind, tags))
 }
 
 // ─── list_executions ─────────────────────────────────────────────

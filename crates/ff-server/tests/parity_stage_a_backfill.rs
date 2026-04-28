@@ -28,7 +28,7 @@ use ff_core::contracts::{
     ChangePriorityArgs, ClaimForWorkerArgs, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult, CreateBudgetArgs, CreateExecutionArgs, CreateFlowArgs,
     CreateQuotaPolicyArgs, DeliverSignalArgs, DeliverSignalResult, EdgeDependencyPolicy,
-    EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot, ListExecutionsPage,
+    EdgeDirection, EdgeSnapshot, ExecutionContext, ExecutionSnapshot, FlowSnapshot, ListExecutionsPage,
     ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs, ListSuspendedPage,
     ReplayExecutionArgs, ReportUsageAdminArgs, ReportUsageResult, ResetBudgetArgs, RevokeLeaseArgs,
     SeedWaitpointHmacSecretArgs,
@@ -128,6 +128,16 @@ impl EngineBackend for DefaultsOnlyBackend {
         _id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
         Ok(None)
+    }
+    async fn read_execution_context(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        Ok(ExecutionContext::new(
+            Vec::new(),
+            String::new(),
+            std::collections::HashMap::new(),
+        ))
     }
     async fn describe_flow(
         &self,
