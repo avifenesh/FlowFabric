@@ -2245,6 +2245,74 @@ pub(crate) struct SqliteBackendInner {
     pub(crate) scanner_handle: std::sync::OnceLock<crate::scanner_supervisor::SqliteScannerHandle>,
 }
 
+/// RFC-023 §6.3 — v0.12 atomic Supports flag flip for the SQLite
+/// dev-only backend.
+///
+/// Every flag whose backing trait method shipped in Phase 1-3 flips
+/// `true` here; two flags remain `false`:
+///
+/// - `claim_for_worker` — RFC-023 §5 permanent non-goal (scheduler
+///   routing is out of scope for the dev-only backend; SqliteBackend
+///   exposes `claim` via handle but not the scheduler-routed surface).
+/// - `subscribe_instance_tags` — #311 deferred on all backends;
+///   cairn's `instance_tag_backfill` is served by `list_executions`
+///   + `ScannerFilter::with_instance_tag`.
+///
+/// Mirrors the `postgres_supports_base()` shape in
+/// `ff-backend-postgres/src/lib.rs` for consumer-copy-paste parity
+/// per cairn #277. `Supports` is `#[non_exhaustive]` so we start from
+/// [`Supports::none`] and mutate named fields.
+fn sqlite_supports_base() -> Supports {
+    let mut s = Supports::none();
+
+    // ── Flow bulk cancel (Phase 2b.1 Group A) ──
+    // SqliteBackend::cancel_flow is always synchronous under the
+    // single-writer model: every member flips in the same transaction
+    // as the header. Both wait axes are callable (the `_wait` arg is
+    // ignored — the result is always `Cancelled {..}` immediately).
+    s.cancel_flow_wait_timeout = true;
+    s.cancel_flow_wait_indefinite = true;
+
+    // ── Admin seed + rotate HMAC (Phase 2b.1) ──
+    s.rotate_waitpoint_hmac_secret_all = true;
+    s.seed_waitpoint_hmac_secret = true;
+
+    // ── RFC-019 subscriptions (Phase 3.1) ──
+    s.subscribe_lease_history = true;
+    s.subscribe_completion = true;
+    s.subscribe_signal_delivery = true;
+
+    // ── Streaming (Phase 2b.2.2) ──
+    s.stream_durable_summary = true;
+    s.stream_best_effort_live = true;
+
+    // ── Boot ──
+    // SqliteBackend::prepare() returns NoOp (migrations run inside
+    // `SqliteBackend::new`, matching the PG posture); NoOp is a
+    // callable + correct outcome, not Unavailable.
+    s.prepare = true;
+
+    // ── Wave 9 (Phase 3.2-3.5) ──
+    s.cancel_execution = true;
+    s.change_priority = true;
+    s.replay_execution = true;
+    s.revoke_lease = true;
+    s.read_execution_state = true;
+    s.read_execution_info = true;
+    s.get_execution_result = true;
+    s.budget_admin = true;
+    s.quota_admin = true;
+    s.list_pending_waitpoints = true;
+    s.cancel_flow_header = true;
+    s.ack_cancel_member = true;
+
+    // ── Stay `false` (see struct-level rustdoc above) ──
+    // s.claim_for_worker — RFC-023 §5 non-goal
+    // s.subscribe_instance_tags — #311 all-backends
+
+    s
+}
+
 /// RFC-023 SQLite dev-only backend.
 ///
 /// Construction demands `FF_DEV_MODE=1` (§4.5). Identical paths
@@ -3097,11 +3165,14 @@ impl EngineBackend for SqliteBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // RFC-023 §4.3: Phase 1a exposes only the identity tuple; real
-        // `Supports::*` flags flip at the Phase 4 release PR when trait
-        // bodies ship. Consumers seeing `supports.*` all-false under
-        // "sqlite" know to expect `Unavailable` on every data-plane
-        // call until Phase 2+ lands.
+        // RFC-023 §6.3: atomic flag-flip at the v0.12 release PR.
+        // Phase 1-3 trait bodies shipped on `main` ahead of this PR; this
+        // capabilities() snapshot flips every `Supports::*` flag whose
+        // backing method ships (Wave 10 live), EXCEPT `claim_for_worker`
+        // (§5 permanent non-goal — scheduler routing is out of scope for
+        // the dev-only backend) and `subscribe_instance_tags` (#311 —
+        // deferred on all backends; cairn's `instance_tag_backfill` is
+        // served by `list_executions` + `ScannerFilter::with_instance_tag`).
         Capabilities::new(
             BackendIdentity::new(
                 "sqlite",
@@ -3110,9 +3181,9 @@ impl EngineBackend for SqliteBackend {
                     env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
                     env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
                 ),
-                "Phase-1a",
+                "Phase-4",
             ),
-            Supports::none(),
+            sqlite_supports_base(),
         )
     }
 
