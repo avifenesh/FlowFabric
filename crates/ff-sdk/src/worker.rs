@@ -1609,7 +1609,7 @@ impl FlowFabricWorker {
         // comparison against `ReclaimGrant::expires_at_ms`. Clamp
         // negatives to 0 so a pre-epoch system clock (vanishingly
         // unlikely, but representable) doesn't wrap to a future u64.
-        let now_ms: u64 = TimestampMs::now().0.max(0) as u64;
+        let now_ms: u64 = ff_core::types::TimestampMs::now().0.max(0) as u64;
         validate_reclaim_grant_against_args(&grant, &args, now_ms)?;
         self.backend
             .reclaim_execution(args)
