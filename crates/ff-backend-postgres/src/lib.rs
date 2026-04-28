@@ -606,6 +606,19 @@ impl EngineBackend for PostgresBackend {
         .await
     }
 
+    #[tracing::instrument(name = "pg.read_total_attempt_count", skip_all)]
+    async fn read_total_attempt_count(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ff_core::types::AttemptIndex, EngineError> {
+        exec_core::read_total_attempt_count_impl(
+            &self.pool,
+            &self.partition_config,
+            execution_id,
+        )
+        .await
+    }
+
     #[tracing::instrument(name = "pg.describe_flow", skip_all)]
     async fn describe_flow(
         &self,

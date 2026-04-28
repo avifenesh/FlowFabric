@@ -346,7 +346,14 @@ pub trait EngineBackend: Send + Sync + 'static {
         execution_id: &ExecutionId,
     ) -> Result<ExecutionContext, EngineError>;
 
-    /// Point-read of the execution's current attempt-index.
+    /// Point-read of the execution's current attempt-index **pointer**
+    /// — the index of the currently-leased attempt row.
+    ///
+    /// Distinct from [`Self::read_total_attempt_count`]: this method
+    /// names the attempt that *already exists* (pointer), whereas
+    /// `read_total_attempt_count` is the monotonic claim counter used
+    /// to compute the next fresh attempt index. See the sibling's
+    /// rustdoc for the retry-path scenario that motivates the split.
     ///
     /// Used on the SDK worker's `claim_from_resume_grant` path —
     /// specifically the private `claim_resumed_execution` helper —
@@ -384,6 +391,59 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<AttemptIndex, EngineError> {
         Err(EngineError::Unavailable {
             op: "read_current_attempt_index",
+        })
+    }
+
+    /// Point-read of the execution's **total attempt counter** — the
+    /// monotonic count of claims that have ever fired against this
+    /// execution (including the in-flight one once claimed).
+    ///
+    /// Used on the SDK worker's `claim_from_grant` / `claim_execution`
+    /// path — the next attempt-index for a fresh claim is this
+    /// counter's current value (so `1` on the second retry after the
+    /// first attempt failed terminally). This is semantically distinct
+    /// from [`Self::read_current_attempt_index`], which is a *pointer*
+    /// at the currently-leased attempt row and is only meaningful on
+    /// the `claim_from_resume_grant` path (where a live attempt already
+    /// exists and we want to re-seat its lease rather than mint a new
+    /// attempt row).
+    ///
+    /// Reading the pointer on the `claim_from_grant` path was a live
+    /// bug: on the retry-of-a-retry scenario the pointer still named
+    /// the *previous* terminal-failed attempt, so the newly-minted
+    /// attempt collided with it (Valkey KEYS[6]) or mis-targeted the
+    /// PG/SQLite `ff_attempt` PK tuple. This method fixes that by
+    /// reading the counter that Lua 5920 / PG `ff_claim_execution` /
+    /// SQLite `claim_impl` all already consult when computing the
+    /// next attempt index.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET {exec}:core total_attempt_count` on the
+    ///   execution's partition. Single command; pre-claim read (field
+    ///   absent or empty) maps to `0`.
+    /// * **Postgres** — `SELECT raw_fields->>'total_attempt_count'
+    ///   FROM ff_exec_core WHERE (partition_key, execution_id) = ...`.
+    ///   The field lives in the JSONB `raw_fields` bag rather than a
+    ///   dedicated column (mirrors how `create_execution_impl` seeds
+    ///   it on row creation). Missing row → `InvalidInput`; missing
+    ///   field → `0`.
+    /// * **SQLite** — `SELECT CAST(json_extract(raw_fields,
+    ///   '$.total_attempt_count') AS INTEGER) FROM ff_exec_core
+    ///   WHERE ...`. Same JSON-in-`raw_fields` shape as PG; uses the
+    ///   same `json_extract` idiom already employed in
+    ///   `ff-backend-sqlite/src/queries/operator.rs` for replay_count.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so the
+    /// trait addition is non-breaking for out-of-tree backends (same
+    /// precedent as [`Self::read_current_attempt_index`] landing in
+    /// v0.12 PR-3).
+    async fn read_total_attempt_count(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<AttemptIndex, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_total_attempt_count",
         })
     }
 
@@ -1750,6 +1810,12 @@ mod tests {
             ))
         }
         async fn read_current_attempt_index(
+            &self,
+            _execution_id: &ExecutionId,
+        ) -> Result<AttemptIndex, EngineError> {
+            Ok(AttemptIndex::new(0))
+        }
+        async fn read_total_attempt_count(
             &self,
             _execution_id: &ExecutionId,
         ) -> Result<AttemptIndex, EngineError> {

@@ -1,4 +1,3 @@
-#[cfg(feature = "valkey-default")]
 use std::collections::HashMap;
 #[cfg(feature = "direct-valkey-claim")]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,20 +8,11 @@ use std::sync::Arc;
 // `--no-default-features, features = ["sqlite"]`.
 #[cfg(feature = "valkey-default")]
 use ferriskey::Client;
-#[cfg(feature = "valkey-default")]
-use ff_core::keys::ExecKeyContext;
 use ff_core::partition::PartitionConfig;
-#[cfg(feature = "valkey-default")]
 use ff_core::types::*;
-// Types referenced by the backend-agnostic surface
-// (e.g. `deliver_signal` ungated in v0.12 PR-3). The wildcard above
-// is `valkey-default`-gated; these are always in scope.
-#[cfg(not(feature = "valkey-default"))]
-use ff_core::types::{ExecutionId, TimestampMs, WaitpointId};
 use tokio::sync::Semaphore;
 
 use crate::config::WorkerConfig;
-#[cfg(feature = "valkey-default")]
 use crate::task::ClaimedTask;
 use crate::SdkError;
 
@@ -87,6 +77,7 @@ pub struct FlowFabricWorker {
     /// panics with a clear message until the backend-agnostic SDK
     /// worker-loop RFC lands (tracked in §8).
     #[cfg(feature = "valkey-default")]
+    #[allow(dead_code)]
     client: Option<Client>,
     config: WorkerConfig,
     partition_config: PartitionConfig,
@@ -177,6 +168,7 @@ impl FlowFabricWorker {
     /// claim/signal loop.
     #[cfg(feature = "valkey-default")]
     #[inline]
+    #[allow(dead_code)]
     fn valkey_client(&self) -> &Client {
         self.client.as_ref().expect(
             "FlowFabricWorker was built via connect_with (no Valkey dial) \
@@ -787,16 +779,16 @@ impl FlowFabricWorker {
     /// the Valkey-specific FCALL plumbing lives behind the trait in
     /// `ff_backend_valkey::claim_execution_impl`.
     ///
-    /// The method stays `valkey-default`-gated because
-    /// [`ClaimedTask::new`](crate::task::ClaimedTask) still depends on
-    /// `ValkeyBackend::encode_handle` for handle synthesis (lease-
-    /// renewal loop cookie). The public [`claim_from_grant`] entry
-    /// point that calls this helper stays gated for the same reason.
-    /// A full cross-backend ungate awaits an agnostic `ClaimedTask::new`
-    /// (v0.12 PR-5 / `claim_next` scope).
+    /// As of v0.12 PR-5.5 this helper + `claim_from_grant` are no
+    /// longer `valkey-default`-gated: the backend mints the `Handle`
+    /// at claim time and `ClaimedTask::new` caches it, so no
+    /// Valkey-specific handle synthesis is required on this path. The
+    /// `EngineBackend::claim_execution` default impl returns
+    /// `Err(Unavailable)` on PG/SQLite today (grant-consumer surface
+    /// is Valkey-only until the PG/SQLite grant-consumer RFC lands);
+    /// the compile surface is fully agnostic.
     ///
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
-    #[cfg(feature = "valkey-default")]
     async fn claim_execution(
         &self,
         execution_id: &ExecutionId,
@@ -804,27 +796,27 @@ impl FlowFabricWorker {
         partition: &ff_core::partition::Partition,
         now: TimestampMs,
     ) -> Result<ClaimedTask, SdkError> {
-        // Pre-read total_attempt_count from exec_core to derive the
-        // expected attempt index. The Lua uses total_attempt_count as
-        // the new index and builds the attempt key from the hash tag,
-        // so the Rust-side index is mainly documentation/debugging; we
-        // still plumb it through `ClaimExecutionArgs::expected_attempt_index`
-        // so the backend's KEYS construction lines up with what the
-        // Lua computes (byte-for-byte identical to pre-PR-4).
-        let ctx = ExecKeyContext::new(partition, execution_id);
-        let total_str: Option<String> = self
-            .valkey_client()
-            .cmd("HGET")
-            .arg(ctx.core())
-            .arg("total_attempt_count")
-            .execute()
+        // v0.12 PR-5.5 retry-path fix — pre-read the **total attempt
+        // counter**, not the current-attempt pointer. The fresh-claim
+        // path mints a new attempt row whose index is the counter's
+        // current value (the backend's Lua 5920 / PG `ff_claim_execution`
+        // / SQLite `claim_impl` all consult this same counter to compute
+        // `next_att_idx`). Pre-PR-5.5 this call went inline as `HGET
+        // {exec}:core total_attempt_count` on the Valkey client; the
+        // first PR-5.5 landing mistakenly routed it to
+        // `read_current_attempt_index`, which returns the *pointer* at
+        // the previously-leased attempt — on a retry-of-a-retry that
+        // still named the terminal-failed prior attempt and the new
+        // claim collided with it. `read_total_attempt_count` wraps
+        // the same byte-for-byte HGET on Valkey and provides the JSONB
+        // / json_extract equivalents on PG / SQLite. See
+        // `EngineBackend::read_total_attempt_count` rustdoc for the
+        // pointer-vs-counter distinction.
+        let att_idx = self
+            .backend
+            .read_total_attempt_count(execution_id)
             .await
-            .unwrap_or(None);
-        let next_idx = total_str
-            .as_deref()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        let att_idx = AttemptIndex::new(next_idx);
+            .map_err(|e| SdkError::Engine(Box::new(e)))?;
 
         let args = ff_core::contracts::ClaimExecutionArgs::new(
             execution_id.clone(),
@@ -868,6 +860,7 @@ impl FlowFabricWorker {
         Ok(ClaimedTask::new(
             self.backend.clone(),
             self.partition_config,
+            claimed.handle,
             execution_id.clone(),
             claimed.attempt_index,
             claimed.attempt_id,
@@ -928,7 +921,21 @@ impl FlowFabricWorker {
     ///
     /// [`ClaimGrant`]: ff_core::contracts::ClaimGrant
     /// [`ff_scheduler::Scheduler::claim_for_worker`]: https://docs.rs/ff-scheduler
-    #[cfg(feature = "valkey-default")]
+    ///
+    /// # Backend coverage (v0.12 PR-5.5)
+    ///
+    /// Method ungated across backends. The Valkey backend handles the
+    /// grant fully. Postgres + SQLite backends return
+    /// [`EngineError::Unavailable`](ff_core::engine_error::EngineError::Unavailable)
+    /// from [`EngineBackend::claim_execution`] today — grants on those
+    /// backends flow through the scheduler-routed [`claim_via_server`]
+    /// path (the PG/SQLite scheduler lives outside the `EngineBackend`
+    /// trait in this release). See
+    /// `project_claim_from_grant_pg_sqlite_gap.md` for motivation and
+    /// planned follow-up.
+    ///
+    /// [`claim_via_server`]: FlowFabricWorker::claim_via_server
+    /// [`EngineBackend::claim_execution`]: ff_core::engine_backend::EngineBackend::claim_execution
     pub async fn claim_from_grant(
         &self,
         lane: LaneId,
@@ -1001,7 +1008,6 @@ impl FlowFabricWorker {
     /// (`FlowFabricAdminClient`) reused here so workers don't keep a
     /// second reqwest client around. Build once at worker boot and
     /// hand in by reference on every claim.
-    #[cfg(feature = "valkey-default")]
     pub async fn claim_via_server(
         &self,
         admin: &crate::FlowFabricAdminClient,
@@ -1071,7 +1077,6 @@ impl FlowFabricWorker {
     ///
     /// [`ResumeGrant`]: ff_core::contracts::ResumeGrant
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
-    #[cfg(feature = "valkey-default")]
     pub async fn claim_from_resume_grant(
         &self,
         grant: ff_core::contracts::ResumeGrant,
@@ -1222,7 +1227,6 @@ impl FlowFabricWorker {
     /// [`claim_from_resume_grant`].
     ///
     /// [`claim_from_resume_grant`]: FlowFabricWorker::claim_from_resume_grant
-    #[cfg(feature = "valkey-default")]
     async fn claim_resumed_execution(
         &self,
         execution_id: &ExecutionId,
@@ -1263,6 +1267,7 @@ impl FlowFabricWorker {
         Ok(ClaimedTask::new(
             self.backend.clone(),
             self.partition_config,
+            claimed.handle,
             execution_id.clone(),
             claimed.attempt_index,
             claimed.attempt_id,
@@ -1287,7 +1292,6 @@ impl FlowFabricWorker {
     /// helper + its call sites in `claim_execution` and
     /// `claim_resumed_execution`) is PR-4/PR-5 scope per the v0.12
     /// agnostic-SDK plan.
-    #[cfg(feature = "valkey-default")]
     async fn read_execution_context(
         &self,
         execution_id: &ExecutionId,
@@ -1621,11 +1625,12 @@ mod sqlite_only_compile_surface_tests {
     /// v0.12 PR-2 compile anchor — `ClaimedTask` as a type MUST be
     /// addressable under `--no-default-features --features sqlite`
     /// (the `task` module is no longer `valkey-default`-gated at the
-    /// module level). The `impl ClaimedTask { ... }` block is still
-    /// valkey-gated because `synth_handle` / `new` depend on
-    /// `ff_backend_valkey::ValkeyBackend::encode_handle`; this anchor
-    /// pins the struct path + its field types through a generic-over-T
-    /// wrapper so a compile-time lookup of `ClaimedTask` is exercised
+    /// module level). As of v0.12 PR-5.5 the `impl ClaimedTask { ... }`
+    /// block is likewise ungated: the backend mints the `Handle` at
+    /// claim time and `cloned_handle` just clones the cached field, so
+    /// no Valkey-specific synthesis is required. This anchor pins the
+    /// struct path + its field types through a generic-over-T wrapper
+    /// so a compile-time lookup of `ClaimedTask` is exercised
     /// mechanically under the sqlite-only feature set.
     #[test]
     fn claimed_task_type_addressable_under_sqlite_only() {
@@ -1688,6 +1693,24 @@ mod sqlite_only_compile_surface_tests {
             id: &ExecutionId,
         ) -> Result<AttemptIndex, EngineError> {
             b.read_current_attempt_index(id).await
+        }
+    }
+
+    /// v0.12 PR-5.5 retry-path-fix compile anchor — the new
+    /// [`EngineBackend::read_total_attempt_count`] trait method MUST
+    /// be addressable under `--no-default-features --features sqlite`.
+    /// Mirrors the PR-3 `read_current_attempt_index` anchor.
+    #[test]
+    fn read_total_attempt_count_addressable_under_sqlite_only() {
+        use ff_core::engine_error::EngineError;
+        use ff_core::types::{AttemptIndex, ExecutionId};
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            id: &ExecutionId,
+        ) -> Result<AttemptIndex, EngineError> {
+            b.read_total_attempt_count(id).await
         }
     }
 
@@ -1794,6 +1817,98 @@ mod sqlite_only_compile_surface_tests {
             s: Signal,
         ) -> Pin<Box<dyn Future<Output = Result<SignalOutcome, SdkError>> + Send + 'a>> {
             Box::pin(w.deliver_signal(id, wp, s))
+        }
+    }
+
+    /// v0.12 PR-5.5 compile anchor — `claim_from_grant` MUST be
+    /// addressable under `--no-default-features --features sqlite`
+    /// (ungated in PR-5.5). PG / SQLite return `EngineError::Unavailable`
+    /// from the underlying trait method today, so the call path is
+    /// compile-reachable but runtime-unavailable. The anchor pins the
+    /// signature; a future PR wiring real PG/SQLite grant-consumer
+    /// bodies flips the runtime behaviour without touching this test.
+    #[test]
+    fn claim_from_grant_addressable_under_sqlite_only() {
+        use crate::task::ClaimedTask;
+        use crate::SdkError;
+        use ff_core::contracts::ClaimGrant;
+        use ff_core::types::LaneId;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        #[allow(dead_code)]
+        fn _pin<'a>(
+            w: &'a FlowFabricWorker,
+            lane: LaneId,
+            grant: ClaimGrant,
+        ) -> Pin<Box<dyn Future<Output = Result<ClaimedTask, SdkError>> + Send + 'a>> {
+            Box::pin(w.claim_from_grant(lane, grant))
+        }
+    }
+
+    /// v0.12 PR-5.5 compile anchor — `claim_via_server` MUST be
+    /// addressable under `--no-default-features --features sqlite`.
+    /// The scheduler-routed path is the supported PG/SQLite claim
+    /// entry point per `project_claim_from_grant_pg_sqlite_gap.md`;
+    /// pinning the signature here prevents a future PR from
+    /// accidentally re-gating it behind `valkey-default`.
+    #[test]
+    fn claim_via_server_addressable_under_sqlite_only() {
+        use crate::admin::FlowFabricAdminClient;
+        use crate::task::ClaimedTask;
+        use crate::SdkError;
+        use ff_core::types::LaneId;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        #[allow(dead_code)]
+        fn _pin<'a>(
+            w: &'a FlowFabricWorker,
+            admin: &'a FlowFabricAdminClient,
+            lane: &'a LaneId,
+            grant_ttl_ms: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<ClaimedTask>, SdkError>> + Send + 'a>>
+        {
+            Box::pin(w.claim_via_server(admin, lane, grant_ttl_ms))
+        }
+    }
+
+    /// v0.12 PR-5.5 compile anchor — `ClaimedTask::{complete, fail,
+    /// cancel}` MUST be addressable under `--no-default-features
+    /// --features sqlite`. The `impl ClaimedTask` block is now
+    /// module-level ungated (PR-5.5); the terminal ops route through
+    /// `EngineBackend::{complete, fail, cancel}` which are core trait
+    /// methods (no `streaming` / `suspension` / `budget` gate).
+    #[test]
+    fn claimed_task_terminal_ops_addressable_under_sqlite_only() {
+        use crate::task::{ClaimedTask, FailOutcome};
+        use crate::SdkError;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        #[allow(dead_code)]
+        fn _pin_complete(
+            t: ClaimedTask,
+            payload: Option<Vec<u8>>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SdkError>> + Send>> {
+            Box::pin(t.complete(payload))
+        }
+
+        #[allow(dead_code)]
+        fn _pin_fail<'a>(
+            t: ClaimedTask,
+            reason: &'a str,
+            error_category: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<FailOutcome, SdkError>> + Send + 'a>> {
+            Box::pin(t.fail(reason, error_category))
+        }
+
+        #[allow(dead_code)]
+        fn _pin_cancel<'a>(
+            t: ClaimedTask,
+            reason: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SdkError>> + Send + 'a>> {
+            Box::pin(t.cancel(reason))
         }
     }
 }

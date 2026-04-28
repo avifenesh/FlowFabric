@@ -1060,15 +1060,35 @@ pub(crate) async fn claim_resumed_execution_impl(
         let lease_epoch = LeaseEpoch(u64::try_from(epoch_i).unwrap_or(0));
         let attempt_id = AttemptId::new();
 
+        // v0.12 PR-5.5: populate the handle on the claim result so the
+        // SDK's `ClaimedTask::new` no longer synthesises one via
+        // `ValkeyBackend::encode_handle`.
+        let payload = HandlePayload::new(
+            args.execution_id.clone(),
+            attempt_index,
+            attempt_id.clone(),
+            args.lease_id.clone(),
+            lease_epoch,
+            args.lease_ttl_ms,
+            args.lane_id.clone(),
+            args.worker_instance_id.clone(),
+        );
+        let handle = Handle::new(
+            BackendTag::Sqlite,
+            HandleKind::Resumed,
+            encode_opaque(BackendTag::Sqlite, &payload),
+        );
+
         Ok::<_, EngineError>((
-            ClaimResumedExecutionResult::Claimed(ClaimedResumedExecution {
-                execution_id: args.execution_id.clone(),
-                lease_id: args.lease_id.clone(),
+            ClaimResumedExecutionResult::Claimed(ClaimedResumedExecution::new(
+                args.execution_id.clone(),
+                args.lease_id.clone(),
                 lease_epoch,
                 attempt_index,
                 attempt_id,
-                lease_expires_at: TimestampMs::from_millis(new_expires),
-            }),
+                TimestampMs::from_millis(new_expires),
+                handle,
+            )),
             lease_event_id,
         ))
     }

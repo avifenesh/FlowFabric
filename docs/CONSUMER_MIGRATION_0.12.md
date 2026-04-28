@@ -370,6 +370,52 @@ flow.
   admission-time capability-hash through for downstream
   correlation, or pass `None` to leave the field empty.
 
+### 8. Agnostic-SDK PR-5.5 — `ClaimedTask` + `claim_from_grant` ungated
+
+The SDK's worker hot paths (`claim_from_grant`, `claim_via_server`,
+`claim_resumed_execution`, and the `ClaimedTask` type + its
+non-streaming methods) are no longer `#[cfg(feature =
+"valkey-default")]`-gated. They route through the `EngineBackend`
+trait and compile under `--no-default-features, features = ["sqlite"]`.
+
+`ClaimedExecution` and `ClaimedResumedExecution` gain a new
+`handle: ff_core::backend::Handle` field populated by the owning
+backend at claim time. The SDK's `ClaimedTask` caches the handle
+and clones it into each per-op trait forwarder — replacing the
+pre-PR `ValkeyBackend::encode_handle` synthesis call previously
+hardcoded into `ClaimedTask::new`.
+
+**Source-breaking — `#[non_exhaustive]` on claim contracts.**
+`ClaimedExecution` and `ClaimedResumedExecution` are now marked
+`#[non_exhaustive]` so future backend-populated fields stay
+additive. Consumers that constructed these via struct literals,
+or pattern-matched them without a `..` rest pattern, must switch
+to the public constructors (`ClaimedExecution::new(..)`,
+`ClaimedResumedExecution::new(..)`) or add `..` to exhaustive
+destructures. Backends outside the crate cannot construct claim
+results by literal — use the `::new` constructors that take the
+`handle` as an explicit argument.
+
+**Limitations.** Runtime coverage on PG/SQLite remains the
+scheduler-routed [`claim_via_server`] path. Both backends return
+[`EngineError::Unavailable`](../crates/ff-core/src/engine_error.rs)
+from `EngineBackend::claim_execution` today, so `claim_from_grant`
+on PG/SQLite is compile-reachable but runtime-unavailable. The
+[`claim_via_server`] / [`Scheduler::claim_for_worker`] path is the
+supported production shape for those backends in v0.12; a future
+RFC-024 grant-consumer extension will wire the direct
+`claim_from_grant` bodies. See
+`project_claim_from_grant_pg_sqlite_gap.md` for status.
+
+`ClaimedTask::read_stream` / `tail_stream` /
+`tail_stream_with_visibility` remain `valkey-default`-gated in v0.12
+— the backing `EngineBackend::read_stream` / `tail_stream` trait
+methods are gated on ff-core's `streaming` feature, which the
+`sqlite` feature set does not pull in today.
+
+[`claim_via_server`]: https://docs.rs/ff-sdk/latest/ff_sdk/struct.FlowFabricWorker.html#method.claim_via_server
+[`Scheduler::claim_for_worker`]: https://docs.rs/ff-scheduler
+
 ## Non-changes
 
 - No Rust API break on Valkey or Postgres hot paths **outside

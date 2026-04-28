@@ -968,6 +968,47 @@ async fn read_current_attempt_index_impl(
     Ok(AttemptIndex::new(idx))
 }
 
+/// Point-read of the execution's **total attempt counter** from the
+/// `{exec}:core` hash. Single `HGET total_attempt_count` — the same
+/// field Lua 5920's `ff_claim_execution` consults when computing
+/// `next_att_idx`. Missing hash / missing field / empty string all
+/// map to `0` (pre-claim state, first-claim about to mint attempt 0);
+/// the FCALL itself surfaces the loud error if the exec truly
+/// doesn't exist.
+///
+/// Distinct from [`read_current_attempt_index_impl`] — this is the
+/// monotonic counter used to assign the *next* attempt on a fresh
+/// claim, not the pointer at the currently-leased attempt row. See
+/// `EngineBackend::read_total_attempt_count` rustdoc for the
+/// retry-path bug this split fixes.
+#[tracing::instrument(
+    name = "ff.read_total_attempt_count",
+    skip_all,
+    fields(backend = "valkey", execution_id = %id)
+)]
+async fn read_total_attempt_count_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<AttemptIndex, EngineError> {
+    let partition = execution_partition(id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, id);
+
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("total_attempt_count")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    let count = raw
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    Ok(AttemptIndex::new(count))
+}
+
 /// List suspended executions in one partition, cursor-paginated,
 /// with suspension `reason_code` populated per entry (issue #183).
 ///
@@ -4415,7 +4456,23 @@ async fn claim_resumed_execution_impl(
     let partial = ff_claim_resumed_execution(client, &keys, &args)
         .await
         .map_err(EngineError::from)?;
-    Ok(partial.complete(execution_id))
+    let mut result = partial.complete(execution_id);
+    // v0.12 PR-5.5: overwrite the stub handle with the real
+    // Valkey-encoded one (`HandleKind::Resumed`). Lane + worker_instance
+    // ride on `args`.
+    let ClaimResumedExecutionResult::Claimed(claimed) = &mut result;
+    let fields = handle_codec::HandleFields::new(
+        claimed.execution_id.clone(),
+        claimed.attempt_index,
+        claimed.attempt_id.clone(),
+        claimed.lease_id.clone(),
+        claimed.lease_epoch,
+        args.lease_ttl_ms,
+        args.lane_id.clone(),
+        args.worker_instance_id.clone(),
+    );
+    claimed.handle = handle_codec::encode_handle(&fields, HandleKind::Resumed);
+    Ok(result)
 }
 
 /// Scan a lane's eligible ZSET on one partition via `ZRANGEBYSCORE`.
@@ -4423,6 +4480,11 @@ async fn claim_resumed_execution_impl(
 /// (`FlowFabricWorker::claim_next` at `ff-sdk/src/worker.rs:~624-637`).
 /// Keep the command shape byte-for-byte identical so bench traces
 /// match pre-PR.
+#[tracing::instrument(
+    name = "ff.scan_eligible_executions",
+    skip_all,
+    fields(backend = "valkey", lane_id = %args.lane_id, limit = args.limit)
+)]
 async fn scan_eligible_executions_impl(
     client: &ferriskey::Client,
     args: ScanEligibleArgs,
@@ -4482,6 +4544,16 @@ async fn scan_eligible_executions_impl(
 /// (`FlowFabricWorker::issue_claim_grant` at
 /// `ff-sdk/src/worker.rs:~763-804`). Wire (KEYS/ARGV) shape is
 /// byte-for-byte identical so bench traces match pre-PR.
+#[tracing::instrument(
+    name = "ff.issue_claim_grant",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        worker_id = %args.worker_id,
+        lane_id = %args.lane_id,
+    )
+)]
 async fn issue_claim_grant_impl(
     client: &ferriskey::Client,
     args: IssueClaimGrantArgs,
@@ -4557,6 +4629,15 @@ async fn issue_claim_grant_impl(
 /// (`FlowFabricWorker::block_route` at
 /// `ff-sdk/src/worker.rs:~818-866`). Wire (KEYS/ARGV) shape is
 /// byte-for-byte identical so bench traces match pre-PR.
+#[tracing::instrument(
+    name = "ff.block_route",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        lane_id = %args.lane_id,
+    )
+)]
 async fn block_route_impl(
     client: &ferriskey::Client,
     args: BlockRouteArgs,
@@ -4641,7 +4722,28 @@ async fn claim_execution_impl(
     let partial = ff_claim_execution(client, &keys, &args)
         .await
         .map_err(EngineError::from)?;
-    Ok(partial.complete(execution_id))
+    let mut result = partial.complete(execution_id);
+    // v0.12 PR-5.5: overwrite the stub handle seeded by
+    // `ClaimExecutionResultPartial::complete` with the real Valkey-encoded
+    // one so the SDK's `ClaimedTask::new` no longer synthesises via
+    // `ValkeyBackend::encode_handle` at the worker layer.
+    // `ClaimExecutionResult` is `#[non_exhaustive]` with `Claimed` as
+    // the only variant today; if a future variant needs a handle the
+    // new arm will land here.
+    if let ClaimExecutionResult::Claimed(claimed) = &mut result {
+        let fields = handle_codec::HandleFields::new(
+            claimed.execution_id.clone(),
+            claimed.attempt_index,
+            claimed.attempt_id.clone(),
+            claimed.lease_id.clone(),
+            claimed.lease_epoch,
+            args.lease_ttl_ms,
+            args.lane_id.clone(),
+            args.worker_instance_id.clone(),
+        );
+        claimed.handle = handle_codec::encode_handle(&fields, HandleKind::Fresh);
+    }
+    Ok(result)
 }
 
 /// RFC-017 Stage B: acquire a stream-op permit off
@@ -5053,6 +5155,20 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "read_current_attempt_index: HGET exec_core.current_attempt_index",
+                )
+            })
+    }
+
+    async fn read_total_attempt_count(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<AttemptIndex, EngineError> {
+        read_total_attempt_count_impl(&self.client, &self.partition_config, execution_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "read_total_attempt_count: HGET exec_core.total_attempt_count",
                 )
             })
     }

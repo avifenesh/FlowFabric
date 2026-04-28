@@ -561,6 +561,7 @@ impl ClaimExecutionArgs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClaimedExecution {
     pub execution_id: ExecutionId,
     pub lease_id: LeaseId,
@@ -569,6 +570,42 @@ pub struct ClaimedExecution {
     pub attempt_id: AttemptId,
     pub attempt_type: AttemptType,
     pub lease_expires_at: TimestampMs,
+    /// Backend-populated attempt handle for this claim (v0.12 PR-5.5).
+    /// Valkey fills in an encoded `HandleKind::Fresh`; PG/SQLite are
+    /// `Unavailable` on `claim_execution` at runtime per
+    /// `project_claim_from_grant_pg_sqlite_gap.md`, so the field stays
+    /// a stub on those paths.
+    #[serde(default = "crate::backend::stub_handle_fresh")]
+    pub handle: crate::backend::Handle,
+}
+
+impl ClaimedExecution {
+    /// Construct a `ClaimedExecution`. Added alongside
+    /// `#[non_exhaustive]` per `feedback_non_exhaustive_needs_constructor`
+    /// so consumers (backend impls building a claim outcome) can still
+    /// build the struct after it was sealed for forward-compat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        attempt_index: AttemptIndex,
+        attempt_id: AttemptId,
+        attempt_type: AttemptType,
+        lease_expires_at: TimestampMs,
+        handle: crate::backend::Handle,
+    ) -> Self {
+        Self {
+            execution_id,
+            lease_id,
+            lease_epoch,
+            attempt_index,
+            attempt_id,
+            attempt_type,
+            lease_expires_at,
+            handle,
+        }
+    }
 }
 
 /// Typed outcome of [`crate::engine_backend::EngineBackend::claim_execution`].
@@ -1390,6 +1427,7 @@ pub struct ClaimResumedExecutionArgs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClaimedResumedExecution {
     pub execution_id: ExecutionId,
     pub lease_id: LeaseId,
@@ -1397,6 +1435,39 @@ pub struct ClaimedResumedExecution {
     pub attempt_index: AttemptIndex,
     pub attempt_id: AttemptId,
     pub lease_expires_at: TimestampMs,
+    /// Backend-populated attempt handle for this resumed claim
+    /// (v0.12 PR-5.5). Valkey fills in `HandleKind::Resumed`; PG/SQLite
+    /// populate a backend-tagged real handle via
+    /// `ff_core::handle_codec::encode`.
+    #[serde(default = "crate::backend::stub_handle_resumed")]
+    pub handle: crate::backend::Handle,
+}
+
+impl ClaimedResumedExecution {
+    /// Construct a `ClaimedResumedExecution`. Added alongside
+    /// `#[non_exhaustive]` per `feedback_non_exhaustive_needs_constructor`
+    /// so consumers (backend impls building a resumed-claim outcome)
+    /// can still build the struct after it was sealed for forward-compat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        attempt_index: AttemptIndex,
+        attempt_id: AttemptId,
+        lease_expires_at: TimestampMs,
+        handle: crate::backend::Handle,
+    ) -> Self {
+        Self {
+            execution_id,
+            lease_id,
+            lease_epoch,
+            attempt_index,
+            attempt_id,
+            lease_expires_at,
+            handle,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3185,6 +3256,7 @@ mod tests {
             attempt_id: AttemptId::new(),
             attempt_type: AttemptType::Initial,
             lease_expires_at: TimestampMs::from_millis(1000),
+            handle: crate::backend::stub_handle_fresh(),
         });
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ClaimExecutionResult = serde_json::from_str(&json).unwrap();
