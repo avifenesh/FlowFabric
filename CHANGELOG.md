@@ -5,6 +5,22 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `examples/ff-dev/` — RFC-023 Phase 4 headline example for the
+  SQLite dev-only backend (v0.12.0 release target). ~200-line
+  consumer-facing demo that drives the `EngineBackend` trait directly
+  against an in-memory `SqliteBackend`: `create_flow` +
+  `create_execution` + `claim` + `complete` + Wave-9 admin
+  (`change_priority`, `cancel_execution`) + `read_execution_info` +
+  RFC-019 `subscribe_completion` surface. No Docker, no ambient
+  services; runs as `FF_DEV_MODE=1 cargo run --bin ff-dev`. Companion
+  `scripts/smoke-sqlite.sh` wraps the example as a release-gate smoke
+  (RFC-023 §9) and is wired into the `matrix-tests-complete` required
+  check via `.github/workflows/matrix.yml`. The example follows the
+  RFC-023 §4.7.1 cairn-canonical shape (no ff-sdk / ferriskey in the
+  dep graph) and honours the `FF_DEV_MODE=1` production guard.
+
 ### Fixed
 
 - `ff-backend-postgres`: `ff_attempt.outcome` is now cleared on the

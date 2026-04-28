@@ -1,0 +1,36 @@
+[workspace]
+
+[package]
+name = "ff-dev-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "RFC-023 headline example — FlowFabric dev backend (SQLite) in 60 seconds, no Docker."
+
+[[bin]]
+name = "ff-dev"
+path = "src/main.rs"
+
+[dependencies]
+# RFC-023 §4.7 consumer-canonical dependency posture:
+#   - `ff-backend-sqlite` provides the dev-only SQLite EngineBackend.
+#   - `ff-core` supplies the trait + typed contracts (no Valkey deps).
+# No `ff-sdk` — the cairn-canonical shape drives the backend trait
+# directly, so this example does not pull in ferriskey by any path.
+ff-core = { path = "../../crates/ff-core", default-features = false, features = ["core", "streaming", "suspension", "budget"] }
+ff-backend-sqlite = { path = "../../crates/ff-backend-sqlite" }
+
+# Used only by the `promote_to_runnable` helper that flips a
+# freshly-seeded row into the `runnable` shape the claim path expects
+# (see the helper rustdoc for the rationale). Real consumers relying
+# on the scheduler + scanner supervisor never need this.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "uuid"] }
+
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
