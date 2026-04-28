@@ -1516,6 +1516,113 @@ impl FlowFabricWorker {
         Ok(task)
     }
 
+    /// Consume a [`ReclaimGrant`] to mint a fresh attempt for a
+    /// lease-expired / lease-revoked execution (RFC-024 §3.4).
+    ///
+    /// Backend-agnostic. Routes through
+    /// [`EngineBackend::reclaim_execution`] on whatever backend the
+    /// worker was connected with (Valkey via `connect` / `connect_with`,
+    /// Postgres / SQLite via `connect_with`). Distinct from
+    /// [`claim_from_resume_grant`]: reclaim creates a NEW attempt row
+    /// and bumps `lease_reclaim_count` (`HandleKind::Reclaimed`), while
+    /// resume re-uses the existing attempt under
+    /// `ff_claim_resumed_execution` (`HandleKind::Resumed`).
+    ///
+    /// # Return shape
+    ///
+    /// Returns the raw [`ReclaimExecutionOutcome`] so consumers match
+    /// on the four outcomes (`Claimed(Handle)`, `NotReclaimable`,
+    /// `ReclaimCapExceeded`, `GrantNotFound`) and decide their
+    /// dispatch. The `Claimed` variant carries a [`Handle`] whose
+    /// `kind` is [`HandleKind::Reclaimed`]; downstream ops (complete,
+    /// fail, renew, append_frame, …) take the handle directly via the
+    /// `EngineBackend` trait.
+    ///
+    /// This contrasts with [`claim_from_resume_grant`], which wraps
+    /// the handle in a [`ClaimedTask`] with a concurrency-permit and
+    /// auto-lease-renewal loop. Those affordances are
+    /// `valkey-default`-gated today (they depend on the bundled
+    /// `ferriskey::Client` + `lease_ttl_ms` renewal timer). The
+    /// reclaim surface is intentionally narrower so it compiles under
+    /// `--no-default-features, features = ["sqlite"]` and consumers
+    /// can drive the reclaim flow on any backend.
+    ///
+    /// # Feature compatibility
+    ///
+    /// No cfg-gate. Compiles + runs under every feature set ff-sdk
+    /// supports (including sqlite-only). Verified by the compile-time
+    /// type assertion
+    /// `worker_claim_from_reclaim_grant_is_backend_agnostic_at_type_level`
+    /// in `crates/ff-sdk/tests/rfc024_sdk.rs`, which pins the method's
+    /// full signature under the default feature set and is paralleled
+    /// by `sqlite_only_compile_surface_tests` in this file for the
+    /// `--no-default-features, features = ["sqlite"]` compile anchor on
+    /// the rest of the backend-agnostic surface.
+    ///
+    /// # worker_capabilities
+    ///
+    /// `ReclaimExecutionArgs::worker_capabilities` is NOT part of the
+    /// Lua FCALL (the reclaim Lua validates grant consumption via
+    /// `grant.worker_id == args.worker_id` only — see
+    /// `crates/ff-script/src/flowfabric.lua:3088` and RFC-024 §4.4).
+    /// Capability matching happens at grant-issuance time (see
+    /// [`FlowFabricAdminClient::issue_reclaim_grant`]
+    /// — in the `ff-sdk::admin` module, `valkey-default`-gated).
+    ///
+    /// # Errors
+    ///
+    /// * [`SdkError::Engine`] — the backend's `reclaim_execution`
+    ///   returned an [`EngineError`] (transport fault, validation
+    ///   failure, `Unavailable` from a backend that does not
+    ///   implement RFC-024 — currently only pre-RFC out-of-tree
+    ///   backends).
+    ///
+    /// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
+    /// [`ReclaimExecutionOutcome`]: ff_core::contracts::ReclaimExecutionOutcome
+    /// [`Handle`]: ff_core::backend::Handle
+    /// [`HandleKind::Reclaimed`]: ff_core::backend::HandleKind::Reclaimed
+    /// [`EngineBackend::reclaim_execution`]: ff_core::engine_backend::EngineBackend::reclaim_execution
+    /// [`EngineError`]: ff_core::engine_error::EngineError
+    /// [`claim_from_resume_grant`]: FlowFabricWorker::claim_from_resume_grant
+    /// [`FlowFabricAdminClient::issue_reclaim_grant`]: crate::admin::FlowFabricAdminClient::issue_reclaim_grant
+    pub async fn claim_from_reclaim_grant(
+        &self,
+        grant: ff_core::contracts::ReclaimGrant,
+        args: ff_core::contracts::ReclaimExecutionArgs,
+    ) -> Result<ff_core::contracts::ReclaimExecutionOutcome, SdkError> {
+        // `ReclaimGrant` is accepted as a parameter so the call-site
+        // shape matches RFC-024 §3.4 (consumer receives a grant from
+        // `issue_reclaim_grant` and feeds it + args into
+        // `claim_from_reclaim_grant`). The grant metadata is
+        // already embedded in the backend's server-side store
+        // (Valkey `claim_grant` hash, PG/SQLite `ff_claim_grant`
+        // table) keyed by (execution_id, grant_key) — the trait
+        // method looks it up from `args.execution_id`.
+        //
+        // The overlap between `ReclaimGrant` and
+        // `ReclaimExecutionArgs` is (execution_id, lane_id);
+        // mismatched grant/args is a consumer-side bug (grant-for-A
+        // + args-for-B), and silently forwarding lets the SDK act
+        // on the args execution. Reject the mismatch up front so
+        // the misuse surfaces at the SDK boundary instead of
+        // succeeding against the wrong execution. The grant's
+        // `expires_at_ms` is validated against wall-clock now so
+        // an already-expired grant is rejected without a backend
+        // round-trip (the backend also enforces expiry, but the
+        // SDK-side check gives a crisper error and preserves the
+        // reclaim-budget / lease slot).
+        // `TimestampMs` is an `i64` (Unix-epoch ms); cast to `u64` for
+        // comparison against `ReclaimGrant::expires_at_ms`. Clamp
+        // negatives to 0 so a pre-epoch system clock (vanishingly
+        // unlikely, but representable) doesn't wrap to a future u64.
+        let now_ms: u64 = ff_core::types::TimestampMs::now().0.max(0) as u64;
+        validate_reclaim_grant_against_args(&grant, &args, now_ms)?;
+        self.backend
+            .reclaim_execution(args)
+            .await
+            .map_err(|e| SdkError::Engine(Box::new(e)))
+    }
+
     /// Low-level resume claim. Forwards through
     /// [`EngineBackend::claim_resumed_execution`](ff_core::engine_backend::EngineBackend::claim_resumed_execution)
     /// — the trait-level trigger surface landed in issue #150 — and
@@ -1748,6 +1855,161 @@ async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkEr
         num_budget_partitions: parse("num_budget_partitions", 32),
         num_quota_partitions: parse("num_quota_partitions", 32),
     })
+}
+
+/// Cross-check the [`ReclaimGrant`] handed back by
+/// `issue_reclaim_grant` against the [`ReclaimExecutionArgs`] the
+/// consumer is about to dispatch. Catches the grant-for-A + args-for-B
+/// misuse at the SDK boundary before a backend round-trip (PR #407
+/// review F1).
+///
+/// The overlap between the two types is `(execution_id, lane_id)`;
+/// `partition_key` / `grant_key` live only on the grant and are
+/// verified server-side. The grant's `expires_at_ms` is also
+/// validated against `now_ms` so an expired grant fails fast without
+/// burning a backend call (the backend enforces expiry too, but the
+/// SDK-side check gives a crisper, typed error).
+///
+/// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
+/// [`ReclaimExecutionArgs`]: ff_core::contracts::ReclaimExecutionArgs
+fn validate_reclaim_grant_against_args(
+    grant: &ff_core::contracts::ReclaimGrant,
+    args: &ff_core::contracts::ReclaimExecutionArgs,
+    now_ms: u64,
+) -> Result<(), SdkError> {
+    if grant.execution_id != args.execution_id {
+        return Err(SdkError::Config {
+            context: "claim_from_reclaim_grant".to_owned(),
+            field: Some("execution_id".to_owned()),
+            message: format!(
+                "grant.execution_id ({}) does not match args.execution_id ({})",
+                grant.execution_id, args.execution_id
+            ),
+        });
+    }
+    if grant.lane_id != args.lane_id {
+        return Err(SdkError::Config {
+            context: "claim_from_reclaim_grant".to_owned(),
+            field: Some("lane_id".to_owned()),
+            message: format!(
+                "grant.lane_id ({}) does not match args.lane_id ({})",
+                grant.lane_id.as_str(),
+                args.lane_id.as_str()
+            ),
+        });
+    }
+    if grant.expires_at_ms <= now_ms {
+        return Err(SdkError::Config {
+            context: "claim_from_reclaim_grant".to_owned(),
+            field: Some("expires_at_ms".to_owned()),
+            message: format!(
+                "grant expired: expires_at_ms={} now_ms={}",
+                grant.expires_at_ms, now_ms
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod reclaim_grant_validation_tests {
+    //! Unit tests for `validate_reclaim_grant_against_args` — the
+    //! SDK-side cross-check that catches grant/args mismatch (PR #407
+    //! review F1). No Valkey / backend required: the helper is pure.
+    use super::validate_reclaim_grant_against_args;
+    use crate::SdkError;
+    use ff_core::contracts::{ReclaimExecutionArgs, ReclaimGrant};
+    use ff_core::partition::{Partition, PartitionFamily, PartitionKey};
+    use ff_core::types::{
+        AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseId, WorkerId, WorkerInstanceId,
+    };
+
+    const EXEC_A: &str = "{fp:7}:00000000-0000-4000-8000-000000000001";
+    const EXEC_B: &str = "{fp:7}:00000000-0000-4000-8000-000000000002";
+
+    fn exec(s: &str) -> ExecutionId {
+        ExecutionId::parse(s).expect("valid execution id")
+    }
+
+    fn grant_for(execution_id: ExecutionId, lane: &str, expires_at_ms: u64) -> ReclaimGrant {
+        ReclaimGrant::new(
+            execution_id,
+            PartitionKey::from(&Partition { family: PartitionFamily::Flow, index: 7 }),
+            "reclaim:grant:abc".to_owned(),
+            expires_at_ms,
+            LaneId::new(lane),
+        )
+    }
+
+    fn args_for(execution_id: ExecutionId, lane: &str) -> ReclaimExecutionArgs {
+        ReclaimExecutionArgs::new(
+            execution_id,
+            WorkerId::new("w1"),
+            WorkerInstanceId::new("w1-i1"),
+            LaneId::new(lane),
+            None,
+            LeaseId::new(),
+            30_000,
+            AttemptId::new(),
+            "{}".to_owned(),
+            None,
+            WorkerInstanceId::new("w1-i0"),
+            AttemptIndex::new(0),
+        )
+    }
+
+    #[test]
+    fn accepts_matching_grant_and_args() {
+        let g = grant_for(exec(EXEC_A), "main", 2_000);
+        let a = args_for(exec(EXEC_A), "main");
+        assert!(validate_reclaim_grant_against_args(&g, &a, 1_000).is_ok());
+    }
+
+    #[test]
+    fn rejects_mismatched_execution_id() {
+        let g = grant_for(exec(EXEC_A), "main", 2_000);
+        let a = args_for(exec(EXEC_B), "main");
+        let err = validate_reclaim_grant_against_args(&g, &a, 1_000)
+            .expect_err("expected mismatched execution_id to fail");
+        match err {
+            SdkError::Config { field, .. } => assert_eq!(field.as_deref(), Some("execution_id")),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_mismatched_lane_id() {
+        let g = grant_for(exec(EXEC_A), "main", 2_000);
+        let a = args_for(exec(EXEC_A), "other");
+        let err = validate_reclaim_grant_against_args(&g, &a, 1_000)
+            .expect_err("expected mismatched lane_id to fail");
+        match err {
+            SdkError::Config { field, .. } => assert_eq!(field.as_deref(), Some("lane_id")),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_expired_grant() {
+        // expires_at_ms == now_ms is rejected (strict `<=`) so the
+        // server's TTL enforcement window can't race us.
+        let g = grant_for(exec(EXEC_A), "main", 1_000);
+        let a = args_for(exec(EXEC_A), "main");
+        let err = validate_reclaim_grant_against_args(&g, &a, 1_000)
+            .expect_err("expected expired grant to fail");
+        match err {
+            SdkError::Config { field, .. } => assert_eq!(field.as_deref(), Some("expires_at_ms")),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+
+        // Also rejected when already past expiry.
+        let err2 = validate_reclaim_grant_against_args(&g, &a, 5_000)
+            .expect_err("expected past-expiry grant to fail");
+        match err2 {
+            SdkError::Config { field, .. } => assert_eq!(field.as_deref(), Some("expires_at_ms")),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

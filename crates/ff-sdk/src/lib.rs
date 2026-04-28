@@ -100,7 +100,8 @@ pub mod worker;
 // Re-exports for convenience
 #[cfg(feature = "valkey-default")]
 pub use admin::{
-    rotate_waitpoint_hmac_secret_all_partitions, FlowFabricAdminClient, PartitionRotationOutcome,
+    rotate_waitpoint_hmac_secret_all_partitions, FlowFabricAdminClient,
+    IssueReclaimGrantRequest, IssueReclaimGrantResponse, PartitionRotationOutcome,
     RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
 };
 // RFC-023 Phase 1a: re-export `SqliteBackend` so consumers using
