@@ -33,24 +33,42 @@ cd "${REPO_ROOT}"
 
 START_NS="$(date +%s%N)"
 
+# Pre-build the example so the guard-regression leg below can attribute
+# a non-zero exit to the `FF_DEV_MODE` refusal path specifically — a
+# compile break would otherwise also non-zero-exit `cargo run` and
+# falsely green the guard check.
+echo "==> smoke-sqlite: pre-build ff-dev"
+(cd examples/ff-dev && cargo build --quiet --bin ff-dev)
+
+FF_DEV_BIN="${REPO_ROOT}/examples/ff-dev/target/debug/ff-dev"
+if [[ ! -x "${FF_DEV_BIN}" ]]; then
+    echo "FAIL: ff-dev binary not found at ${FF_DEV_BIN} after build" >&2
+    exit 1
+fi
+
+OUT="$(mktemp -t ff-dev-smoke.XXXXXX)"
+GUARD_OUT="$(mktemp -t ff-dev-guard.XXXXXX)"
+trap 'rm -f "${OUT}" "${GUARD_OUT}"' EXIT
+
 echo "==> smoke-sqlite: verify production guard refuses without FF_DEV_MODE"
-# Scrub FF_DEV_MODE from the environment for this leg even if the
-# caller set it, so the guard regression test is deterministic.
-if (
-    cd examples/ff-dev
-    unset FF_DEV_MODE
-    cargo run --quiet --bin ff-dev 2>/dev/null
-) ; then
+# Invoke the pre-built binary directly. Scrub `FF_DEV_MODE` from the
+# child env even if the caller set it so the leg is deterministic. The
+# assertion is stricter than "non-zero exit": we grep for the specific
+# refusal message, so a crash / panic / link error cannot false-pass
+# the leg.
+if env -u FF_DEV_MODE "${FF_DEV_BIN}" > "${GUARD_OUT}" 2>&1 ; then
     echo "FAIL: ff-dev exited 0 without FF_DEV_MODE=1 — production guard regressed" >&2
+    tail -n 40 "${GUARD_OUT}" >&2 || true
+    exit 2
+fi
+if ! grep -Fq "FF_DEV_MODE=1 is required" "${GUARD_OUT}"; then
+    echo "FAIL: guard-leg exited non-zero but refusal message not present — assumed regression" >&2
+    tail -n 40 "${GUARD_OUT}" >&2 || true
     exit 2
 fi
 
 echo "==> smoke-sqlite: run ff-dev end-to-end (FF_DEV_MODE=1)"
-OUT="$(mktemp -t ff-dev-smoke.XXXXXX)"
-trap 'rm -f "${OUT}"' EXIT
-
-if ! (cd examples/ff-dev && FF_DEV_MODE=1 cargo run --quiet --bin ff-dev) \
-        > "${OUT}" 2>&1 ; then
+if ! FF_DEV_MODE=1 "${FF_DEV_BIN}" > "${OUT}" 2>&1 ; then
     echo "FAIL: ff-dev example exited non-zero — tail of output:" >&2
     tail -n 40 "${OUT}" >&2 || true
     exit 1

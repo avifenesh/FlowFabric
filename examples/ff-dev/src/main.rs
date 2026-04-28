@@ -79,6 +79,25 @@ async fn main() -> Result<()> {
         .await
         .context("construct SqliteBackend")?;
     let trait_obj: Arc<dyn EngineBackend> = backend.clone();
+
+    // Side-pool dialed at the same shared-cache URI. `promote_to_runnable`
+    // below uses it to flip one row's lifecycle column directly — a
+    // dev-envelope convenience that substitutes for the scanner
+    // supervisor's promotion pass. Real consumers using
+    // `SqliteBackend::with_scanners` or the full ff-server boot path
+    // never need this pool. Kept separate from the backend's own
+    // connection pool so the example does not depend on the crate's
+    // `#[doc(hidden)] pool_for_test()` hook.
+    let side_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            db_uri
+                .parse::<sqlx::sqlite::SqliteConnectOptions>()
+                .context("parse dev URI for side-pool")?,
+        )
+        .await
+        .context("open dev side-pool")?;
+
     let caps = trait_obj.capabilities();
     info!(
         family = caps.identity.family,
@@ -126,14 +145,17 @@ async fn main() -> Result<()> {
 
     // ── 4. Drive one execution through claim → complete ────────────────
     //
-    // `create_execution` seeds the row in `pending` / `initial` shape;
-    // the claim path expects `runnable` / `pending` / `initial`. In the
+    // `create_execution` inserts `lifecycle_phase='submitted'`,
+    // `public_state='waiting'`, `attempt_state='pending'`. The claim
+    // path requires `lifecycle_phase='runnable'` /
+    // `public_state='pending'` / `attempt_state='initial'` — in the
     // steady-state Valkey / Postgres pipeline the scheduler + scanner
-    // supervisor flip this column; under the SQLite dev envelope the
-    // example flips it directly so the trait-level claim / complete
-    // lifecycle is visible end-to-end.
+    // supervisor walk executions through that promotion. Under the
+    // SQLite dev envelope the example flips the columns directly so
+    // the trait-level claim / complete lifecycle is visible
+    // end-to-end.
     let target = &execs[0];
-    promote_to_runnable(backend.pool_for_test(), target)
+    promote_to_runnable(&side_pool, target)
         .await
         .context("promote_to_runnable")?;
 
@@ -162,12 +184,16 @@ async fn main() -> Result<()> {
     // `change_priority`, `cancel_execution`, `read_execution_info`, and
     // the subscribe surface all work identically.
     //
-    // `change_priority` + `cancel_execution` require the execution to
-    // be in the `runnable` phase (same invariant as PG); the raw-SQL
-    // promote here is the dev-only analogue of what the Valkey /
-    // Postgres scheduler does automatically.
-    promote_to_runnable(backend.pool_for_test(), &execs[1]).await?;
-    promote_to_runnable(backend.pool_for_test(), &execs[2]).await?;
+    // `change_priority` specifically requires the execution to already
+    // be in the `runnable` phase (same contention guard as PG) — the
+    // raw-SQL promote here is the dev-only analogue of what the
+    // Valkey / Postgres scheduler does automatically. `cancel_execution`
+    // has NO such requirement — it works on the freshly-created row
+    // too — but we promote exec[2] as well so the follow-on
+    // `read_execution_info` audit surfaces a state the wire-level
+    // reader normalizer accepts.
+    promote_to_runnable(&side_pool, &execs[1]).await?;
+    promote_to_runnable(&side_pool, &execs[2]).await?;
 
     trait_obj
         .change_priority(ChangePriorityArgs {

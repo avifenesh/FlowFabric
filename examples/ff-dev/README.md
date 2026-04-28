@@ -71,14 +71,17 @@ story.
 
 ## Under the hood — what the promote helper does
 
-RFC-023 §4.7.1 calls out that `create_execution` seeds the row in the
-`pending` / `initial` shape, which the claim path does not route. In
-production backends the scheduler + scanner supervisor flip this to
-`runnable` automatically; under the SQLite dev envelope there is no
-scanner spawning happening for this example so the `promote_to_runnable`
-helper issues the SQL flip directly. Real consumers using
-`SqliteBackend::with_scanners` or driving the full ff-server boot
-path do not need this helper.
+`create_execution` inserts each row with
+`lifecycle_phase='submitted'`, `public_state='waiting'`, and
+`attempt_state='pending'`. The claim path requires
+`lifecycle_phase='runnable'` + `public_state='pending'` +
+`attempt_state='initial'` — in production backends the scheduler +
+scanner supervisor walk executions through that promotion
+automatically. The example spawns neither, so the
+`promote_to_runnable` helper issues the SQL flip directly via a
+side-pool opened against the same shared-cache `:memory:` URI. Real
+consumers using `SqliteBackend::with_scanners` or driving the full
+ff-server boot path do not need this helper.
 
 ## See also
 
