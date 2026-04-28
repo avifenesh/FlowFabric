@@ -96,6 +96,7 @@ fi
 EXPECTED=(
     "FlowFabric SQLite backend active (FF_DEV_MODE=1)"
     "dialed SQLite dev backend"
+    "sqlite_version"
     "create_flow"
     "claim → minted handle"
     "complete"
@@ -114,6 +115,14 @@ for needle in "${EXPECTED[@]}"; do
         exit 1
     fi
 done
+
+# Surface the bundled SQLite version from the ff-dev log (RFC-023 §7.1
+# floor: >= 3.35, enforced by ff-dev itself). Grep the first
+# `sqlite_version` log line so CI logs show which SQLite the bundled
+# build pulled in.
+if SQLITE_VERSION_LINE="$(grep -F 'sqlite_version' "${OUT}" | head -n 1)"; then
+    echo "==> smoke-sqlite: bundled ${SQLITE_VERSION_LINE}"
+fi
 
 END_NS="$(date +%s%N)"
 ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
