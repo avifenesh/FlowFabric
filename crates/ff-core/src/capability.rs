@@ -107,6 +107,15 @@ pub struct Supports {
     /// Postgres-native on Postgres).
     pub claim_for_worker: bool,
 
+    // ── Reclaim (RFC-024) ──
+    /// `issue_reclaim_grant` + `reclaim_execution` (rolled up — both
+    /// land together on every in-tree backend per RFC-024 §3.6, so
+    /// one bool covers the consumer-visible reclaim surface).
+    /// `false` on out-of-tree backends via `Supports::none()`; `true`
+    /// on Valkey (v0.12.0 per RFC-024 PR-F), Postgres (PR-D), SQLite
+    /// (PR-E).
+    pub issue_reclaim_grant: bool,
+
     // ── Boot ──
     /// `prepare` does non-trivial work (e.g. Valkey `FUNCTION LOAD`).
     /// Postgres reports `false` — `prepare` returns `NoOp` there.
@@ -162,6 +171,7 @@ impl Supports {
             cancel_flow_wait_indefinite: false,
             ack_cancel_member: false,
             claim_for_worker: false,
+            issue_reclaim_grant: false,
             prepare: false,
             subscribe_lease_history: false,
             subscribe_completion: false,
