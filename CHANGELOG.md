@@ -37,6 +37,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`examples/incident-remediation` — SC-10 headline example for the
+  RFC-024 lease-reclaim consumer surface.** Two-responder pager-death
+  handoff: Responder A claims an incident, drops mid-flow; a
+  supervisor issues a `ReclaimGrant`; Responder B picks up via
+  `FlowFabricWorker::claim_from_reclaim_grant` and completes. A
+  second incident is run past `max_reclaim_count` to demonstrate the
+  `ReclaimExecutionOutcome::ReclaimCapExceeded` escalation branch.
+  Runs end-to-end under `FF_DEV_MODE=1 cargo run -p
+  incident-remediation -- --backend sqlite` with zero external infra
+  (companion to `examples/ff-dev`'s RFC-023 SQLite dev-mode
+  showcase). Valkey + Postgres dispatch paths compile + connect but
+  defer the full loop to deployments with a live scheduler +
+  scanner supervisor — see the example README for setup notes.
+  Cross-links `docs/CONSUMER_MIGRATION_0.12.md` §7 as the production
+  migration reference.
 - **RFC-024 PR-G — SDK consumer surface for lease-reclaim (closes
   #371 end-to-end).** Adds the three consumer-facing surfaces that
   cairn-fabric (and any pull-mode consumer) calls to recover from

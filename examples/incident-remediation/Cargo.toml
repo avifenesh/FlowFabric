@@ -1,0 +1,50 @@
+[workspace]
+
+[package]
+name = "incident-remediation"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "SC-10 scenario — incident-remediation workflow demonstrating the RFC-024 lease-reclaim consumer surface (v0.12.0)."
+
+[[bin]]
+name = "incident-remediation"
+path = "src/main.rs"
+
+[dependencies]
+# SC-10 (RFC-024) consumer-surface posture. The end-to-end flow (claim
+# → pager-death → issue reclaim grant → claim_from_reclaim_grant →
+# complete, plus the max_reclaim_count cap-exceeded branch) is driven
+# through the public consumer surface:
+#
+#   * `ff-sdk::FlowFabricWorker::connect_with`  (backend-agnostic)
+#   * `ff-sdk::FlowFabricWorker::claim_from_reclaim_grant`  (RFC-024 §3.4)
+#   * `ff-core::engine_backend::EngineBackend::issue_reclaim_grant`
+#     (supervisor path — see README §"Why issue_reclaim_grant is
+#     trait-direct not SDK-direct" for the admin-SDK-is-HTTP-only gap)
+#
+# `ff-sdk` is pulled in with `features = ["sqlite"]` so `connect_with`
+# compiles under a non-Valkey backend; the `valkey-default` feature
+# stays ON (transitively from `default = ["valkey-default"]`) so the
+# `--backend valkey` dispatch path has the ferriskey client available.
+ff-sdk = { path = "../../crates/ff-sdk", features = ["sqlite"] }
+ff-core = { path = "../../crates/ff-core", default-features = false, features = ["core", "streaming", "suspension", "budget"] }
+ff-backend-sqlite = { path = "../../crates/ff-backend-sqlite" }
+ff-backend-postgres = { path = "../../crates/ff-backend-postgres" }
+ff-backend-valkey = { path = "../../crates/ff-backend-valkey" }
+
+# Side-pool against the shared-cache SQLite URI. Used by the
+# `promote_to_runnable` + `force_lease_expired` helpers (the dev-only
+# analogue of what the Valkey/PG scheduler + scanner supervisor do).
+# Mirrors `examples/ff-dev`.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "uuid"] }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
