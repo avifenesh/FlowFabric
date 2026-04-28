@@ -1,4 +1,12 @@
-# Postgres Parity Matrix — `EngineBackend` trait
+# Backend Parity Matrix — `EngineBackend` trait
+
+> **Filename note (v0.12 / RFC-023 §9).** The file is named
+> `POSTGRES_PARITY_MATRIX.md` for historical reasons; at v0.12 it
+> gained a SQLite column and now documents all three backends. The
+> filename is retained to avoid URL churn in external consumer
+> references. Rename to `BACKEND_PARITY_MATRIX.md` is an open owner
+> call if the cross-reference cost ever stops exceeding the
+> clarity gain (RFC-023 §7, §9 owner note).
 
 **RFC-018 Stage A note (2026-04-24, reshaped in v0.10):** this matrix
 is now callable at runtime via
@@ -378,3 +386,65 @@ Migrations shipped as part of Wave 9 (all additive, forward-only):
   cancel-backlog reconciler.
 
 Consumer migration notes at [`CONSUMER_MIGRATION_0.11.md`](CONSUMER_MIGRATION_0.11.md).
+
+## Release: v0.12.0 (SQLite dev-only backend, RFC-023, 2026-04-26)
+
+Third `EngineBackend` implementation lands at v0.12:
+`ff-backend-sqlite`. Scoped **permanently** to dev-only / testing
+per [`rfcs/RFC-023-sqlite-dev-only-backend.md`](../rfcs/RFC-023-sqlite-dev-only-backend.md)
+§1.0. See [`docs/dev-harness.md`](dev-harness.md) for the consumer
+setup guide and
+[`docs/CONSUMER_MIGRATION_0.12.md`](CONSUMER_MIGRATION_0.12.md) for
+the upgrade checklist.
+
+**Positioning reminder.** SQLite is a testing harness; Valkey is
+the engine; Postgres is the enterprise persistence layer. The
+parity rows below do NOT imply perf parity — SQLite is a
+single-writer, single-process, ~10³ write-QPS envelope. Production
+scale demands Valkey or Postgres.
+
+### Parity summary at v0.12.0 (all three backends)
+
+| Family | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| Ingress (5 methods) | `impl` | `impl` | `impl` | `create_flow`, `create_execution`, `add_execution_to_flow`, `stage_dependency_edge`, `apply_dependency_to_child`. |
+| Flow family (6 methods) | `impl` | `impl` | `impl` | `describe_flow`, `list_flows`, `list_edges`, `describe_edge`, `cancel_flow`, `set_edge_group_policy`. |
+| Flow cancel (`cancel_flow_header`, `ack_cancel_member`) | `impl` | `impl` | `impl` | **v0.12 (RFC-023 Phase 3.3).** SQLite ports the PG cancel-backlog semantics (migration 0014 analogue); `AlreadyTerminal { stored_* }` idempotent replay matches PG. Operator-event outbox INSERT in-tx + post-commit broadcast wakeup. |
+| Read model (`read_execution_info`, `read_execution_state`, `get_execution_result`) | `impl` | `impl` | `impl` | **v0.12 (RFC-023 Phase 3.3).** SQLite lowers PG's `LEFT JOIN LATERAL` to correlated subqueries; storage-tier literal normalisation reuses the PG helper shape. |
+| Operator control (`cancel_execution`, `change_priority`, `replay_execution`, `revoke_lease`) | `impl` | `impl` | `impl` | **v0.12 (RFC-023 Phase 3.2).** SQLite runs the PG Rev-7 spine under `BEGIN IMMEDIATE` RESERVED-lock + WHERE-clause CAS fencing + `retry_serializable` for SQLITE_BUSY absorption. `ff_lease_event` + `ff_operator_event` outbox emits match PG exactly. |
+| Budget / quota (`create_budget`, `reset_budget`, `create_quota_policy`, `get_budget_status`, `report_usage_admin`) | `impl` | `impl` | `impl` | **v0.12 (RFC-023 Phase 3.4).** SQLite hand-ports PG `ff_budget_policy` / `ff_quota_policy` family with positional `?` placeholders; breach-counter columns (`breach_count`, `soft_breach_count`, `last_breach_at_ms`, `last_breach_dim`) maintained in-tx matching Valkey + PG Rev-6. |
+| Waitpoints (`list_pending_waitpoints`) | `impl` | `impl` | `impl` | **v0.12 (RFC-023 Phase 3.3).** SQLite cursor-paginated scan of `ff_waitpoint_pending` with `state IN ('pending','active')` filter + `NotFound` on missing execution + `(token_kid, token_fingerprint)` parsed from the stored token. |
+| Scheduler (`claim_for_worker`) | `impl` | `impl` | `stub` | **SQLite non-goal** per RFC-023 §5 — no scheduler is wired on SQLite. `Supports::claim_for_worker = false` on the SQLite backend. Dev harness consumers drive claim/complete/fail directly through the `EngineBackend` trait. |
+| Subscribe (lease / completion / signal) | `impl` | `impl` | `impl` | **v0.12.** SQLite uses `tokio::sync::broadcast` channels for WAKEUP + outbox tables (migrations 0006 / 0007 / 0010 analogues) for cursor-resume, mirroring the RFC-019 contract. In-process only — cross-process subscribe fan-out is a PG-only property. |
+| `subscribe_instance_tags` | `n/a` | `n/a` | `n/a` | Deferred per #311 (speculative demand; served by `list_executions` + `ScannerFilter::with_instance_tag`). |
+| Admin rotation + seed | `impl` | `impl` | `impl` | — |
+| Cross-cutting (`backend_label`, `ping`, `shutdown_prepare`, `prepare`) | `impl` | `impl` | `impl` | SQLite `prepare` returns `PrepareOutcome::NoOp` (migrations run via `sqlx::migrate!` at pool init); `shutdown_prepare` drains the N=1 scanner supervisor. |
+
+### SQLite-specific notes
+
+- **No partitioning.** SQLite drops `PARTITION BY HASH` — one
+  non-partitioned table per entity (RFC-023 §4.1). The scanner
+  supervisor collapses to `N=1` (one tick task per reconciler, no
+  fan-out).
+- **Single-writer + retry classifier.** SERIALIZABLE-grade ops run
+  under `BEGIN IMMEDIATE` + `retry_serializable` wrapping of
+  `is_retryable_sqlite_busy` (`SQLITE_BUSY` / `SQLITE_BUSY_TIMEOUT` /
+  `SQLITE_LOCKED`). `MAX_ATTEMPTS = 3` matches PG's
+  `CANCEL_FLOW_MAX_ATTEMPTS`.
+- **Production guard.** `SqliteBackend::new` refuses to construct
+  without `FF_DEV_MODE=1` and emits a WARN banner on every
+  construction.
+- **Migrations.** SQLite migrations 0001 – 0014 are hand-ported
+  SQLite-dialect files 1:1 numbered with Postgres for parity-drift
+  detection (RFC-023 §4.1). CI lints the pairing via a
+  `.sqlite-skip` sidecar allow-list.
+- **Handle codec wire byte `0x03`.** `BackendTag::Sqlite`
+  (wire byte `0x03`) joins `Valkey=0x01` / `Postgres=0x02`; handles
+  minted by one backend are rejected by the other two with
+  `EngineError::Validation { kind: HandleFromOtherBackend }`.
+
+Phase 4c (capability-matrix snapshot test) flips the `Supports`
+flags above from `Supports::none()` at release time; the `impl`
+entries here are the post-flip state. See
+`crates/ff-backend-sqlite/tests/capabilities.rs` for the snapshot
+gate.

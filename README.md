@@ -20,16 +20,26 @@ Valkey-native execution engine for long-running, interruptible, resource-aware w
                  └──────────────┼──────────────┘
                                 │
                          ┌──────┴──────┐
-                         │  ff-script  │  typed FCALL wrappers
+                         │  ff-script  │  typed FCALL wrappers (Valkey)
                          └──────┬──────┘
                                 │
                          ┌──────┴──────┐
-                         │   ff-core   │  types, state, keys, errors
+                         │   ff-core   │  types, state, keys, errors,
+                         │              │  EngineBackend trait
                          └──────┬──────┘
                                 │
-                         ┌──────┴──────┐
-                         │  ferriskey  │  Valkey client (Rust)
-                         └─────────────┘
+           ┌────────────────────┼────────────────────┐
+           │                    │                    │
+  ┌────────┴────────┐  ┌────────┴────────┐  ┌───────┴────────┐
+  │ ff-backend-     │  │ ff-backend-     │  │ ff-backend-    │
+  │  valkey         │  │  postgres       │  │  sqlite         │
+  │  (production)   │  │  (production)   │  │  (dev-only)    │
+  │                 │  │                 │  │  RFC-023       │
+  └────────┬────────┘  └─────────────────┘  └────────────────┘
+           │
+  ┌────────┴────────┐
+  │    ferriskey    │  Valkey client (Rust)
+  └─────────────────┘
 ```
 
 ## Features
@@ -83,7 +93,11 @@ FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 
 ### 3. Try an example
 
-Six end-to-end examples live under [`examples/`](examples/):
+Six end-to-end examples live under [`examples/`](examples/). A
+seventh example — `ff-dev` — is the v0.12 dev-harness demo for the
+RFC-023 SQLite backend and lands in a sibling tranche of the
+v0.12 docs sweep; see [`docs/dev-harness.md`](docs/dev-harness.md)
+for the canonical setup in the meantime.
 
 - **[`v011-wave9-postgres`](examples/v011-wave9-postgres/)** -- v0.11 headline demo for the RFC-020 Wave 9 Postgres release. Multi-tenant operator dashboard exercising all six Wave-9 method groups on Postgres: budget/quota admin, `change_priority`, `cancel_execution` + `ack_cancel_member`, `replay_execution`, `list_pending_waitpoints`, `cancel_flow_header`, and `read_execution_info`. Requires `FF_PG_TEST_URL`.
 - **[`v010-read-side-ergonomics`](examples/v010-read-side-ergonomics/)** -- v0.10 headline demo for consumer read-side APIs: flat `Capabilities::supports.<flag>` discovery (#277), typed `LeaseHistoryEvent` from `subscribe_lease_history` (#282), and tag-restricted subscriptions via `ScannerFilter::with_instance_tag(..)`. Multi-tenant lease-audit console pattern. No external dependencies beyond a running `ff-server`.
@@ -125,6 +139,7 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
 | `ff-scheduler` | Claim-grant cycle, fairness, capability matching |
 | `ff-backend-valkey` | `EngineBackend` implementation backed by Valkey FCALL |
 | `ff-backend-postgres` | `EngineBackend` implementation backed by Postgres (RFC-017 Stage E) |
+| `ff-backend-sqlite` | `EngineBackend` implementation backed by SQLite (RFC-023) — **dev-only**, gated behind `FF_DEV_MODE=1`. For `cargo test` without Docker and contributor onboarding. Not a deployment target. |
 | `flowfabric` | Umbrella re-export crate; feature-flagged backend selection (`valkey` default, `postgres` opt-in) |
 | `ff-sdk` | Worker SDK — public API for worker authors; includes the client-local `EngineBackendLayer` surface |
 | `ff-server` | HTTP API server, Valkey connection, boot sequence, engine `/metrics` endpoint |
@@ -140,13 +155,16 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
   | Variable | Default | Description |
   |----------|---------|-------------|
   | `FF_WAITPOINT_HMAC_SECRET` | *required* | Hex-encoded HMAC signing secret for waitpoint tokens (RFC-004 §Waitpoint Security). Even-length hex; 64 chars (32 bytes) recommended. |
-  | `FF_BACKEND` | `valkey` | Backend family — `valkey` or `postgres`. Both first-class at v0.8.0 (RFC-017 Stage E4). |
-  | `FF_HOST` | `localhost` | Valkey host (ignored when `FF_BACKEND=postgres`) |
-  | `FF_PORT` | `6379` | Valkey port (ignored when `FF_BACKEND=postgres`) |
+  | `FF_BACKEND` | `valkey` | Backend family — `valkey`, `postgres`, or `sqlite`. Valkey + Postgres are first-class at v0.8.0 (RFC-017 Stage E4); SQLite lands at v0.12.0 as a **dev-only** backend (RFC-023). |
+  | `FF_HOST` | `localhost` | Valkey host (ignored when `FF_BACKEND=postgres` or `sqlite`) |
+  | `FF_PORT` | `6379` | Valkey port (ignored when `FF_BACKEND=postgres` or `sqlite`) |
   | `FF_TLS` | `false` | Enable Valkey TLS (`1` or `true`) |
   | `FF_CLUSTER` | `false` | Enable Valkey cluster mode |
   | `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (required when `FF_BACKEND=postgres`). Example: `postgres://user:pass@host:5432/db`. |
-  | `FF_POSTGRES_POOL_SIZE` | `10` | Postgres pool size (ignored on the Valkey path). |
+  | `FF_POSTGRES_POOL_SIZE` | `10` | Postgres pool size (ignored on non-Postgres paths). |
+  | `FF_SQLITE_PATH` | `:memory:` | SQLite path or URI (required shape under `FF_BACKEND=sqlite`). File path (`/tmp/ff-dev.db`) or URI (`file:name?mode=memory&cache=shared`). Dev-only per RFC-023. |
+  | `FF_SQLITE_POOL_SIZE` | `4` | SQLite pool size (1 writer + N–1 readers); ignored on non-SQLite paths. |
+  | `FF_DEV_MODE` | *(unset)* | **Required** when `FF_BACKEND=sqlite` or when constructing `SqliteBackend::new` directly; server + backend refuse to start without it. Orthogonal to `FF_ENV=development` / `FF_BACKEND_ACCEPT_UNREADY=1`. No effect on Valkey / Postgres paths. See [`docs/dev-harness.md`](docs/dev-harness.md). |
   | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
   | `FF_LANES` | `default` | Comma-separated lane names |
   | `FF_FLOW_PARTITIONS` | `256` | Flow partition count (exec keys co-locate under RFC-011) |
