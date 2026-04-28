@@ -5,6 +5,36 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Agnostic-SDK PR-5.5 — `ClaimedTask` + `claim_from_grant` /
+  `claim_via_server` / `claim_resumed_execution` /
+  `read_execution_context` ungated.** The SDK's worker hot paths are
+  no longer `#[cfg(feature = "valkey-default")]`-gated at the method
+  level; they now route exclusively through the `EngineBackend`
+  trait and compile under `--no-default-features, features =
+  ["sqlite"]`. The `ClaimedExecution` and `ClaimedResumedExecution`
+  contract structs gain a new `handle:
+  ff_core::backend::Handle` field populated by the owning backend at
+  claim time; `ClaimedTask::new` caches the handle and clones it
+  into each per-op trait forwarder (replaces the pre-PR
+  `ValkeyBackend::encode_handle` synthesis call that hardcoded the
+  Valkey backend tag). `BackendTag`, `HandleKind`, `HandleOpaque`,
+  and `Handle` gain `#[derive(Serialize, Deserialize)]` to support
+  the new contract field. PG and SQLite backends populate
+  `claim_resumed_execution.handle` with a real backend-tagged
+  encoded handle; `claim_execution` on those backends still returns
+  `EngineError::Unavailable` at runtime per
+  `project_claim_from_grant_pg_sqlite_gap.md` (ungate is
+  compile-surface; runtime coverage on PG/SQLite remains the
+  scheduler-routed `claim_via_server` path). `ClaimedTask::read_stream`
+  / `tail_stream` / `tail_stream_with_visibility` remain
+  `valkey-default`-gated — the backing trait methods require
+  ff-core's `streaming` feature which the `sqlite` feature set does
+  not activate today. See
+  [`docs/CONSUMER_MIGRATION_0.12.md`](docs/CONSUMER_MIGRATION_0.12.md)
+  §8 for details.
+
 ### Added
 
 - **RFC-024 PR-G — SDK consumer surface for lease-reclaim (closes

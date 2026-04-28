@@ -4415,7 +4415,23 @@ async fn claim_resumed_execution_impl(
     let partial = ff_claim_resumed_execution(client, &keys, &args)
         .await
         .map_err(EngineError::from)?;
-    Ok(partial.complete(execution_id))
+    let mut result = partial.complete(execution_id);
+    // v0.12 PR-5.5: overwrite the stub handle with the real
+    // Valkey-encoded one (`HandleKind::Resumed`). Lane + worker_instance
+    // ride on `args`.
+    let ClaimResumedExecutionResult::Claimed(claimed) = &mut result;
+    let fields = handle_codec::HandleFields::new(
+        claimed.execution_id.clone(),
+        claimed.attempt_index,
+        claimed.attempt_id.clone(),
+        claimed.lease_id.clone(),
+        claimed.lease_epoch,
+        args.lease_ttl_ms,
+        args.lane_id.clone(),
+        args.worker_instance_id.clone(),
+    );
+    claimed.handle = handle_codec::encode_handle(&fields, HandleKind::Resumed);
+    Ok(result)
 }
 
 /// Scan a lane's eligible ZSET on one partition via `ZRANGEBYSCORE`.
@@ -4641,7 +4657,28 @@ async fn claim_execution_impl(
     let partial = ff_claim_execution(client, &keys, &args)
         .await
         .map_err(EngineError::from)?;
-    Ok(partial.complete(execution_id))
+    let mut result = partial.complete(execution_id);
+    // v0.12 PR-5.5: overwrite the stub handle seeded by
+    // `ClaimExecutionResultPartial::complete` with the real Valkey-encoded
+    // one so the SDK's `ClaimedTask::new` no longer synthesises via
+    // `ValkeyBackend::encode_handle` at the worker layer.
+    // `ClaimExecutionResult` is `#[non_exhaustive]` with `Claimed` as
+    // the only variant today; if a future variant needs a handle the
+    // new arm will land here.
+    if let ClaimExecutionResult::Claimed(claimed) = &mut result {
+        let fields = handle_codec::HandleFields::new(
+            claimed.execution_id.clone(),
+            claimed.attempt_index,
+            claimed.attempt_id.clone(),
+            claimed.lease_id.clone(),
+            claimed.lease_epoch,
+            args.lease_ttl_ms,
+            args.lane_id.clone(),
+            args.worker_instance_id.clone(),
+        );
+        claimed.handle = handle_codec::encode_handle(&fields, HandleKind::Fresh);
+    }
+    Ok(result)
 }
 
 /// RFC-017 Stage B: acquire a stream-op permit off

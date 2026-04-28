@@ -40,6 +40,10 @@ impl ClaimResumedExecutionResultPartial {
                 attempt_index: p.attempt_index,
                 attempt_id: p.attempt_id,
                 lease_expires_at: p.lease_expires_at,
+                // Handle populated by the backend impl (see
+                // `ff_backend_valkey::claim_resumed_execution_impl`) —
+                // ff-script has no `BackendTag` context here.
+                handle: ff_core::backend::stub_handle_resumed(),
             }),
         }
     }

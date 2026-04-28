@@ -1003,6 +1003,27 @@ pub(crate) async fn claim_resumed_execution_impl(
     let lease_epoch = LeaseEpoch(u64::try_from(epoch_row.0).unwrap_or(0));
     let attempt_id = AttemptId::new();
 
+    // v0.12 PR-5.5: populate the handle alongside the claim result so
+    // the SDK's `ClaimedTask::new` no longer synthesises one via
+    // `ValkeyBackend::encode_handle`. PG encodes a real Postgres-tagged
+    // handle that ops (`renew`, `progress`, …) can decode on the same
+    // backend.
+    let payload = HandlePayload::new(
+        args.execution_id.clone(),
+        attempt_index,
+        attempt_id.clone(),
+        args.lease_id.clone(),
+        lease_epoch,
+        args.lease_ttl_ms,
+        args.lane_id.clone(),
+        args.worker_instance_id.clone(),
+    );
+    let handle = Handle::new(
+        BackendTag::Postgres,
+        HandleKind::Resumed,
+        encode_opaque(BackendTag::Postgres, &payload),
+    );
+
     Ok(ClaimResumedExecutionResult::Claimed(
         ClaimedResumedExecution {
             execution_id: args.execution_id.clone(),
@@ -1011,6 +1032,7 @@ pub(crate) async fn claim_resumed_execution_impl(
             attempt_index,
             attempt_id,
             lease_expires_at: TimestampMs::from_millis(new_expires),
+            handle,
         },
     ))
 }

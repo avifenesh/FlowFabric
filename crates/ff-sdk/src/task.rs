@@ -1,18 +1,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-#[cfg(feature = "valkey-default")]
 use std::time::Duration;
 
 #[cfg(feature = "valkey-default")]
 use ferriskey::Value;
 use ff_core::backend::Handle;
-#[cfg(feature = "valkey-default")]
-use ff_core::backend::{HandleKind, PendingWaitpoint};
-#[cfg(feature = "valkey-default")]
+use ff_core::backend::PendingWaitpoint;
 use ff_core::contracts::ReportUsageResult;
 use ff_core::engine_backend::EngineBackend;
-#[cfg(feature = "valkey-default")]
 use ff_core::engine_error::StateKind;
 use ff_script::error::ScriptError;
 use ff_core::partition::PartitionConfig;
@@ -148,7 +144,6 @@ pub use ff_core::backend::FailOutcome;
 ///
 /// `complete`, `fail`, and `cancel` consume `self` — this prevents
 /// double-complete bugs at the type level.
-#[cfg_attr(not(feature = "valkey-default"), allow(dead_code))]
 pub struct ClaimedTask {
     /// `EngineBackend` the trait-migrated ops forward through.
     ///
@@ -182,11 +177,25 @@ pub struct ClaimedTask {
     lease_id: LeaseId,
     lease_epoch: LeaseEpoch,
     /// Lease timing.
+    #[allow(dead_code)]
     lease_ttl_ms: u64,
     /// Lane used at claim time.
     lane_id: LaneId,
     /// Worker instance that holds this lease (for index cleanup keys).
+    #[allow(dead_code)]
     worker_instance_id: WorkerInstanceId,
+    /// Backend-minted attempt handle cached at claim time.
+    ///
+    /// **RFC-012 Stage 1d (v0.12 PR-5.5).** Replaces the pre-PR
+    /// `synth_handle` helper that per-op synthesised a Valkey-specific
+    /// `Handle` via `ValkeyBackend::encode_handle`. The handle is now
+    /// produced by the owning backend at `claim_execution` /
+    /// `claim_resumed_execution` time and rides on the
+    /// `ClaimedExecution` / `ClaimedResumedExecution` result. Every
+    /// per-op trait forwarder clones it into `backend.*()` — no
+    /// runtime cost difference vs. the pre-PR-5.5 per-op
+    /// `encode_handle` (one `Box<[u8]>` allocation per op).
+    handle: Handle,
     /// Execution data.
     input_payload: Vec<u8>,
     execution_kind: String,
@@ -220,7 +229,6 @@ pub struct ClaimedTask {
     _concurrency_permit: Option<OwnedSemaphorePermit>,
 }
 
-#[cfg(feature = "valkey-default")]
 impl ClaimedTask {
     /// Construct a `ClaimedTask` from the results of a successful
     /// `ff_claim_execution` or `ff_claim_resumed_execution` FCALL.
@@ -280,6 +288,7 @@ impl ClaimedTask {
     pub(crate) fn new(
         backend: Arc<dyn EngineBackend>,
         partition_config: PartitionConfig,
+        handle: Handle,
         execution_id: ExecutionId,
         attempt_index: AttemptIndex,
         attempt_id: AttemptId,
@@ -295,23 +304,13 @@ impl ClaimedTask {
         let renewal_stop = Arc::new(Notify::new());
         let renewal_failures = Arc::new(AtomicU32::new(0));
 
-        // Stage 1b: the renewal task forwards through `backend.renew(&handle)`.
-        // Build the handle once at construction time and hand both Arc clones
-        // into the spawned task.
-        let renewal_handle_cookie = ff_backend_valkey::ValkeyBackend::encode_handle(
-            execution_id.clone(),
-            attempt_index,
-            attempt_id.clone(),
-            lease_id.clone(),
-            lease_epoch,
-            lease_ttl_ms,
-            lane_id.clone(),
-            worker_instance_id.clone(),
-            HandleKind::Fresh,
-        );
+        // v0.12 PR-5.5: the renewal task forwards through
+        // `backend.renew(&handle)` using the backend-minted handle. No
+        // Valkey-specific `encode_handle` call here — the handle rode in
+        // on the claim result.
         let renewal_handle = spawn_renewal_task(
             backend.clone(),
-            renewal_handle_cookie,
+            handle.clone(),
             execution_id.clone(),
             lease_ttl_ms,
             renewal_stop.clone(),
@@ -329,6 +328,7 @@ impl ClaimedTask {
             lease_ttl_ms,
             lane_id,
             worker_instance_id,
+            handle,
             input_payload,
             execution_kind,
             tags,
@@ -394,6 +394,13 @@ impl ClaimedTask {
     ///
     /// Validation (count_limit bounds) runs at this boundary — out-of-range
     /// input surfaces as [`SdkError::Config`] before reaching the backend.
+    ///
+    /// Gated on `valkey-default` — the backing
+    /// [`EngineBackend::read_stream`] trait method requires ff-core's
+    /// `streaming` feature, which the `valkey-default` feature set
+    /// activates. Sqlite-only builds (`--no-default-features,
+    /// features = ["sqlite"]`) do not expose this method today.
+    #[cfg(feature = "valkey-default")]
     pub async fn read_stream(
         &self,
         from: StreamCursor,
@@ -414,6 +421,9 @@ impl ClaimedTask {
     /// with claim/complete/fail hot paths. Consumers that need
     /// isolation should build a dedicated `EngineBackend` for tail
     /// reads.
+    ///
+    /// Gated on `valkey-default` — see [`Self::read_stream`].
+    #[cfg(feature = "valkey-default")]
     pub async fn tail_stream(
         &self,
         after: StreamCursor,
@@ -434,6 +444,9 @@ impl ClaimedTask {
     /// (ff_core::backend::TailVisibility::ExcludeBestEffort) to drop
     /// [`StreamMode::BestEffortLive`](ff_core::backend::StreamMode::BestEffortLive)
     /// frames server-side.
+    ///
+    /// Gated on `valkey-default` — see [`Self::read_stream`].
+    #[cfg(feature = "valkey-default")]
     pub async fn tail_stream_with_visibility(
         &self,
         after: StreamCursor,
@@ -463,33 +476,18 @@ impl ClaimedTask {
             .await?)
     }
 
-    /// Synthesise a Valkey-backend `Handle` encoding this task's
-    /// attempt-cookie fields. Private to the SDK — the trait
-    /// forwarders call this per op to produce the `&Handle` argument
-    /// the `EngineBackend` methods take.
+    /// Clone this task's cached attempt handle for passing to a trait
+    /// op (`backend.complete(&handle, …)`, `backend.fail(&handle, …)`,
+    /// etc.).
     ///
-    /// **RFC-012 Stage 1b option A.** Refactoring `ClaimedTask` to
-    /// carry one cached `Handle` instead of synthesising per op is
-    /// deferred to Stage 1d (issue #89 follow-up). The per-op cost is
-    /// a single allocation of a small byte buffer — negligible
-    /// compared to the FCALL round-trip that follows.
-    ///
-    /// Kind is always `HandleKind::Fresh` because today the 9
-    /// Stage-1b ops all treat the backend tag + opaque bytes as
-    /// authoritative; they do not dispatch on kind. Stage 1d routes
-    /// resumed-claim callers through a `Resumed` synth.
+    /// **RFC-012 Stage 1d (v0.12 PR-5.5).** The handle rides in on the
+    /// claim result and is stored on the struct — per-op calls clone
+    /// it instead of re-synthesising via backend-specific code. The
+    /// `Handle` payload is `Box<[u8]> + 2 small enums`, so a clone is
+    /// effectively one heap allocation — the same cost as the
+    /// pre-PR-5.5 `synth_handle`.
     fn synth_handle(&self) -> Handle {
-        ff_backend_valkey::ValkeyBackend::encode_handle(
-            self.execution_id.clone(),
-            self.attempt_index,
-            self.attempt_id.clone(),
-            self.lease_id.clone(),
-            self.lease_epoch,
-            self.lease_ttl_ms,
-            self.lane_id.clone(),
-            self.worker_instance_id.clone(),
-            HandleKind::Fresh,
-        )
+        self.handle.clone()
     }
 
     /// Check if the lease is likely still valid based on renewal success.
@@ -1049,7 +1047,6 @@ impl ClaimedTask {
 /// whether to call `stop_renewal()`: yes for landed responses, no
 /// for transport errors so the caller's retry path still sees a
 /// running renewal task.
-#[cfg(feature = "valkey-default")]
 fn fcall_landed<T>(r: &Result<T, crate::EngineError>) -> bool {
     match r {
         Ok(_) => true,
@@ -1065,7 +1062,6 @@ fn fcall_landed<T>(r: &Result<T, crate::EngineError>) -> bool {
 /// Stage 1b forwarder is reclassify a novel category as transient.
 /// Stage 1d (or issue #117) widens `FailureClass` with a
 /// `Custom(String)` arm for exact round-trip.
-#[cfg(feature = "valkey-default")]
 fn error_category_to_class(s: &str) -> ff_core::backend::FailureClass {
     use ff_core::backend::FailureClass;
     match s {
@@ -1115,7 +1111,6 @@ impl Drop for ClaimedTask {
 ///
 /// See `benches/harness/src/bin/long_running.rs` for the bench
 /// consumer that depends on this span naming.
-#[cfg(feature = "valkey-default")]
 #[tracing::instrument(
     name = "renew_lease",
     skip_all,
@@ -1143,7 +1138,6 @@ async fn renew_once(
 /// - `stop_signal` is notified (complete/fail/cancel called)
 /// - Renewal fails with a terminal error (stale_lease, lease_expired, etc.)
 /// - The task handle is aborted (ClaimedTask dropped)
-#[cfg(feature = "valkey-default")]
 fn spawn_renewal_task(
     backend: Arc<dyn EngineBackend>,
     handle: Handle,
@@ -1210,7 +1204,6 @@ fn spawn_renewal_task(
 }
 
 /// Check if an engine error means renewal should stop permanently.
-#[cfg(feature = "valkey-default")]
 #[allow(dead_code)]
 fn is_terminal_renewal_error(err: &crate::EngineError) -> bool {
     use crate::{ContentionKind, EngineError, StateKind};
@@ -1746,28 +1739,25 @@ pub const MAX_TAIL_BLOCK_MS: u64 = 30_000;
 /// Maximum frames per read/tail call. Mirrors
 /// `ff_core::contracts::STREAM_READ_HARD_CAP` — re-exported here so SDK
 /// callers don't need to import ff-core just to read the bound.
-#[cfg(feature = "valkey-default")]
 pub use ff_core::contracts::STREAM_READ_HARD_CAP;
 
 /// Result of [`read_stream`] / [`tail_stream`] — frames plus the terminal
 /// signal so polling consumers can exit cleanly.
 ///
 /// Re-export of `ff_core::contracts::StreamFrames` for SDK ergonomics.
-#[cfg(feature = "valkey-default")]
 pub use ff_core::contracts::StreamFrames;
 
 /// Opaque cursor for [`read_stream`] / [`tail_stream`] — re-export of
 /// `ff_core::contracts::StreamCursor`. Wire tokens: `"start"`, `"end"`,
 /// `"<ms>"`, `"<ms>-<seq>"`. Bare `-` / `+` are rejected — use
 /// `StreamCursor::Start` / `StreamCursor::End` instead.
-#[cfg(feature = "valkey-default")]
 pub use ff_core::contracts::StreamCursor;
 
 /// Reject `Start` / `End` cursors at the XREAD (`tail_stream`) boundary
 /// — XREAD does not accept the open markers. Pulled out as a bare
 /// function so unit tests can exercise the guard without constructing a
 /// live `ferriskey::Client`.
-#[cfg(feature = "valkey-default")]
+#[allow(dead_code)]
 fn validate_tail_cursor(after: &StreamCursor) -> Result<(), SdkError> {
     if !after.is_concrete() {
         return Err(SdkError::Config {
@@ -1782,7 +1772,7 @@ fn validate_tail_cursor(after: &StreamCursor) -> Result<(), SdkError> {
     Ok(())
 }
 
-#[cfg(feature = "valkey-default")]
+#[allow(dead_code)]
 fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
     if count_limit == 0 {
         return Err(SdkError::Config {
@@ -2161,7 +2151,6 @@ mod parse_report_usage_result_tests {
 /// user-supplied key. Single-waitpoint scoping: all
 /// Single.waitpoint_key / Count.waitpoints[i] in the tree must be
 /// equal; this function returns the first one it encounters.
-#[cfg(feature = "valkey-default")]
 fn composite_first_waitpoint_key(body: &CompositeBody) -> Option<String> {
     match body {
         CompositeBody::AllOf { members } => members.iter().find_map(|m| match m {

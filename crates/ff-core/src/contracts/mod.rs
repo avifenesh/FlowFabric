@@ -569,6 +569,13 @@ pub struct ClaimedExecution {
     pub attempt_id: AttemptId,
     pub attempt_type: AttemptType,
     pub lease_expires_at: TimestampMs,
+    /// Backend-populated attempt handle for this claim (v0.12 PR-5.5).
+    /// Valkey fills in an encoded `HandleKind::Fresh`; PG/SQLite are
+    /// `Unavailable` on `claim_execution` at runtime per
+    /// `project_claim_from_grant_pg_sqlite_gap.md`, so the field stays
+    /// a stub on those paths.
+    #[serde(default = "crate::backend::stub_handle_fresh")]
+    pub handle: crate::backend::Handle,
 }
 
 /// Typed outcome of [`crate::engine_backend::EngineBackend::claim_execution`].
@@ -1397,6 +1404,12 @@ pub struct ClaimedResumedExecution {
     pub attempt_index: AttemptIndex,
     pub attempt_id: AttemptId,
     pub lease_expires_at: TimestampMs,
+    /// Backend-populated attempt handle for this resumed claim
+    /// (v0.12 PR-5.5). Valkey fills in `HandleKind::Resumed`; PG/SQLite
+    /// populate a backend-tagged real handle via
+    /// `ff_core::handle_codec::encode`.
+    #[serde(default = "crate::backend::stub_handle_resumed")]
+    pub handle: crate::backend::Handle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3185,6 +3198,7 @@ mod tests {
             attempt_id: AttemptId::new(),
             attempt_type: AttemptType::Initial,
             lease_expires_at: TimestampMs::from_millis(1000),
+            handle: crate::backend::stub_handle_fresh(),
         });
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ClaimExecutionResult = serde_json::from_str(&json).unwrap();

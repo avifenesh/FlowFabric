@@ -55,6 +55,12 @@ impl ClaimExecutionResultPartial {
                 attempt_id: p.attempt_id,
                 attempt_type: p.attempt_type,
                 lease_expires_at: p.lease_expires_at,
+                // Handle is populated by the backend impl (see
+                // `ff_backend_valkey::claim_execution_impl`) after the
+                // partial completes — ff-script does not have the
+                // `BackendTag` context to mint one here. Stub until
+                // the backend overwrites it.
+                handle: ff_core::backend::stub_handle_fresh(),
             }),
         }
     }
