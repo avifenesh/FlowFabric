@@ -73,6 +73,50 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-024 PR-F — Valkey `issue_reclaim_grant` + `reclaim_execution`
+  real impls + Lua ARGV[9] threading (continues #371).** Replaces the
+  PR-B+C `EngineError::Unavailable` default with direct FCALL forwards
+  on the Valkey backend. Scope: `ff-backend-valkey` +
+  `ff-script/flowfabric.lua` only; Postgres (PR-D) + SQLite (PR-E)
+  land separately.
+  - `ValkeyBackend::issue_reclaim_grant` — forwards to
+    `ff_issue_reclaim_grant` (KEYS[3] + ARGV[9] unchanged). Maps the
+    Lua `execution_not_reclaimable` + `capability_mismatch` err codes
+    to `IssueReclaimGrantOutcome::NotReclaimable { detail, .. }`;
+    success mints a `ReclaimGrant` carrying the server-authoritative
+    `expires_at_ms` (returned by Lua from `TIME + grant_ttl_ms`) +
+    the execution's lane (per RFC-024 §3.1 lane asymmetry with
+    `ResumeGrant`).
+  - `ValkeyBackend::reclaim_execution` — forwards to
+    `ff_reclaim_execution` with new ARGV[9] threading the caller's
+    `max_reclaim_count.unwrap_or(1000)` (Rust-surface default per
+    RFC-024 §4.6). Success mints a `Handle { kind: Reclaimed, .. }`
+    via `handle_codec::encode_handle(.., HandleKind::Reclaimed)`;
+    Lua err codes map to typed outcomes: `invalid_claim_grant` →
+    `GrantNotFound`, `execution_not_reclaimable` → `NotReclaimable`,
+    `max_retries_exhausted` → `ReclaimCapExceeded` (with the
+    authoritative post-policy-override cap surfaced in
+    `reclaim_count`).
+  - `ff-script: ff_reclaim_execution` Lua primitive gains optional
+    `ARGV[9] = default_max_reclaim_count`. Resolution order is
+    (1) per-execution policy override at `<core>:policy`
+    (`policy.max_reclaim_count`), (2) caller-supplied ARGV[9],
+    (3) legacy fallback `"100"`. Pre-RFC call sites (8-ARGV) keep
+    working unchanged — the `or "100"` default preserves pre-RFC
+    behaviour exactly. ARGV[9] is now asserted numeric so a
+    caller-side bug surfaces loudly instead of crashing on the
+    `>=` comparison.
+  - `ff-backend-valkey: valkey_supports_base().issue_reclaim_grant = true`
+    — flips the new RFC-018 capability flag (see `### Changed`) so
+    snapshot consumers see the new surface available on Valkey.
+  - Integration tests: `crates/ff-backend-valkey/tests/rfc024_reclaim.rs`
+    adds six `#[ignore]`-gated scenarios (happy-path /
+    grant-not-found / nonexistent-execution / granted-on-expired /
+    server-authoritative `expires_at_ms` / policy-override cap
+    surfaced on `ReclaimCapExceeded`) against a live Valkey.
+    `tests/capabilities.rs` adds an assertion that
+    `supports.issue_reclaim_grant` is `true` on a dialed Valkey
+    backend.
 - **RFC-024 PR-D — Postgres `issue_reclaim_grant` + `reclaim_execution`
   real impls + migration 0017 (continues #371).** Replaces the
   PR-B+C `EngineError::Unavailable` default with production SQL
@@ -151,6 +195,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **RFC-024 PR-F — `Supports::issue_reclaim_grant` capability flag**
+  added to `ff_core::capability::Supports` (RFC-018 surface). One bool
+  covers both `issue_reclaim_grant` + `reclaim_execution` per
+  RFC-024 §3.6 (the two trait methods always land together on every
+  in-tree backend, so rolling them up matches the group-level policy
+  on `budget_admin` / `quota_admin`). Defaults to `false` via
+  `Supports::none()`; Valkey's `valkey_supports_base()` flips it to
+  `true` in this PR.
 - **RFC-024 PR-D — Postgres scheduler claim-grant storage flips
   from JSON stash to `ff_claim_grant` table.** Pre-PR-D the
   scheduler wrote claim grants into

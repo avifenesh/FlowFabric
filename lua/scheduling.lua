@@ -497,5 +497,9 @@ redis.register_function('ff_issue_reclaim_grant', function(keys, args)
 
   -- Do NOT ZREM from lease_expiry — stays for scheduler discovery
 
-  return ok(A.execution_id)
+  -- Return the authoritative server-side `grant_expires_at` so callers
+  -- surface the server's clock (not their own `now + grant_ttl_ms`) in
+  -- `ReclaimGrant::expires_at_ms`. Under clock skew these diverge; per
+  -- RFC-024 §3.1 grant-carried fields come from server.
+  return ok(A.execution_id, tostring(grant_expires_at))
 end)

@@ -41,9 +41,11 @@ use ff_core::contracts::{
     AdditionalWaitpointBinding, CancelFlowArgs, CancelFlowResult, ClaimExecutionArgs,
     ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CompositeBody,
     CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
-    ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, ListExecutionsPage, ListFlowsPage,
-    ListLanesPage, ListSuspendedPage, ReportUsageResult, ResumeCondition, ResumePolicy,
-    ResumeTarget, RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
+    ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, IssueReclaimGrantArgs,
+    IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
+    ListSuspendedPage, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
+    ReportUsageResult, ResumeCondition, ResumePolicy, ResumeTarget,
+    RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
     RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretArgs, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SignalMatcher, SuspendArgs,
     SuspendOutcome, SuspendOutcomeDetails, SuspendedExecutionEntry, WaitpointBinding,
@@ -144,6 +146,7 @@ fn valkey_supports_base() -> ff_core::capability::Supports {
     s.cancel_flow_wait_indefinite = true;
     s.ack_cancel_member = true;
     s.claim_for_worker = true; // runtime-gated by capabilities() caller
+    s.issue_reclaim_grant = true; // RFC-024 PR-F: Lua FCALLs exist pre-v0.12
     s.prepare = true;
     s.subscribe_lease_history = true;
     s.subscribe_completion = true;
@@ -3980,6 +3983,285 @@ async fn claim_from_resume_grant_impl(
     Ok(Some(handle_codec::encode_handle(&fields, HandleKind::Resumed)))
 }
 
+// ─── RFC-024 PR-F: issue_reclaim_grant + reclaim_execution ────────────
+
+/// Valkey wiring for [`EngineBackend::issue_reclaim_grant`]. Forwards
+/// directly to `ff_issue_reclaim_grant` (`flowfabric.lua:3898`).
+///
+/// KEYS (3): exec_core, claim_grant, lease_expiry
+/// ARGV (9): execution_id, worker_id, worker_instance_id, lane_id,
+///           capability_hash, grant_ttl_ms, route_snapshot_json,
+///           admission_summary, worker_capabilities_csv
+#[tracing::instrument(
+    name = "ff.issue_reclaim_grant",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        worker_id = %args.worker_id,
+        worker_instance_id = %args.worker_instance_id,
+    )
+)]
+async fn issue_reclaim_grant_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: IssueReclaimGrantArgs,
+) -> Result<IssueReclaimGrantOutcome, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    // Build the caps CSV (sorted, deterministic) matching `claim_impl`.
+    // `worker_capabilities` is a `BTreeSet<String>`, already sorted +
+    // deduplicated by the collection itself — iterate directly.
+    let caps_csv = args
+        .worker_capabilities
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let core_k = ctx.core();
+    let grant_k = ctx.claim_grant();
+    let lease_expiry_k = idx.lease_expiry();
+    let keys: [&str; 3] = [core_k.as_str(), grant_k.as_str(), lease_expiry_k.as_str()];
+
+    let eid_s = args.execution_id.to_string();
+    let worker_id_s = args.worker_id.to_string();
+    let worker_instance_s = args.worker_instance_id.to_string();
+    let lane_s = args.lane_id.to_string();
+    let cap_hash_s = args.capability_hash.clone().unwrap_or_default();
+    let ttl_s = args.grant_ttl_ms.to_string();
+    let route_s = args.route_snapshot_json.clone().unwrap_or_default();
+    let admission_s = args.admission_summary.clone().unwrap_or_default();
+    let argv: [&str; 9] = [
+        &eid_s,
+        &worker_id_s,
+        &worker_instance_s,
+        &lane_s,
+        &cap_hash_s,
+        &ttl_s,
+        &route_s,
+        &admission_s,
+        &caps_csv,
+    ];
+
+    let raw: ferriskey::Value = client
+        .fcall("ff_issue_reclaim_grant", &keys, &argv)
+        .await
+        .map_err(transport_fk)?;
+
+    let parsed = FcallResult::parse(&raw).map_err(EngineError::from)?;
+    if parsed.success {
+        // RFC-024 §3.1: grant-carried fields come from server. Lua returns
+        // `ok(execution_id, grant_expires_at)` where `grant_expires_at`
+        // is derived from the server's `TIME` + `grant_ttl_ms` — use it
+        // directly rather than recomputing `args.now + grant_ttl_ms`
+        // client-side (which would diverge under Rust↔Valkey clock skew).
+        let expires_at_ms = parsed.field_str(1).parse::<u64>().map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "ff_issue_reclaim_grant".into(),
+                execution_id: Some(args.execution_id.to_string()),
+                message: format!("bad grant_expires_at: {e}"),
+            })
+        })?;
+        let grant = ReclaimGrant::new(
+            args.execution_id.clone(),
+            ff_core::partition::PartitionKey::from(&partition),
+            grant_k,
+            expires_at_ms,
+            args.lane_id.clone(),
+        );
+        return Ok(IssueReclaimGrantOutcome::Granted(grant));
+    }
+    match parsed.into_success().unwrap_err() {
+        ScriptError::ExecutionNotReclaimable => {
+            Ok(IssueReclaimGrantOutcome::NotReclaimable {
+                execution_id: args.execution_id,
+                detail: "execution_not_reclaimable".into(),
+            })
+        }
+        ScriptError::CapabilityMismatch(missing) => {
+            Ok(IssueReclaimGrantOutcome::NotReclaimable {
+                execution_id: args.execution_id,
+                detail: format!("capability_mismatch: {missing}"),
+            })
+        }
+        err => Err(EngineError::from(err)),
+    }
+}
+
+/// Valkey wiring for [`EngineBackend::reclaim_execution`]. Forwards to
+/// `ff_reclaim_execution` (`flowfabric.lua:2985`) with ARGV[9] threading
+/// the caller's [`ReclaimExecutionArgs::max_reclaim_count`] (defaulting
+/// to 1000 per RFC-024 §4.6).
+#[tracing::instrument(
+    name = "ff.reclaim_execution",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        worker_id = %args.worker_id,
+        worker_instance_id = %args.worker_instance_id,
+    )
+)]
+async fn reclaim_execution_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: ReclaimExecutionArgs,
+) -> Result<ReclaimExecutionOutcome, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let old_att_idx = args.current_attempt_index;
+    let new_att_idx = AttemptIndex::new(old_att_idx.0 + 1);
+
+    // KEYS (14) — mirror the e2e_lifecycle helper + the Lua KEYS comment
+    // at flowfabric.lua:2977.
+    let core_k = ctx.core();
+    let grant_k = ctx.claim_grant();
+    let old_att_k = ctx.attempt_hash(old_att_idx);
+    let old_stream_k = ctx.stream_meta(old_att_idx);
+    let new_att_k = ctx.attempt_hash(new_att_idx);
+    let new_att_usage_k = ctx.attempt_usage(new_att_idx);
+    let attempts_k = ctx.attempts();
+    let lease_cur_k = ctx.lease_current();
+    let lease_hist_k = ctx.lease_history();
+    let lease_expiry_k = idx.lease_expiry();
+    let worker_leases_k = idx.worker_leases(&args.worker_instance_id);
+    let lane_active_k = idx.lane_active(&args.lane_id);
+    let att_timeout_k = idx.attempt_timeout();
+    let exec_deadline_k = idx.execution_deadline();
+    let keys: [&str; 14] = [
+        core_k.as_str(),
+        grant_k.as_str(),
+        old_att_k.as_str(),
+        old_stream_k.as_str(),
+        new_att_k.as_str(),
+        new_att_usage_k.as_str(),
+        attempts_k.as_str(),
+        lease_cur_k.as_str(),
+        lease_hist_k.as_str(),
+        lease_expiry_k.as_str(),
+        worker_leases_k.as_str(),
+        lane_active_k.as_str(),
+        att_timeout_k.as_str(),
+        exec_deadline_k.as_str(),
+    ];
+
+    // RFC-024 §4.6: Rust-surface default is 1000 when `None`.
+    let default_max = args.max_reclaim_count.unwrap_or(1000);
+
+    let eid_s = args.execution_id.to_string();
+    let worker_id_s = args.worker_id.to_string();
+    let worker_instance_s = args.worker_instance_id.to_string();
+    let lane_s = args.lane_id.to_string();
+    let lease_id_s = args.lease_id.to_string();
+    let lease_ttl_s = args.lease_ttl_ms.to_string();
+    let attempt_id_s = args.attempt_id.to_string();
+    let attempt_policy = if args.attempt_policy_json.is_empty() {
+        "{}".to_owned()
+    } else {
+        args.attempt_policy_json.clone()
+    };
+    let default_max_s = default_max.to_string();
+    // ARGV (9) — 8 existing + 1 new ARGV[9] = default_max_reclaim_count.
+    let argv: [&str; 9] = [
+        &eid_s,
+        &worker_id_s,
+        &worker_instance_s,
+        &lane_s,
+        &lease_id_s,
+        &lease_ttl_s,
+        &attempt_id_s,
+        &attempt_policy,
+        &default_max_s,
+    ];
+
+    let raw: ferriskey::Value = client
+        .fcall("ff_reclaim_execution", &keys, &argv)
+        .await
+        .map_err(transport_fk)?;
+
+    let parsed = FcallResult::parse(&raw).map_err(EngineError::from)?;
+    if parsed.success {
+        // ok(lease_id, epoch, expires_at, attempt_id, attempt_index, "reclaim")
+        let lease_id = LeaseId::parse(&parsed.field_str(0)).map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "ff_reclaim_execution".into(),
+                execution_id: Some(args.execution_id.to_string()),
+                message: format!("bad lease_id: {e}"),
+            })
+        })?;
+        let epoch = parsed.field_str(1).parse::<u64>().map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "ff_reclaim_execution".into(),
+                execution_id: Some(args.execution_id.to_string()),
+                message: format!("bad epoch: {e}"),
+            })
+        })?;
+        let attempt_id = AttemptId::parse(&parsed.field_str(3)).map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "ff_reclaim_execution".into(),
+                execution_id: Some(args.execution_id.to_string()),
+                message: format!("bad attempt_id: {e}"),
+            })
+        })?;
+        let attempt_index_u: u32 = parsed.field_str(4).parse().map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "ff_reclaim_execution".into(),
+                execution_id: Some(args.execution_id.to_string()),
+                message: format!("bad attempt_index: {e}"),
+            })
+        })?;
+
+        let fields = handle_codec::HandleFields::new(
+            args.execution_id,
+            AttemptIndex::new(attempt_index_u),
+            attempt_id,
+            lease_id,
+            LeaseEpoch::new(epoch),
+            args.lease_ttl_ms,
+            args.lane_id,
+            args.worker_instance_id,
+        );
+        let handle = handle_codec::encode_handle(&fields, HandleKind::Reclaimed);
+        return Ok(ReclaimExecutionOutcome::Claimed(handle));
+    }
+    // Pre-extract the authoritative cap value before we consume `parsed`
+    // with `into_success()`. For `max_retries_exhausted` the Lua tail is
+    // `err("max_retries_exhausted", tostring(max_reclaim))` where
+    // `max_reclaim` is the post-policy-override enforced cap (RFC-024
+    // §4.6 resolution order). Falling back to `default_max` preserves
+    // the previous behaviour if the field is missing or unparseable.
+    let authoritative_cap: u32 = parsed
+        .field_str(0)
+        .parse::<u32>()
+        .unwrap_or(default_max);
+    match parsed.into_success().unwrap_err() {
+        ScriptError::InvalidClaimGrant => Ok(ReclaimExecutionOutcome::GrantNotFound {
+            execution_id: args.execution_id,
+        }),
+        ScriptError::ExecutionNotReclaimable => Ok(ReclaimExecutionOutcome::NotReclaimable {
+            execution_id: args.execution_id,
+            detail: "execution_not_reclaimable".into(),
+        }),
+        ScriptError::MaxRetriesExhausted => {
+            // Lua set terminal_failed + returned
+            // `err("max_retries_exhausted", tostring(max_reclaim))`. Use
+            // the authoritative value (which reflects per-execution
+            // policy override if present) rather than the caller's
+            // Rust-side `default_max`.
+            Ok(ReclaimExecutionOutcome::ReclaimCapExceeded {
+                execution_id: args.execution_id,
+                reclaim_count: authoritative_cap,
+            })
+        }
+        err => Err(EngineError::from(err)),
+    }
+}
+
 /// Thin forwarder to
 /// `ff_script::functions::signal::ff_claim_resumed_execution`. The Lua
 /// returns a partial result (omits `execution_id`, which the caller
@@ -4330,6 +4612,34 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "claim_from_resume_grant: FCALL ff_claim_resumed_execution",
+                )
+            })
+    }
+
+    async fn issue_reclaim_grant(
+        &self,
+        args: IssueReclaimGrantArgs,
+    ) -> Result<IssueReclaimGrantOutcome, EngineError> {
+        issue_reclaim_grant_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "issue_reclaim_grant: FCALL ff_issue_reclaim_grant",
+                )
+            })
+    }
+
+    async fn reclaim_execution(
+        &self,
+        args: ReclaimExecutionArgs,
+    ) -> Result<ReclaimExecutionOutcome, EngineError> {
+        reclaim_execution_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "reclaim_execution: FCALL ff_reclaim_execution",
                 )
             })
     }

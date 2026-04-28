@@ -1292,7 +1292,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '27'
+  return '28'
 end)
 
 
@@ -2979,8 +2979,16 @@ end)
 --            lease_current, lease_history, lease_expiry_zset,
 --            worker_leases, active_index, attempt_timeout_zset,
 --            execution_deadline_zset
--- ARGV (8): execution_id, worker_id, worker_instance_id, lane,
---           lease_id, lease_ttl_ms, attempt_id, attempt_policy_json
+-- ARGV (8 or 9): execution_id, worker_id, worker_instance_id, lane,
+--           lease_id, lease_ttl_ms, attempt_id, attempt_policy_json,
+--           [default_max_reclaim_count]
+--
+-- ARGV[9] (RFC-024 §4.6) is the Rust-surface default for
+-- max_reclaim_count used when the per-execution policy override at
+-- <core_key>:policy is absent. Omitted callers fall back to "100"
+-- (pre-RFC behaviour). RFC-024 PR-F Rust callers pass
+-- `max_reclaim_count.unwrap_or(1000)`; the Lua policy override still
+-- dominates when set.
 ---------------------------------------------------------------------------
 redis.register_function('ff_reclaim_execution', function(keys, args)
   local K = {
@@ -3031,16 +3039,26 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
     return err("execution_not_reclaimable")
   end
 
-  -- Check max_reclaim_count
+  -- Check max_reclaim_count.
+  --
+  -- Resolution order (RFC-024 §4.6):
+  --   1. Per-execution policy override at <core>:policy (policy.max_reclaim_count)
+  --   2. ARGV[9] = default_max_reclaim_count from the caller (PR-F: Rust-surface
+  --      default of 1000 via `ReclaimExecutionArgs::max_reclaim_count.unwrap_or(1000)`)
+  --   3. Legacy fallback "100" (pre-RFC ARGV-omitted call sites)
   local reclaim_count = tonumber(core.lease_reclaim_count or "0")
-  local max_reclaim = 100  -- default
-  -- Read from policy if available
+  -- ARGV[9] must be numeric if provided. Assert loudly on non-numeric
+  -- input so a caller-side bug surfaces immediately instead of crashing
+  -- on the `>=` comparison below.
+  local max_reclaim = assert(tonumber(args[9] or "100"),
+    "ARGV[9] (default_max_reclaim_count) must be numeric")
+  -- Read from policy if available — policy override trumps caller default.
   local policy_key = string.gsub(K.core_key, ":core$", ":policy")
   local policy_raw = redis.call("GET", policy_key)
   if policy_raw then
     local ok_p, policy = pcall(cjson.decode, policy_raw)
-    if ok_p and type(policy) == "table" then
-      max_reclaim = tonumber(policy.max_reclaim_count or "100")
+    if ok_p and type(policy) == "table" and policy.max_reclaim_count ~= nil then
+      max_reclaim = tonumber(policy.max_reclaim_count)
     end
   end
 
@@ -3084,7 +3102,12 @@ redis.register_function('ff_reclaim_execution', function(keys, args)
     local terminal_key = "ff:idx:" .. tag .. ":lane:" .. lane .. ":terminal"
     redis.call("ZADD", terminal_key, now_ms, A.execution_id)
 
-    return err("max_retries_exhausted")
+    -- Return the authoritative cap value (after policy-override resolution)
+    -- so the Rust caller can surface it in
+    -- `ReclaimExecutionOutcome::ReclaimCapExceeded { reclaim_count, .. }`
+    -- rather than echoing its Rust-side ARGV[9] default (which differs
+    -- from the enforced value when per-execution policy overrides it).
+    return err("max_retries_exhausted", tostring(max_reclaim))
   end
 
   -- 2. Validate and consume claim grant
@@ -3973,7 +3996,11 @@ redis.register_function('ff_issue_reclaim_grant', function(keys, args)
 
   -- Do NOT ZREM from lease_expiry — stays for scheduler discovery
 
-  return ok(A.execution_id)
+  -- Return the authoritative server-side `grant_expires_at` so callers
+  -- surface the server's clock (not their own `now + grant_ttl_ms`) in
+  -- `ReclaimGrant::expires_at_ms`. Under clock skew these diverge; per
+  -- RFC-024 §3.1 grant-carried fields come from server.
+  return ok(A.execution_id, tostring(grant_expires_at))
 end)
 
 

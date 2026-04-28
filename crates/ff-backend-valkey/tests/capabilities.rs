@@ -34,6 +34,11 @@ async fn capabilities_reports_valkey_family() {
     assert!(caps.supports.subscribe_signal_delivery);
     // Deferred per #311.
     assert!(!caps.supports.subscribe_instance_tags);
+    // RFC-024 PR-F: reclaim surface is live on Valkey.
+    assert!(
+        caps.supports.issue_reclaim_grant,
+        "RFC-024 PR-F flips supports.issue_reclaim_grant true on Valkey"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
