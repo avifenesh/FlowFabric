@@ -698,6 +698,7 @@ dependencies = [
  "futures-core",
  "hex",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -713,6 +714,7 @@ dependencies = [
  "ff-core",
  "futures-core",
  "hex",
+ "libsqlite3-sys",
  "serde_json",
  "sqlx",
  "tokio",
@@ -788,6 +790,7 @@ version = "0.11.0"
 dependencies = [
  "ferriskey",
  "ff-backend-postgres",
+ "ff-backend-valkey",
  "ff-core",
  "ff-observability",
  "futures",
