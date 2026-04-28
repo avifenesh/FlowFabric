@@ -93,9 +93,12 @@ FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 
 ### 3. Try an example
 
-Seven end-to-end examples live under [`examples/`](examples/):
+Six end-to-end examples live under [`examples/`](examples/). A
+seventh example — `ff-dev` — is the v0.12 dev-harness demo for the
+RFC-023 SQLite backend and lands in a sibling tranche of the
+v0.12 docs sweep; see [`docs/dev-harness.md`](docs/dev-harness.md)
+for the canonical setup in the meantime.
 
-- **[`ff-dev`](examples/ff-dev/)** -- v0.12 dev-harness example for the RFC-023 SQLite backend. Spins a zero-config ff-server against an in-memory SQLite in one `cargo run` invocation, Temporal `start-dev` style. Requires `FF_DEV_MODE=1`. See [`docs/dev-harness.md`](docs/dev-harness.md) for the canonical setup and dev→prod gotchas. No external dependencies.
 - **[`v011-wave9-postgres`](examples/v011-wave9-postgres/)** -- v0.11 headline demo for the RFC-020 Wave 9 Postgres release. Multi-tenant operator dashboard exercising all six Wave-9 method groups on Postgres: budget/quota admin, `change_priority`, `cancel_execution` + `ack_cancel_member`, `replay_execution`, `list_pending_waitpoints`, `cancel_flow_header`, and `read_execution_info`. Requires `FF_PG_TEST_URL`.
 - **[`v010-read-side-ergonomics`](examples/v010-read-side-ergonomics/)** -- v0.10 headline demo for consumer read-side APIs: flat `Capabilities::supports.<flag>` discovery (#277), typed `LeaseHistoryEvent` from `subscribe_lease_history` (#282), and tag-restricted subscriptions via `ScannerFilter::with_instance_tag(..)`. Multi-tenant lease-audit console pattern. No external dependencies beyond a running `ff-server`.
 - **[`llm-race`](examples/llm-race/)** -- race N free OpenRouter LLM providers against the same prompt; automatically cancel losers when one wins; stream the winner via `DurableSummary` with JSON Merge Patch. Exercises v0.6 `AnyOf{CancelRemaining}` + `Count{DistinctSources}` + typed `SuspendArgs`. Verified live 2026-04-24. Best starting point for learning v0.6 primitives. Requires `OPENROUTER_API_KEY` (free tier).

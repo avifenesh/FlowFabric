@@ -52,14 +52,16 @@ for details.
 ```
 
 And `ff-server` with `FF_BACKEND=sqlite` and no `FF_DEV_MODE=1`
-refuses to start:
+refuses to start — it propagates the `BackendError` through
+`ServerError::SqliteRequiresDevMode`, whose Display is:
 
 ```
-error: FF_BACKEND=sqlite requires FF_DEV_MODE=1 to activate.
-       SQLite is a dev-only backend; set FF_DEV_MODE=1 to
-       acknowledge, or pick FF_BACKEND=valkey | postgres for
-       production.
+sqlite requires FF_DEV_MODE=1: SqliteBackend requires FF_DEV_MODE=1 to activate. SQLite is dev-only; see https://github.com/avifenesh/FlowFabric/blob/main/docs/dev-harness.md for details.
 ```
+
+Both messages carry the same actionable docs URL; the server path
+prefixes with `sqlite requires FF_DEV_MODE=1: ` and wraps the
+embedded-path `BackendError::RequiresDevMode` as its source.
 
 ### 2.2 Canonical location: `.cargo/config.toml`
 
@@ -132,24 +134,37 @@ Feature posture in your consumer `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-ff-sdk            = { version = "0.12", default-features = false, features = ["sqlite"] }
-ff-backend-sqlite = "0.12"
+# The `sqlite` feature on ff-sdk pulls ff-backend-sqlite as an
+# optional dependency and re-exports `ff_sdk::SqliteBackend`.
+ff-sdk = { version = "0.12", default-features = false, features = ["sqlite"] }
 ```
+
+If you also want to name the crate directly (e.g. to pin its
+version independently or reach non-re-exported items), add
+`ff-backend-sqlite = "0.12"` alongside — but it is not required
+when enabling the ff-sdk `sqlite` feature.
 
 ---
 
 ## 3. Connection-URI modes
 
-### 3.1 `:memory:?cache=shared`
+### 3.1 Bare `:memory:`
 
-Ephemeral; database vanishes when the last connection closes. Each
-`sqlx::SqlitePool` owns multiple connections; `cache=shared` lets
-those connections see each other's state within the pool. No
-persistence across process restarts.
+The simplest form. Ephemeral; database vanishes when the last
+connection closes. `SqliteBackend::new(":memory:")` canonicalises
+internally to a shared-cache URI so pool connections see each
+other's state.
 
 ```rust
-SqliteBackend::new(":memory:?cache=shared").await?
+SqliteBackend::new(":memory:").await?
 ```
+
+> **Note on `:memory:?cache=shared`.** The backend's `is_memory_uri`
+> check recognises bare `:memory:` and `file:...?mode=memory` forms;
+> it does NOT treat a bare `:memory:` with a query-string tail as
+> in-memory. Pass bare `:memory:` and let the backend canonicalise,
+> or use the named `file:<name>?mode=memory&cache=shared` form in
+> §3.2 for multi-test isolation.
 
 ### 3.2 `file:<name>?mode=memory&cache=shared` — per-test isolation
 
@@ -270,10 +285,12 @@ override is not needed for the SQLite path.
 
 ## 6. Reference example
 
-See [`examples/ff-dev/`](../examples/ff-dev/) — the v0.12 dev-
-harness example that spins a zero-config ff-server against an
-in-memory SQLite in one `cargo run` invocation. Temporal's
-`temporal server start-dev` is the exemplar for this shape.
+A dedicated dev-harness example (`examples/ff-dev/`) lands in the
+v0.12 Phase 4a tranche. It spins a zero-config ff-server against an
+in-memory SQLite in one `cargo run` invocation, in the spirit of
+Temporal's `temporal server start-dev`. Link here will resolve
+once the Phase 4a PR merges; until then the §2.4 embedded snippet
+above is the self-contained template.
 
 ---
 

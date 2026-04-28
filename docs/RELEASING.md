@@ -83,12 +83,15 @@ Before cutting a release, verify:
       both stabilised in 7.2). Ensure all production + CI targets
       are on 7.2+ before cutting.
 - [ ] SQLite minimum is 3.35+ (dev-only backend, RFC-023 §7.1).
-      `ff-backend-sqlite` uses `sqlx` with the **bundled build**,
-      which statically links SQLite into the binary — distro SQLite
-      version is irrelevant for consumers. Recommended floor 3.38+
-      for JSON1 ergonomics; modern distros ship 3.40+. The bundled-
-      build choice was locked at v0.12.0 to decouple SQLite version
-      from distro and to avoid an Ubuntu-22.04 contributor fork.
+      `ff-backend-sqlite` pulls `sqlx` with the `sqlite` feature;
+      `libsqlite3-sys` links against the distro's system
+      `libsqlite3`. Modern distros ship 3.40+; Ubuntu 22.04 ships
+      3.37; RHEL 8 ships 3.26 (below floor — contributors there
+      need a newer sqlite, or enable `libsqlite3-sys/bundled` in a
+      follow-up). RFC-023 §7.1 owner call anticipated the bundled-
+      build path; confirm which posture the release tags with
+      before cutting. Recommended floor 3.38+ for full JSON1
+      ergonomics.
 - [ ] Postgres `max_locks_per_transaction >= 512` on all target
       deployments (default `64` is insufficient under concurrent
       bench/partition load — see

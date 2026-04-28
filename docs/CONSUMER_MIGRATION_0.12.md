@@ -120,6 +120,11 @@ ff-sdk             = { version = "0.12", default-features = false, features = ["
 ff-backend-sqlite  = "0.12"
 ```
 
+Set `FF_DEV_MODE=1` via `.cargo/config.toml [env]` (recommended —
+see [`docs/dev-harness.md`](dev-harness.md)); `std::env::set_var`
+is `unsafe` under Rust 2024 edition and racy across parallel
+tests.
+
 ```rust
 // cairn-fabric/tests/integration_sqlite.rs
 use ff_sdk::{FlowFabricWorker, WorkerConfig, SqliteBackend};
@@ -127,7 +132,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn roundtrip_on_sqlite() {
-    std::env::set_var("FF_DEV_MODE", "1"); // or set in .cargo/config.toml [env]
+    // FF_DEV_MODE=1 is set in .cargo/config.toml [env] — no set_var needed.
 
     let uri = format!(
         "file:cairn-test-{}?mode=memory&cache=shared",
