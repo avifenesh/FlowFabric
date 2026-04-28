@@ -106,6 +106,28 @@ async fn main() -> Result<()> {
         "dialed SQLite dev backend"
     );
 
+    // RFC-023 §7.1: bundled libsqlite3-sys must ship SQLite >= 3.35
+    // (JSON1 + RETURNING). Log the runtime-reported version on the
+    // side-pool so smoke logs show which SQLite the bundled build
+    // pulled in; parse + assert the floor so an accidental
+    // libsqlite3-sys downgrade fails the smoke-gate loudly.
+    let sqlite_version: String =
+        sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&side_pool)
+            .await
+            .context("SELECT sqlite_version()")?;
+    info!(version = %sqlite_version, "sqlite_version");
+    {
+        let mut parts = sqlite_version.split('.');
+        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        anyhow::ensure!(
+            major > 3 || (major == 3 && minor >= 35),
+            "bundled SQLite {} is below RFC-023 §7.1 floor (3.35)",
+            sqlite_version
+        );
+    }
+
     // ── 3. Create a flow + three executions ────────────────────────────
     //
     // These are the RFC-012 ingress-row trait methods: every backend

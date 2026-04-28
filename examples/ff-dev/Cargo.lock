@@ -294,6 +294,7 @@ dependencies = [
  "ff-core",
  "futures-core",
  "hex",
+ "libsqlite3-sys",
  "serde_json",
  "sqlx",
  "tokio",

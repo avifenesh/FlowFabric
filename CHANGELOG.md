@@ -23,6 +23,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `ff-backend-sqlite`: `Cargo.toml` now correctly enables
+  `libsqlite3-sys/bundled` via an explicit dep so the backend actually
+  links a bundled SQLite, matching the long-standing "Bundled SQLite
+  is deliberately selected" comment. sqlx 0.8 has no `sqlite-bundled`
+  feature alias, so the previous config silently fell through to
+  system-linked `libsqlite3-sys` and the comment did not hold.
+  Deterministic CI builds + distro independence per RFC-023 §7.1
+  (JSON1 + RETURNING rely on SQLite >= 3.35). `examples/ff-dev` now
+  asserts the `SELECT sqlite_version()` floor at startup and
+  `scripts/smoke-sqlite.sh` logs the bundled version in CI output.
 - `ff-backend-postgres`: `ff_attempt.outcome` is now cleared on the
   exec-cancel paths that previously left it stale — `cancel_flow`
   member loop (`src/flow.rs`) and `exec_core::cancel` (the
