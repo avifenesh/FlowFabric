@@ -55,6 +55,18 @@ pub struct PostgresServerConfig {
     pub pool_size: u32,
 }
 
+impl PostgresServerConfig {
+    /// Construct a new config with the given URL and the default
+    /// `pool_size = 10` (matches sqlx's out-of-box default +
+    /// [`ff_core::backend::PostgresConnection`] default).
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            pool_size: 10,
+        }
+    }
+}
+
 impl Default for PostgresServerConfig {
     fn default() -> Self {
         Self {
@@ -223,6 +235,18 @@ pub struct ServerConfig {
     /// Meaningful only when `backend == BackendKind::Sqlite`; the
     /// Valkey/Postgres paths ignore these fields.
     pub sqlite: SqliteServerConfig,
+}
+
+impl ServerConfig {
+    /// Construct a [`ServerConfig`] with the same defaults as
+    /// [`Self::default`]. Provided so external consumers have an
+    /// explicit constructor against this `#[non_exhaustive]` struct
+    /// (struct-literal + `..Default::default()` spread are both
+    /// forbidden cross-crate). Override fields field-by-field after
+    /// calling; for env-driven boot use [`Self::from_env`].
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl ServerConfig {

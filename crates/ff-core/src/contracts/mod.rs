@@ -3783,7 +3783,21 @@ pub struct ResumePolicy {
     pub close_waitpoint_on_resume: bool,
 }
 
+impl Default for ResumePolicy {
+    fn default() -> Self {
+        Self::normal()
+    }
+}
+
 impl ResumePolicy {
+    /// Construct a [`ResumePolicy`] with the canonical v1 defaults
+    /// (see [`Self::normal`]). Alias for [`Self::normal`] — provided
+    /// so external consumers have a conventional `new` constructor
+    /// against this `#[non_exhaustive]` struct.
+    pub fn new() -> Self {
+        Self::normal()
+    }
+
     /// Canonical v1 defaults (RFC-013 §2.2.1):
     /// * `resume_target = Runnable`
     /// * `consume_matched_signals = true`
