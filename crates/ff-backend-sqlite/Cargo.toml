@@ -22,7 +22,7 @@ streaming = ["ff-core/streaming"]
 # impl honours the same `EngineBackend` method surface. Trait impl
 # bodies arrive in Phase 2+; Phase 1a returns `EngineError::Unavailable`
 # from every method except `capabilities()` + `prepare()`.
-ff-core = { version = "0.11.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.12.0", path = "../ff-core", default-features = false, features = ["core"] }
 
 # SQLite transport. Bundled SQLite is deliberately selected to decouple
 # the backend from the operating distro's libsqlite3 version — RFC-023
