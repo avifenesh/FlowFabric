@@ -38,7 +38,8 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
-    DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ExecutionSnapshot,
+    DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot, ExecutionContext,
+    ExecutionSnapshot,
     FlowSnapshot, ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage,
     ReportUsageResult, RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
     RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretOutcome,
@@ -161,6 +162,12 @@ impl EngineBackend for MockBackend {
         _id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
         Err(unavailable("mock::describe_execution"))
+    }
+    async fn read_execution_context(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        Err(unavailable("mock::read_execution_context"))
     }
     async fn describe_flow(
         &self,
@@ -421,6 +428,12 @@ impl EngineBackend for DefaultsBackend {
         _id: &ExecutionId,
     ) -> Result<Option<ExecutionSnapshot>, EngineError> {
         Err(unavailable("defaults::describe_execution"))
+    }
+    async fn read_execution_context(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        Err(unavailable("defaults::read_execution_context"))
     }
     async fn describe_flow(
         &self,

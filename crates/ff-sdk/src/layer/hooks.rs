@@ -23,7 +23,7 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
-    DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionSnapshot, FlowSnapshot,
+    DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionContext, ExecutionSnapshot, FlowSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListSuspendedPage, ReportUsageResult,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SuspendArgs,
     SuspendOutcome,
@@ -258,6 +258,17 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
             self,
             "describe_execution",
             self.inner.describe_execution(id).await
+        )
+    }
+
+    async fn read_execution_context(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ExecutionContext, EngineError> {
+        with_hooks!(
+            self,
+            "read_execution_context",
+            self.inner.read_execution_context(execution_id).await
         )
     }
 

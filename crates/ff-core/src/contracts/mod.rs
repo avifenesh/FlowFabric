@@ -2303,6 +2303,53 @@ impl LeaseSummary {
     }
 }
 
+// ─── read_execution_context (v0.12 agnostic-SDK prep, PR-1) ───
+
+/// Point-read bundle of the three execution-scoped fields the SDK
+/// worker needs to construct a [`ClaimedTask`](ff_sdk::ClaimedTask):
+/// `input_payload`, `execution_kind`, and `tags`.
+///
+/// Returned by
+/// [`EngineBackend::read_execution_context`](crate::engine_backend::EngineBackend::read_execution_context).
+/// All three fields are execution-scoped (not per-attempt) across
+/// Valkey, Postgres, and SQLite — there is no per-attempt variant in
+/// the data model.
+///
+/// `#[non_exhaustive]` — FF may add fields in minor releases without a
+/// semver break. Construct via [`ExecutionContext::new`]; match with
+/// `..` when destructuring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecutionContext {
+    /// Opaque payload handed to the execution body. Empty when the
+    /// execution was created with no payload.
+    pub input_payload: Vec<u8>,
+    /// Caller-supplied `execution_kind` label — free-form string
+    /// identifying which handler the worker should dispatch to.
+    pub execution_kind: String,
+    /// Caller-owned tag map. Tag key conventions mirror
+    /// [`ExecutionSnapshot::tags`]; empty when no tags are set.
+    pub tags: HashMap<String, String>,
+}
+
+impl ExecutionContext {
+    /// Construct an [`ExecutionContext`]. Present so downstream crates
+    /// (concrete `EngineBackend` impls) can assemble the struct despite
+    /// the `#[non_exhaustive]` marker. Prefer adding builder-style
+    /// helpers here over loosening `non_exhaustive`.
+    pub fn new(
+        input_payload: Vec<u8>,
+        execution_kind: String,
+        tags: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            input_payload,
+            execution_kind,
+            tags,
+        }
+    }
+}
+
 // ─── Common sub-types ───
 
 // ─── describe_flow (issue #58.2) ───

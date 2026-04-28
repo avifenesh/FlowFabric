@@ -1693,39 +1693,23 @@ impl FlowFabricWorker {
         ))
     }
 
-    /// Read payload + execution_kind + tags from exec_core. Previously
-    /// gated behind `direct-valkey-claim`; now shared by the
-    /// feature-gated inline claim path and the public
-    /// `claim_from_reclaim_grant` entry point.
+    /// Read payload + execution_kind + tags from exec_core.
+    ///
+    /// As of v0.12 PR-1 this forwards through
+    /// [`EngineBackend::read_execution_context`](ff_core::engine_backend::EngineBackend::read_execution_context)
+    /// rather than issuing direct GET/HGET/HGETALL against Valkey. The
+    /// outer `valkey-default` gate + `(&ExecutionId, &Partition)`
+    /// signature are preserved; hot-path decoupling (ungating this
+    /// helper + the two call sites at worker.rs:1274,1675) is PR-4/PR-5
+    /// scope per the v0.12 agnostic-SDK plan.
     #[cfg(feature = "valkey-default")]
     async fn read_execution_context(
         &self,
         execution_id: &ExecutionId,
-        partition: &ff_core::partition::Partition,
+        _partition: &ff_core::partition::Partition,
     ) -> Result<(Vec<u8>, String, HashMap<String, String>), SdkError> {
-        let ctx = ExecKeyContext::new(partition, execution_id);
-
-        // Read payload
-        let payload: Option<String> = self.valkey_client()            
-            .get(&ctx.payload())
-            .await
-            .map_err(|e| crate::backend_context(e, "GET payload failed"))?;
-        let input_payload = payload.unwrap_or_default().into_bytes();
-
-        // Read execution_kind from core
-        let kind: Option<String> = self.valkey_client()            
-            .hget(&ctx.core(), "execution_kind")
-            .await
-            .map_err(|e| crate::backend_context(e, "HGET execution_kind failed"))?;
-        let execution_kind = kind.unwrap_or_default();
-
-        // Read tags
-        let tags: HashMap<String, String> = self.valkey_client()            
-            .hgetall(&ctx.tags())
-            .await
-            .map_err(|e| crate::backend_context(e, "HGETALL tags"))?;
-
-        Ok((input_payload, execution_kind, tags))
+        let ctx = self.backend.read_execution_context(execution_id).await?;
+        Ok((ctx.input_payload, ctx.execution_kind, ctx.tags))
     }
 
     // ── Phase 3: Signal delivery ──
@@ -2064,6 +2048,30 @@ mod sqlite_only_compile_surface_tests {
             FlowFabricWorker::config;
         let _d: fn(&FlowFabricWorker) -> &ff_core::partition::PartitionConfig =
             FlowFabricWorker::partition_config;
+    }
+
+    /// v0.12 PR-1 compile anchor — the new
+    /// [`EngineBackend::read_execution_context`] trait method MUST be
+    /// addressable under `--no-default-features --features sqlite`. A
+    /// direct fn-pointer cast is awkward under `#[async_trait]`
+    /// (lifetime-generic fn items don't coerce to `fn` pointers), so
+    /// we take the next-best compile proof: exercise a generic that
+    /// names the method through the trait bound. A bodyless call would
+    /// require a concrete backend; the generic keeps the test pure
+    /// compile-time.
+    #[test]
+    fn read_execution_context_addressable_under_sqlite_only() {
+        use ff_core::contracts::ExecutionContext;
+        use ff_core::engine_error::EngineError;
+        use ff_core::types::ExecutionId;
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            id: &ExecutionId,
+        ) -> Result<ExecutionContext, EngineError> {
+            b.read_execution_context(id).await
+        }
     }
 }
 
