@@ -343,9 +343,11 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn list_edges(
         &self,
-        flow_id: &FlowId,
-        direction: EdgeDirection,
-    ) -> Result<Vec<EdgeSnapshot>, EngineError>;
+        _flow_id: &FlowId,
+        _direction: EdgeDirection,
+    ) -> Result<Vec<EdgeSnapshot>, EngineError> {
+        Err(EngineError::Unavailable { op: "list_edges" })
+    }
 
     /// Snapshot a single dependency edge by its owning flow + edge id.
     ///
@@ -366,9 +368,13 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn describe_edge(
         &self,
-        flow_id: &FlowId,
-        edge_id: &EdgeId,
-    ) -> Result<Option<EdgeSnapshot>, EngineError>;
+        _flow_id: &FlowId,
+        _edge_id: &EdgeId,
+    ) -> Result<Option<EdgeSnapshot>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "describe_edge",
+        })
+    }
 
     /// Resolve an execution's owning flow id, if any.
     ///
@@ -388,8 +394,12 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn resolve_execution_flow_id(
         &self,
-        eid: &ExecutionId,
-    ) -> Result<Option<FlowId>, EngineError>;
+        _eid: &ExecutionId,
+    ) -> Result<Option<FlowId>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "resolve_execution_flow_id",
+        })
+    }
 
     /// List flows on a partition with cursor-based pagination (issue
     /// #185).
@@ -433,10 +443,12 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn list_flows(
         &self,
-        partition: PartitionKey,
-        cursor: Option<FlowId>,
-        limit: usize,
-    ) -> Result<ListFlowsPage, EngineError>;
+        _partition: PartitionKey,
+        _cursor: Option<FlowId>,
+        _limit: usize,
+    ) -> Result<ListFlowsPage, EngineError> {
+        Err(EngineError::Unavailable { op: "list_flows" })
+    }
 
     /// Enumerate registered lanes with cursor-based pagination.
     ///
@@ -464,9 +476,11 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn list_lanes(
         &self,
-        cursor: Option<LaneId>,
-        limit: usize,
-    ) -> Result<ListLanesPage, EngineError>;
+        _cursor: Option<LaneId>,
+        _limit: usize,
+    ) -> Result<ListLanesPage, EngineError> {
+        Err(EngineError::Unavailable { op: "list_lanes" })
+    }
 
     /// List suspended executions in one partition, cursor-paginated,
     /// with each entry's suspension `reason_code` populated (issue
@@ -497,10 +511,14 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn list_suspended(
         &self,
-        partition: PartitionKey,
-        cursor: Option<ExecutionId>,
-        limit: usize,
-    ) -> Result<ListSuspendedPage, EngineError>;
+        _partition: PartitionKey,
+        _cursor: Option<ExecutionId>,
+        _limit: usize,
+    ) -> Result<ListSuspendedPage, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "list_suspended",
+        })
+    }
 
     /// Forward-only paginated listing of the executions indexed under
     /// one partition.
@@ -530,10 +548,14 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn list_executions(
         &self,
-        partition: PartitionKey,
-        cursor: Option<ExecutionId>,
-        limit: usize,
-    ) -> Result<ListExecutionsPage, EngineError>;
+        _partition: PartitionKey,
+        _cursor: Option<ExecutionId>,
+        _limit: usize,
+    ) -> Result<ListExecutionsPage, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "list_executions",
+        })
+    }
 
     // ── Trigger ops (issue #150) ──
 
@@ -561,8 +583,12 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn deliver_signal(
         &self,
-        args: DeliverSignalArgs,
-    ) -> Result<DeliverSignalResult, EngineError>;
+        _args: DeliverSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "deliver_signal",
+        })
+    }
 
     /// Claim a resumed execution — a previously-suspended attempt that
     /// has cleared its resume condition (e.g. via
@@ -588,8 +614,12 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn claim_resumed_execution(
         &self,
-        args: ClaimResumedExecutionArgs,
-    ) -> Result<ClaimResumedExecutionResult, EngineError>;
+        _args: ClaimResumedExecutionArgs,
+    ) -> Result<ClaimResumedExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "claim_resumed_execution",
+        })
+    }
 
     /// Operator-initiated cancellation of a flow and (optionally) its
     /// member executions. See RFC-012 §3.1.1 for the policy /wait
@@ -616,10 +646,14 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "core")]
     async fn set_edge_group_policy(
         &self,
-        flow_id: &FlowId,
-        downstream_execution_id: &ExecutionId,
-        policy: crate::contracts::EdgeDependencyPolicy,
-    ) -> Result<crate::contracts::SetEdgeGroupPolicyResult, EngineError>;
+        _flow_id: &FlowId,
+        _downstream_execution_id: &ExecutionId,
+        _policy: crate::contracts::EdgeDependencyPolicy,
+    ) -> Result<crate::contracts::SetEdgeGroupPolicyResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "set_edge_group_policy",
+        })
+    }
 
     // ── HMAC secret rotation (v0.7 migration-master Q4) ──
 
@@ -717,12 +751,14 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "streaming")]
     async fn read_stream(
         &self,
-        execution_id: &ExecutionId,
-        attempt_index: AttemptIndex,
-        from: StreamCursor,
-        to: StreamCursor,
-        count_limit: u64,
-    ) -> Result<StreamFrames, EngineError>;
+        _execution_id: &ExecutionId,
+        _attempt_index: AttemptIndex,
+        _from: StreamCursor,
+        _to: StreamCursor,
+        _count_limit: u64,
+    ) -> Result<StreamFrames, EngineError> {
+        Err(EngineError::Unavailable { op: "read_stream" })
+    }
 
     /// Tail a live attempt's stream.
     ///
@@ -745,13 +781,15 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "streaming")]
     async fn tail_stream(
         &self,
-        execution_id: &ExecutionId,
-        attempt_index: AttemptIndex,
-        after: StreamCursor,
-        block_ms: u64,
-        count_limit: u64,
-        visibility: TailVisibility,
-    ) -> Result<StreamFrames, EngineError>;
+        _execution_id: &ExecutionId,
+        _attempt_index: AttemptIndex,
+        _after: StreamCursor,
+        _block_ms: u64,
+        _count_limit: u64,
+        _visibility: TailVisibility,
+    ) -> Result<StreamFrames, EngineError> {
+        Err(EngineError::Unavailable { op: "tail_stream" })
+    }
 
     /// Read the rolling summary document for an attempt (RFC-015 §6.3).
     ///
@@ -764,9 +802,13 @@ pub trait EngineBackend: Send + Sync + 'static {
     #[cfg(feature = "streaming")]
     async fn read_summary(
         &self,
-        execution_id: &ExecutionId,
-        attempt_index: AttemptIndex,
-    ) -> Result<Option<SummaryDocument>, EngineError>;
+        _execution_id: &ExecutionId,
+        _attempt_index: AttemptIndex,
+    ) -> Result<Option<SummaryDocument>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_summary",
+        })
+    }
 
     // ── RFC-017 Stage A — Ingress (5) ──────────────────────────
     //
