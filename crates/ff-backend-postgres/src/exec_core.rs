@@ -404,9 +404,13 @@ pub(super) async fn read_current_attempt_index_impl(
         });
     };
     let attempt_index_i: i32 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
-    let attempt_index = ff_core::types::AttemptIndex::new(
-        u32::try_from(attempt_index_i.max(0)).unwrap_or(0),
-    );
+    // `.max(0) as u32`: column is `integer NOT NULL DEFAULT 0`, but a
+    // negative value (from a hand-edited row, say) would wrap to a very
+    // large u32 under a direct cast. Clamp to 0 — matches the PG
+    // convention used elsewhere in this file for attempt-index reads
+    // (see `attempt.rs::claim_impl`).
+    let attempt_index =
+        ff_core::types::AttemptIndex::new(attempt_index_i.max(0) as u32);
     Ok(attempt_index)
 }
 
