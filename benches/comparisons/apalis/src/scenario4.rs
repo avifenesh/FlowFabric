@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use apalis::prelude::*;
-use apalis_redis::RedisStorage;
+use apalis_redis::{RedisConfig, RedisStorage};
 use apalis_workflow::{Workflow, WorkflowSink};
 use clap::Parser;
 use redis::AsyncCommands;
@@ -51,8 +51,16 @@ use redis::aio::MultiplexedConnection;
 const SCENARIO: &str = "flow_dag";
 const SYSTEM: &str = "apalis";
 const STAGES: usize = 10;
-const CONCURRENCY: usize = 16;
+const WORKER_COUNT: usize = 16;
 const COMPLETED_KEY: &str = "bench:apalis:flow_completed";
+const POLL_INTERVAL_MS: u64 = 5;
+const BUFFER_SIZE: usize = 100;
+
+fn tuned_config() -> RedisConfig {
+    RedisConfig::default()
+        .set_poll_interval(Duration::from_millis(POLL_INTERVAL_MS))
+        .set_buffer_size(BUFFER_SIZE)
+}
 
 #[derive(Parser)]
 struct Args {
@@ -126,17 +134,20 @@ async fn main() -> Result<()> {
         "config": {
             "flows": args.flows,
             "nodes_per_flow": STAGES,
-            "concurrency": CONCURRENCY,
+            "workers": WORKER_COUNT,
             "samples": args.samples,
             "apalis_version": "1.0.0-rc.7",
             "apalis_workflow_version": "0.1.0-rc.7",
             "primitive": "apalis_workflow::Workflow (and_then combinator)",
+            "poll_interval_ms": POLL_INTERVAL_MS,
+            "buffer_size": BUFFER_SIZE,
+            "parallelize": "tokio::spawn",
         },
         "throughput_ops_per_sec": throughput,
         "per_sample_wall_secs": walls_secs,
         "mean_wall_secs": mean_wall.as_secs_f64(),
         "latency_ms": { "p50": 0.0, "p95": 0.0, "p99": 0.0 },
-        "notes": "Scenario 4 harness uses apalis-workflow::Workflow (sequential and_then) per issue #51. Prior harness hand-rolled the 10-stage chain across 10 typed queues; maintainer flagged as under-representing apalis. N=5 per PR #140 methodology. latency_ms not reported — apalis doesn't surface per-flow completion without middleware we'd have to write ourselves.",
+        "notes": "Scenario 4 harness uses apalis-workflow::Workflow (sequential and_then) per issue #51. Prior harness hand-rolled the 10-stage chain across 10 typed queues; maintainer flagged as under-representing apalis. N=5 per PR #140 methodology. Post-issue-#51 tuning (2026-04): N=16 independent WorkerBuilders (not .concurrency(16)), RedisConfig poll_interval=5ms buffer_size=100, .parallelize(tokio::spawn). latency_ms not reported — apalis doesn't surface per-flow completion without middleware we'd have to write ourselves.",
     });
 
     let results_dir = std::path::Path::new(&args.results_dir);
@@ -174,48 +185,65 @@ async fn run_sample(
     let _: () = redis::cmd("FLUSHALL").query_async(&mut raw).await?;
     let _: () = raw.del(COMPLETED_KEY).await?;
 
-    let conn = apalis_redis::connect(url)
+    // Seed-side storage (separate connection): the driver pushes flow
+    // starts into this one. Workers get their own storage instances
+    // below so each has an independent fetch loop + config.
+    let seed_conn = apalis_redis::connect(url)
         .await
-        .map_err(|e| anyhow::anyhow!("apalis_redis::connect: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("apalis_redis::connect (seed): {e}"))?;
     // Workflow requires `Backend::Args == BackendExt::Compact`; for
     // RedisStorage `Compact = Vec<u8>`, so the storage must be typed
     // over `Vec<u8>` (raw codec-encoded bytes). Stage handlers still
     // take the typed `u64` — the codec roundtrips between compact and
     // typed at step boundaries.
-    let mut storage = RedisStorage::<Vec<u8>>::new(conn);
-
-    let counter_conn = raw_client.get_multiplexed_async_connection().await?;
-
-    // 10-stage sequential workflow via apalis-workflow::Workflow.
-    // Each `and_then` persists a step transition in the backing
-    // RedisStorage rather than enqueueing across typed queues.
-    let workflow = Workflow::new("ff-bench-s4-linear")
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_pass)
-        .and_then(stage_terminal);
+    let mut storage = RedisStorage::<Vec<u8>>::new_with_config(seed_conn, tuned_config());
 
     use apalis::prelude::WorkerError;
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-    let mut rx = shutdown_tx.subscribe();
-    let shutdown_fut = async move {
-        let _ = rx.recv().await;
-        Ok::<(), WorkerError>(())
-    };
+    // Spawn N independent WorkerBuilder instances per maintainer's
+    // recommendation (issue #51, 2026-04-27). Each worker rebuilds
+    // the 10-stage Workflow (cheap — closures only) and binds it to
+    // its own RedisStorage + counter connection.
+    let mut worker_futs = Vec::with_capacity(WORKER_COUNT);
+    for wi in 0..WORKER_COUNT {
+        let worker_conn = apalis_redis::connect(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("apalis_redis::connect (worker {wi}): {e}"))?;
+        let worker_storage =
+            RedisStorage::<Vec<u8>>::new_with_config(worker_conn, tuned_config());
 
-    let worker = WorkerBuilder::new("s4-workflow")
-        .backend(storage.clone())
-        .data(counter_conn)
-        .concurrency(CONCURRENCY)
-        .build(workflow);
-    let worker_fut = worker.run_until(shutdown_fut);
+        let counter_conn = raw_client.get_multiplexed_async_connection().await?;
+
+        // 10-stage sequential workflow via apalis-workflow::Workflow.
+        // Each `and_then` persists a step transition in the backing
+        // RedisStorage rather than enqueueing across typed queues.
+        let workflow = Workflow::new("ff-bench-s4-linear")
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_pass)
+            .and_then(stage_terminal);
+
+        let worker = WorkerBuilder::new(format!("s4-workflow-{wi}"))
+            .backend(worker_storage)
+            .data(counter_conn)
+            .parallelize(tokio::spawn)
+            .build(workflow);
+
+        let mut rx = shutdown_tx.subscribe();
+        let shutdown_fut = async move {
+            let _ = rx.recv().await;
+            Ok::<(), WorkerError>(())
+        };
+        worker_futs.push(worker.run_until(shutdown_fut));
+    }
+    let worker_fut = futures::future::join_all(worker_futs);
 
     let driver_raw_client = raw_client.clone();
     let flows = args.flows;
@@ -262,6 +290,15 @@ async fn run_sample(
         Ok::<Duration, anyhow::Error>(wall)
     };
 
-    let (driver_res, _worker_res) = tokio::join!(driver, worker_fut);
+    let (driver_res, worker_res) = tokio::join!(driver, worker_fut);
+    // Surface any worker failure — if a worker bails early the
+    // counter-poll driver might already have succeeded, and silently
+    // dropping the error would let a degraded sample slip into the
+    // mean_wall. Re-report whichever side failed first.
+    for (wi, res) in worker_res.into_iter().enumerate() {
+        if let Err(e) = res {
+            anyhow::bail!("worker {wi} run_until returned error: {e:?}");
+        }
+    }
     driver_res
 }
