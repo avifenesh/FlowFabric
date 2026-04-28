@@ -1700,8 +1700,9 @@ impl FlowFabricWorker {
     /// rather than issuing direct GET/HGET/HGETALL against Valkey. The
     /// outer `valkey-default` gate + `(&ExecutionId, &Partition)`
     /// signature are preserved; hot-path decoupling (ungating this
-    /// helper + the two call sites at worker.rs:1274,1675) is PR-4/PR-5
-    /// scope per the v0.12 agnostic-SDK plan.
+    /// helper + its call sites in `claim_execution` and
+    /// `claim_resumed_execution`) is PR-4/PR-5 scope per the v0.12
+    /// agnostic-SDK plan.
     #[cfg(feature = "valkey-default")]
     async fn read_execution_context(
         &self,

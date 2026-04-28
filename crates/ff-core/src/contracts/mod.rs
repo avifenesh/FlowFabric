@@ -2306,7 +2306,7 @@ impl LeaseSummary {
 // ─── read_execution_context (v0.12 agnostic-SDK prep, PR-1) ───
 
 /// Point-read bundle of the three execution-scoped fields the SDK
-/// worker needs to construct a [`ClaimedTask`](ff_sdk::ClaimedTask):
+/// worker needs to construct a `ClaimedTask` (see `ff_sdk::ClaimedTask`):
 /// `input_payload`, `execution_kind`, and `tags`.
 ///
 /// Returned by

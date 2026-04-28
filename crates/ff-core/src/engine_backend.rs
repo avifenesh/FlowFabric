@@ -317,7 +317,7 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     /// Point-read of the execution-scoped `(input_payload,
     /// execution_kind, tags)` bundle used by the SDK worker when
-    /// assembling a [`ClaimedTask`](ff_sdk::ClaimedTask) after a
+    /// assembling a `ClaimedTask` (see `ff_sdk::ClaimedTask`) after a
     /// successful claim.
     ///
     /// No default impl — every `EngineBackend` must answer this
@@ -328,7 +328,7 @@ pub trait EngineBackend: Send + Sync + 'static {
     ///
     /// Per-backend shape:
     ///
-    /// * **Valkey** — pipelined `GET :payload` + `HGET :core execution_kind`
+    /// * **Valkey** — pipelined `GET :payload` + `HGETALL :core`
     ///   + `HGETALL :tags` on the execution's partition (same pattern
     ///   as [`Self::describe_execution`]).
     /// * **Postgres** — single `SELECT payload, raw_fields` on

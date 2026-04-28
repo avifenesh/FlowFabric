@@ -327,8 +327,8 @@ pub(crate) async fn get_execution_result_impl(
 // ─── read_execution_context (v0.12 agnostic-SDK prep, PR-1) ────────
 
 /// Point-read of `(input_payload, execution_kind, tags)` from
-/// `ff_exec_core`. Mirrors the Postgres impl at
-/// [`ff-backend-postgres::exec_core::read_execution_context_impl`]:
+/// `ff_exec_core`. Mirrors the Postgres impl
+/// (`ff-backend-postgres::exec_core::read_execution_context_impl`):
 /// payload is the `payload` BLOB column; `execution_kind` + `tags`
 /// live inside the `raw_fields` JSON text column.
 ///
