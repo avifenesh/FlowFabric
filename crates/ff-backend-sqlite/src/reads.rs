@@ -393,3 +393,48 @@ pub(crate) async fn read_execution_context_impl(
 
     Ok(ExecutionContext::new(input_payload, execution_kind, tags))
 }
+
+// ─── read_current_attempt_index (v0.12 agnostic-SDK prep, PR-3) ────
+
+/// Point-read of `attempt_index` from `ff_exec_core`. Used by the SDK
+/// worker on the `claim_from_resume_grant` path before dispatching
+/// `claim_resumed_execution`. Missing row → `InvalidInput` (same
+/// convention as [`read_execution_context_impl`]).
+pub(crate) async fn read_current_attempt_index_impl(
+    pool: &SqlitePool,
+    id: &ExecutionId,
+) -> Result<ff_core::types::AttemptIndex, EngineError> {
+    let (part, exec_uuid) = split_exec_id(id)?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT attempt_index
+          FROM ff_exec_core
+         WHERE partition_key = ?1 AND execution_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "read_current_attempt_index: execution not found: {id}"
+            ),
+        });
+    };
+    let attempt_index_i: i64 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
+    let attempt_index_u: u32 = u32::try_from(attempt_index_i.max(0)).map_err(|e| {
+        EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!(
+                "exec_core: attempt_index out of u32 range: {attempt_index_i}: {e}"
+            ),
+        }
+    })?;
+    Ok(ff_core::types::AttemptIndex::new(attempt_index_u))
+}

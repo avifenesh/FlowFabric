@@ -14,6 +14,11 @@ use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::PartitionConfig;
 #[cfg(feature = "valkey-default")]
 use ff_core::types::*;
+// Types referenced by the backend-agnostic surface
+// (e.g. `deliver_signal` ungated in v0.12 PR-3). The wildcard above
+// is `valkey-default`-gated; these are always in scope.
+#[cfg(not(feature = "valkey-default"))]
+use ff_core::types::{ExecutionId, TimestampMs, WaitpointId};
 use tokio::sync::Semaphore;
 
 use crate::config::WorkerConfig;
@@ -1376,22 +1381,17 @@ impl FlowFabricWorker {
         lane_id: &LaneId,
         partition: &ff_core::partition::Partition,
     ) -> Result<ClaimedTask, SdkError> {
-        let ctx = ExecKeyContext::new(partition, execution_id);
-
-        // Pre-read current_attempt_index for the existing attempt hash key.
-        // This is load-bearing: the backend's KEYS[6] must point to the
-        // real attempt hash, and the backend takes the index verbatim
-        // from `ClaimResumedExecutionArgs::current_attempt_index`.
-        let att_idx_str: Option<String> = self.valkey_client()
-            .cmd("HGET")
-            .arg(ctx.core())
-            .arg("current_attempt_index")
-            .execute()
+        // v0.12 PR-3 — pre-read current_attempt_index via the trait
+        // rather than an inline `HGET` on the Valkey client. Load-bearing:
+        // the backend's KEYS[6] (Valkey) / `ff_attempt` PK tuple (PG/SQLite)
+        // must target the real existing attempt hash/row, and the backend
+        // takes the index verbatim from
+        // `ClaimResumedExecutionArgs::current_attempt_index`.
+        let att_idx = self
+            .backend
+            .read_current_attempt_index(execution_id)
             .await
-            .map_err(|e| crate::backend_context(e, "read attempt_index"))?;
-        let att_idx = AttemptIndex::new(
-            att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
-        );
+            .map_err(|e| SdkError::Engine(Box::new(e)))?;
 
         let args = ff_core::contracts::ClaimResumedExecutionArgs {
             execution_id: execution_id.clone(),
@@ -1459,7 +1459,11 @@ impl FlowFabricWorker {
     /// Forwards through
     /// [`EngineBackend::deliver_signal`](ff_core::engine_backend::EngineBackend::deliver_signal)
     /// — the trait-level trigger surface landed in issue #150.
-    #[cfg(feature = "valkey-default")]
+    ///
+    /// Backend-agnostic as of v0.12 PR-3. Compiles + runs under every
+    /// feature set ff-sdk supports (including
+    /// `--no-default-features --features sqlite`); pinned by
+    /// `sqlite_only_compile_surface_tests::deliver_signal_addressable_under_sqlite_only`.
     pub async fn deliver_signal(
         &self,
         execution_id: &ExecutionId,
@@ -1828,6 +1832,54 @@ mod sqlite_only_compile_surface_tests {
             id: &ExecutionId,
         ) -> Result<Option<ExecutionSnapshot>, SdkError> {
             w.describe_execution(id).await
+        }
+    }
+
+    /// v0.12 PR-3 compile anchor — the new
+    /// [`EngineBackend::read_current_attempt_index`] trait method MUST
+    /// be addressable under `--no-default-features --features sqlite`.
+    /// Mirrors the PR-1 `read_execution_context` anchor: takes a
+    /// generic over the trait bound so `#[async_trait]` lifetime
+    /// elision doesn't block an `fn`-pointer coercion.
+    #[test]
+    fn read_current_attempt_index_addressable_under_sqlite_only() {
+        use ff_core::engine_error::EngineError;
+        use ff_core::types::{AttemptIndex, ExecutionId};
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            id: &ExecutionId,
+        ) -> Result<AttemptIndex, EngineError> {
+            b.read_current_attempt_index(id).await
+        }
+    }
+
+    /// v0.12 PR-3 compile anchor — `FlowFabricWorker::deliver_signal`
+    /// MUST be addressable under `--no-default-features --features sqlite`
+    /// (ungated in PR-3 — the body is pure
+    /// `self.backend.deliver_signal(...)` trait dispatch).
+    #[test]
+    fn deliver_signal_addressable_under_sqlite_only() {
+        use crate::task::{Signal, SignalOutcome};
+        use crate::SdkError;
+        use ff_core::types::{ExecutionId, WaitpointId};
+        use std::future::Future;
+        use std::pin::Pin;
+
+        // `deliver_signal` is `async fn`, so its item signature bakes
+        // in a hidden lifetime and opaque return future. Take an
+        // `fn`-pointer to an explicit wrapper that names the return
+        // type through the trait — same shape as the PR-1 anchor
+        // (`read_execution_context_addressable_under_sqlite_only`).
+        #[allow(dead_code)]
+        fn _pin<'a>(
+            w: &'a FlowFabricWorker,
+            id: &'a ExecutionId,
+            wp: &'a WaitpointId,
+            s: Signal,
+        ) -> Pin<Box<dyn Future<Output = Result<SignalOutcome, SdkError>> + Send + 'a>> {
+            Box::pin(w.deliver_signal(id, wp, s))
         }
     }
 }
