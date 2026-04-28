@@ -8,8 +8,14 @@ Accepted constructor shapes:
 - An inherent `impl Ty { pub fn <name>(...) -> Self }` or
   `impl Ty { pub fn <name>(...) -> Ty }` — any associated function
   that is `pub`, takes no `self` receiver, and returns the type by
-  value. Captures `new`, `builder`, `none`, `normal`, `with_ttl`,
-  `empty`, `from_parts`, etc.
+  value. Captures `new`, `none`, `normal`, `with_ttl`, `empty`,
+  `from_parts`, etc.
+- A `pub fn builder() -> BuilderTy` whose return type is a **separate
+  builder struct** is NOT counted here — the builder must itself have
+  a reachable `.build()`/`.finish()` path to `Ty`. In practice, pair
+  the `#[non_exhaustive]` target with either a direct-field
+  constructor (`pub fn new(...) -> Self`) or an `impl From<Builder>
+  for Ty`; the latter satisfies the lint via the `From` rule.
 - `impl From<...> for Ty`
 - `impl TryFrom<...> for Ty`
 - `impl Default for Ty`, or `#[derive(Default)]` on the struct.
@@ -68,7 +74,7 @@ Then:
 
 ```sh
 cargo run -p non-exhaustive-lint
-# Expected: exit 1 + "crates/ff-core/src/lib.rs:0 — DeadApi"
+# Expected: exit 1 + "crates/ff-core/src/lib.rs — DeadApi"
 ```
 
 Remove the marker (add `impl DeadApi { pub fn new() -> Self { ... } }`

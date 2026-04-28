@@ -470,7 +470,13 @@ jobs:
           # `fetch-depth: 0` on the checkout step above keeps merge-base
           # resolvable; if either git call below errors, the whole
           # step fails and a human investigates.
-          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          #
+          # Omit `--depth` on the fetch below: a shallow `--depth=1`
+          # fetch of BASE_REF gives only the base tip with no parents,
+          # and `diff A...B` needs a merge-base which may be several
+          # commits back on a non-rebased PR. Full fetch is cheap here
+          # (workflow runs once per PR-update, not per commit).
+          git fetch --no-tags origin "$BASE_REF"
           changed=$(git diff --name-only "origin/${BASE_REF}...HEAD" -- \
             'crates/ff-script/**/*.lua' 'lua/**/*.lua')
           if [ -z "$changed" ]; then

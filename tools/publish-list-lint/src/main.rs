@@ -192,8 +192,10 @@ fn discover_publishable(repo: &Path) -> Result<BTreeSet<String>, String> {
 
     let mut publishable = BTreeSet::new();
     for member in &root.workspace.members {
-        // Skip `tools/*` — those are self-declared publish = false.
-        // We still parse them below, but they won't make the cut.
+        // All workspace members are parsed; `tools/*` crates declare
+        // `publish = false` in their own manifest, so they're filtered
+        // out below by the publish / metadata.release.release gates
+        // rather than by a path-prefix skip.
         let manifest_path = repo.join(member).join("Cargo.toml");
         let raw = fs::read_to_string(&manifest_path)
             .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;

@@ -24,8 +24,11 @@
 //!       * an `impl Ty { pub fn <name>(...) -> Self }` — any public
 //!         associated function that returns `Self` (by value, not a
 //!         reference) and takes no `self` receiver. This captures
-//!         `new`, `builder`, `none`, `normal`, `with_ttl`, `empty`,
-//!         etc.
+//!         `new`, `none`, `normal`, `with_ttl`, `empty`, etc. A
+//!         `pub fn builder() -> BuilderTy` returning a *separate*
+//!         builder type does NOT count on its own — pair with an
+//!         `impl From<Builder> for Ty` so there is a reachable value
+//!         path to the target type.
 //!       * an `impl Ty { pub fn <name>(...) -> Ty }` — same but with
 //!         the type named explicitly.
 //!       * `impl From<_> for Ty`
@@ -88,12 +91,11 @@ fn main() -> ExitCode {
         };
         let mut v = FileVisitor::default();
         v.visit_file(&file);
-        for (ty_name, span_line) in v.non_exhaustive_pub_types {
+        for ty_name in v.non_exhaustive_pub_types {
             if !v.constructors.get(&ty_name).copied().unwrap_or(false) {
                 findings.push(Finding {
                     path: rel.clone(),
                     ty: ty_name,
-                    line: span_line,
                 });
             }
         }
@@ -132,7 +134,7 @@ fn main() -> ExitCode {
     eprintln!("See feedback_non_exhaustive_needs_constructor.md.");
     eprintln!();
     for f in &findings {
-        eprintln!("  {}:{} — {}", f.path.display(), f.line, f.ty);
+        eprintln!("  {} — {}", f.path.display(), f.ty);
     }
     ExitCode::FAILURE
 }
@@ -141,7 +143,6 @@ fn main() -> ExitCode {
 struct Finding {
     path: PathBuf,
     ty: String,
-    line: usize,
 }
 
 fn path_contains_component(path: &Path, comp: &str) -> bool {
@@ -151,9 +152,8 @@ fn path_contains_component(path: &Path, comp: &str) -> bool {
 
 #[derive(Default)]
 struct FileVisitor {
-    /// (type name, approximate line number) for each `pub` struct
-    /// carrying `#[non_exhaustive]`.
-    non_exhaustive_pub_types: Vec<(String, usize)>,
+    /// Type names of every `pub` struct carrying `#[non_exhaustive]`.
+    non_exhaustive_pub_types: Vec<String>,
     /// Type name -> true if any accepted constructor shape found in-file.
     constructors: BTreeMap<String, bool>,
 }
@@ -186,7 +186,7 @@ impl FileVisitor {
         if has_derive_default(&s.attrs) {
             self.constructors.insert(name.clone(), true);
         }
-        self.non_exhaustive_pub_types.push((name, 0));
+        self.non_exhaustive_pub_types.push(name);
     }
 
     fn check_impl(&mut self, i: &ItemImpl) {
