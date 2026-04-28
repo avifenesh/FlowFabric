@@ -39,7 +39,7 @@
 //!
 //! Consumers that need the parsed family/index call
 //! [`PartitionKey::parse`] (or [`crate::contracts::ClaimGrant::partition`] /
-//! [`crate::contracts::ReclaimGrant::partition`]) — these return a
+//! [`crate::contracts::ResumeGrant::partition`]) — these return a
 //! typed [`Partition`] so routing code stays unchanged.
 //!
 //! The `Execution` family label collapses to `Flow` on round-trip

@@ -50,7 +50,7 @@ use async_trait::async_trait;
 use crate::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    PrepareOutcome, ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility,
+    PrepareOutcome, ResumeSignal, ResumeToken, SummaryDocument, TailVisibility,
 };
 use crate::contracts::{
     CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
@@ -251,7 +251,7 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Consume a reclaim grant to mint a resumed-kind handle. Returns
     /// `Ok(None)` when the grant's target execution is no longer
     /// resumable (already reclaimed, terminal, etc.).
-    async fn claim_from_reclaim(&self, token: ReclaimToken) -> Result<Option<Handle>, EngineError>;
+    async fn claim_from_reclaim(&self, token: ResumeToken) -> Result<Option<Handle>, EngineError>;
 
     // Round-5 amendment: lease-releasing peers of `suspend`.
 
@@ -1386,7 +1386,7 @@ mod tests {
         }
         async fn claim_from_reclaim(
             &self,
-            _token: ReclaimToken,
+            _token: ResumeToken,
         ) -> Result<Option<Handle>, EngineError> {
             unreachable!()
         }

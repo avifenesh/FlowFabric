@@ -7,6 +7,41 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-024 PR-A — `ff-core` resume-path rename + `HandleKind::Reclaimed` variant.**
+  First impl PR of the RFC-024 series (wires `ff_reclaim_execution` +
+  `ff_issue_reclaim_grant` to the consumer surface). Scope is
+  ff-core-only; no backend / SDK / server code touched.
+  - `crates/ff-core/src/contracts/mod.rs` — `ReclaimGrant` struct
+    renamed to `ResumeGrant` (the semantic has always been resume-
+    after-suspend; the routing FCALL is `ff_claim_resumed_execution`).
+    A transitional `pub type ReclaimGrant = ResumeGrant` alias is
+    retained so downstream backend / SDK / scheduler crates keep
+    compiling until the follow-up PR rewrites their call sites.
+  - `crates/ff-core/src/backend.rs` — `ReclaimToken` struct renamed
+    to `ResumeToken` (wraps a `ResumeGrant`; feeds the resume path).
+    Transitional `pub type ReclaimToken = ResumeToken` alias
+    retained on the same rationale.
+  - `crates/ff-core/src/backend.rs` — new `HandleKind::Reclaimed`
+    variant on the `#[non_exhaustive]` enum. Purely additive.
+    Reserved for the forthcoming `reclaim_execution` trait method
+    (RFC-024 PR-C onward) that mints a handle via the new
+    lease-reclaim path (distinct from the existing `Resumed`
+    suspend/resume path).
+  - Internal ff-core docs + the single `claim_from_reclaim` trait
+    method signature use the new names directly; no `#[allow(deprecated)]`
+    scatter. The aliases carry no `#[deprecated]` attribute (workspace
+    clippy runs with `-D warnings` and the downstream rename sweep
+    ships separately).
+  - Defers to the next PR in the series: the new `ReclaimGrant`
+    type (distinct semantic, lease-reclaim path), `#[non_exhaustive]` +
+    `new()` constructors on `ClaimGrant` / `ResumeGrant` /
+    `IssueReclaimGrantArgs` / `ReclaimExecutionArgs`,
+    `max_reclaim_count: u32` → `Option<u32>` flip, and the new
+    `IssueReclaimGrantOutcome` + `ReclaimExecutionOutcome` enums.
+    Those ride with the new trait-method introduction (PR-C) so the
+    constructor stabilisation lands alongside the surface that
+    requires it.
+
 - **`crates/ff-backend-sqlite` — Phase 3.5 scanner supervisor (N=1) +
   `budget_reset` reconciler (RFC-023 Phase 3.5 / RFC-020 Wave 9
   Standalone-1).** Ports the Postgres `scanner_supervisor` +
