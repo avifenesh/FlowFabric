@@ -1,0 +1,438 @@
+//! RFC-024 PR-D — issue_reclaim_grant + reclaim_execution integration
+//! tests against a live Postgres with migration 0017 applied.
+//!
+//! Running:
+//!   FF_PG_TEST_URL=postgres://... cargo test -p ff-backend-postgres
+//!     --test rfc024_reclaim -- --ignored
+
+use ff_backend_postgres::PostgresBackend;
+use ff_core::backend::HandleKind;
+use ff_core::contracts::{
+    IssueReclaimGrantArgs, IssueReclaimGrantOutcome, ReclaimExecutionArgs,
+    ReclaimExecutionOutcome,
+};
+use ff_core::engine_backend::EngineBackend;
+use ff_core::partition::PartitionConfig;
+use ff_core::types::{
+    AttemptId, ExecutionId, LaneId, LeaseId, TimestampMs, WorkerId, WorkerInstanceId,
+};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+async fn setup_or_skip() -> Option<PgPool> {
+    let url = std::env::var("FF_PG_TEST_URL").ok()?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect to FF_PG_TEST_URL");
+    ff_backend_postgres::apply_migrations(&pool)
+        .await
+        .expect("apply_migrations clean");
+    sqlx::query(
+        r#"
+        INSERT INTO ff_waitpoint_hmac (kid, secret, rotated_at_ms, active)
+        VALUES ('rfc024-test', decode('0102030405060708', 'hex'), $1, true)
+        ON CONFLICT (kid) DO NOTHING
+        "#,
+    )
+    .bind(now_ms())
+    .execute(&pool)
+    .await
+    .expect("seed hmac");
+    Some(pool)
+}
+
+async fn seed_exec(
+    pool: &PgPool,
+    lane: &str,
+    ownership_state: &str,
+    lifecycle_phase: &str,
+    lease_reclaim_count: i32,
+) -> (i16, Uuid, LaneId) {
+    let part: i16 = 0;
+    let exec_uuid = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO ff_exec_core (
+            partition_key, execution_id, flow_id, lane_id,
+            required_capabilities, attempt_index,
+            lifecycle_phase, ownership_state, eligibility_state,
+            public_state, attempt_state,
+            priority, created_at_ms, lease_reclaim_count
+        ) VALUES (
+            $1, $2, NULL, $3,
+            '{}', 0,
+            $5, $4, 'not_applicable',
+            'running', 'running_attempt',
+            0, $6, $7
+        )
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(lane)
+    .bind(ownership_state)
+    .bind(lifecycle_phase)
+    .bind(now_ms())
+    .bind(lease_reclaim_count)
+    .execute(pool)
+    .await
+    .expect("seed exec");
+    sqlx::query(
+        r#"
+        INSERT INTO ff_attempt (
+            partition_key, execution_id, attempt_index,
+            worker_id, worker_instance_id,
+            lease_epoch, lease_expires_at_ms, started_at_ms
+        ) VALUES ($1, $2, 0, 'w-orig', 'w-orig-1', 1, 0, $3)
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    .expect("seed attempt");
+    (part, exec_uuid, LaneId::new(lane))
+}
+
+fn backend_from_pool(pool: PgPool) -> Arc<dyn EngineBackend> {
+    PostgresBackend::from_pool(pool, PartitionConfig::default())
+}
+
+fn issue_args(eid: ExecutionId, lane: LaneId, worker: &str) -> IssueReclaimGrantArgs {
+    IssueReclaimGrantArgs::new(
+        eid,
+        WorkerId::new(worker),
+        WorkerInstanceId::new(format!("{worker}-1")),
+        lane,
+        None,
+        60_000,
+        None,
+        None,
+        BTreeSet::new(),
+        TimestampMs::from_millis(now_ms()),
+    )
+}
+
+fn reclaim_args(
+    eid: ExecutionId,
+    lane: LaneId,
+    worker: &str,
+    max: Option<u32>,
+) -> ReclaimExecutionArgs {
+    ReclaimExecutionArgs::new(
+        eid,
+        WorkerId::new(worker),
+        WorkerInstanceId::new(format!("{worker}-1")),
+        lane,
+        None,
+        LeaseId::new(),
+        30_000,
+        AttemptId::new(),
+        "{}".into(),
+        max,
+        WorkerInstanceId::new("w-orig-1"),
+        ff_core::types::AttemptIndex::new(0),
+    )
+}
+
+fn exec_id(part: i16, uuid: Uuid) -> ExecutionId {
+    ExecutionId::parse(&format!("{{fp:{part}}}:{uuid}")).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn issue_reclaim_grant_happy_path() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-iss-happy-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let args = issue_args(exec_id(part, exec_uuid), lane_id, "w-rec");
+    let out = backend.issue_reclaim_grant(args).await.expect("ok");
+    match out {
+        IssueReclaimGrantOutcome::Granted(g) => {
+            assert_eq!(g.execution_id, exec_id(part, exec_uuid));
+            assert!(g.expires_at_ms as i64 > now_ms());
+        }
+        other => panic!("expected Granted, got {other:?}"),
+    }
+    let row = sqlx::query(
+        "SELECT kind, worker_id FROM ff_claim_grant WHERE partition_key = $1 AND execution_id = $2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert_eq!(row.get::<String, _>("kind"), "reclaim");
+    assert_eq!(row.get::<String, _>("worker_id"), "w-rec");
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn issue_reclaim_grant_wrong_phase_not_reclaimable() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-iss-phase-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) = seed_exec(&pool, &lane, "leased", "runnable", 0).await;
+    sqlx::query("UPDATE ff_attempt SET lease_expires_at_ms = $1 WHERE partition_key = $2 AND execution_id = $3")
+        .bind(now_ms() + 60_000)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let backend = backend_from_pool(pool.clone());
+    let args = issue_args(exec_id(part, exec_uuid), lane_id, "w-rec");
+    let out = backend.issue_reclaim_grant(args).await.expect("ok");
+    assert!(
+        matches!(out, IssueReclaimGrantOutcome::NotReclaimable { .. }),
+        "got {out:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn issue_reclaim_grant_cap_exceeded() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-iss-cap-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 1000).await;
+    let backend = backend_from_pool(pool.clone());
+    let args = issue_args(exec_id(part, exec_uuid), lane_id, "w-rec");
+    let out = backend.issue_reclaim_grant(args).await.expect("ok");
+    assert!(
+        matches!(
+            out,
+            IssueReclaimGrantOutcome::ReclaimCapExceeded { reclaim_count: 1000, .. }
+        ),
+        "got {out:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_happy_path_new_attempt_minted() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-happy-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+    let _ = match backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap()
+    {
+        IssueReclaimGrantOutcome::Granted(g) => g,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    let outcome = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", None))
+        .await
+        .expect("reclaim ok");
+    let handle = match outcome {
+        ReclaimExecutionOutcome::Claimed(h) => h,
+        other => panic!("expected Claimed, got {other:?}"),
+    };
+    assert_eq!(handle.kind, HandleKind::Reclaimed);
+
+    let row = sqlx::query(
+        "SELECT attempt_index, lease_reclaim_count, lifecycle_phase FROM ff_exec_core WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<i32, _>("attempt_index"), 1);
+    assert_eq!(row.get::<i32, _>("lease_reclaim_count"), 1);
+    assert_eq!(row.get::<String, _>("lifecycle_phase"), "active");
+
+    let prior: Option<String> = sqlx::query_scalar(
+        "SELECT outcome FROM ff_attempt WHERE partition_key=$1 AND execution_id=$2 AND attempt_index=0",
+    )
+    .bind(part).bind(exec_uuid).fetch_one(&pool).await.unwrap();
+    assert_eq!(prior.as_deref(), Some("interrupted_reclaimed"));
+
+    let new_epoch: i64 = sqlx::query_scalar(
+        "SELECT lease_epoch FROM ff_attempt WHERE partition_key=$1 AND execution_id=$2 AND attempt_index=1",
+    )
+    .bind(part).bind(exec_uuid).fetch_one(&pool).await.unwrap();
+    assert_eq!(new_epoch, 1);
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ff_claim_grant WHERE partition_key=$1 AND execution_id=$2 AND kind='reclaim'",
+    )
+    .bind(part).bind(exec_uuid).fetch_one(&pool).await.unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_worker_id_mismatch_errors() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-wid-{}", Uuid::new_v4());
+    let (_part, _exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(_part, _exec_uuid);
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    let err = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-other", None))
+        .await
+        .expect_err("must error");
+    assert!(
+        matches!(err, ff_core::engine_error::EngineError::Validation { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_ttl_expired_grant_not_found() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-ttl-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ff_claim_grant SET expires_at_ms = 1 WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let outcome = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", None))
+        .await
+        .expect("ok");
+    assert!(
+        matches!(outcome, ReclaimExecutionOutcome::GrantNotFound { .. }),
+        "got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_cap_exceeded_transitions_terminal() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-cap-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ff_exec_core SET lease_reclaim_count = 5 WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let outcome = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", Some(5)))
+        .await
+        .expect("ok");
+    assert!(
+        matches!(
+            outcome,
+            ReclaimExecutionOutcome::ReclaimCapExceeded { reclaim_count: 6, .. }
+        ),
+        "got {outcome:?}"
+    );
+    let phase: String = sqlx::query_scalar(
+        "SELECT lifecycle_phase FROM ff_exec_core WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(phase, "terminal");
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn scheduler_claim_grant_writes_new_table_kind_claim() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-sched-tbl-{}", Uuid::new_v4());
+    let part: i16 = 0;
+    let exec_uuid = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO ff_exec_core (
+            partition_key, execution_id, flow_id, lane_id,
+            required_capabilities, attempt_index,
+            lifecycle_phase, ownership_state, eligibility_state,
+            public_state, attempt_state,
+            priority, created_at_ms
+        ) VALUES (
+            $1, $2, NULL, $3,
+            '{}', 0,
+            'runnable', 'unowned', 'eligible_now',
+            'waiting', 'pending_first_attempt',
+            0, $4
+        )
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(&lane)
+    .bind(now_ms())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sched = ff_backend_postgres::scheduler::PostgresScheduler::new(pool.clone());
+    let grant = sched
+        .claim_for_worker(
+            &LaneId::new(&lane),
+            &WorkerId::new("w-sched"),
+            &WorkerInstanceId::new("w-sched-1"),
+            &BTreeSet::new(),
+            30_000,
+        )
+        .await
+        .unwrap();
+    assert!(grant.is_some(), "scheduler should issue a grant");
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT kind, worker_id FROM ff_claim_grant WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let row = row.expect("grant row in ff_claim_grant");
+    assert_eq!(row.0, "claim");
+    assert_eq!(row.1, "w-sched");
+}
