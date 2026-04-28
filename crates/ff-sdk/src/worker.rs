@@ -779,13 +779,14 @@ impl FlowFabricWorker {
     /// the Valkey-specific FCALL plumbing lives behind the trait in
     /// `ff_backend_valkey::claim_execution_impl`.
     ///
-    /// The method stays `valkey-default`-gated because
-    /// [`ClaimedTask::new`](crate::task::ClaimedTask) still depends on
-    /// `ValkeyBackend::encode_handle` for handle synthesis (lease-
-    /// renewal loop cookie). The public [`claim_from_grant`] entry
-    /// point that calls this helper stays gated for the same reason.
-    /// A full cross-backend ungate awaits an agnostic `ClaimedTask::new`
-    /// (v0.12 PR-5 / `claim_next` scope).
+    /// As of v0.12 PR-5.5 this helper + `claim_from_grant` are no
+    /// longer `valkey-default`-gated: the backend mints the `Handle`
+    /// at claim time and `ClaimedTask::new` caches it, so no
+    /// Valkey-specific handle synthesis is required on this path. The
+    /// `EngineBackend::claim_execution` default impl returns
+    /// `Err(Unavailable)` on PG/SQLite today (grant-consumer surface
+    /// is Valkey-only until the PG/SQLite grant-consumer RFC lands);
+    /// the compile surface is fully agnostic.
     ///
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
     async fn claim_execution(
@@ -1624,11 +1625,12 @@ mod sqlite_only_compile_surface_tests {
     /// v0.12 PR-2 compile anchor — `ClaimedTask` as a type MUST be
     /// addressable under `--no-default-features --features sqlite`
     /// (the `task` module is no longer `valkey-default`-gated at the
-    /// module level). The `impl ClaimedTask { ... }` block is still
-    /// valkey-gated because `synth_handle` / `new` depend on
-    /// `ff_backend_valkey::ValkeyBackend::encode_handle`; this anchor
-    /// pins the struct path + its field types through a generic-over-T
-    /// wrapper so a compile-time lookup of `ClaimedTask` is exercised
+    /// module level). As of v0.12 PR-5.5 the `impl ClaimedTask { ... }`
+    /// block is likewise ungated: the backend mints the `Handle` at
+    /// claim time and `cloned_handle` just clones the cached field, so
+    /// no Valkey-specific synthesis is required. This anchor pins the
+    /// struct path + its field types through a generic-over-T wrapper
+    /// so a compile-time lookup of `ClaimedTask` is exercised
     /// mechanically under the sqlite-only feature set.
     #[test]
     fn claimed_task_type_addressable_under_sqlite_only() {

@@ -163,7 +163,7 @@ pub struct ClaimedTask {
     /// Stage 1c migrates the FlowFabricWorker hot paths (claim,
     /// deliver_signal) through the same trait surface; Stage 1d
     /// refactors this struct to carry a single `Handle` rather than
-    /// synthesising one per op via `synth_handle`.
+    /// synthesising one per op via `cloned_handle`.
     backend: Arc<dyn EngineBackend>,
     /// Partition config for key construction.
     #[allow(dead_code)]
@@ -187,7 +187,7 @@ pub struct ClaimedTask {
     /// Backend-minted attempt handle cached at claim time.
     ///
     /// **RFC-012 Stage 1d (v0.12 PR-5.5).** Replaces the pre-PR
-    /// `synth_handle` helper that per-op synthesised a Valkey-specific
+    /// `cloned_handle` helper that per-op synthesised a Valkey-specific
     /// `Handle` via `ValkeyBackend::encode_handle`. The handle is now
     /// produced by the owning backend at `claim_execution` /
     /// `claim_resumed_execution` time and rides on the
@@ -485,8 +485,8 @@ impl ClaimedTask {
     /// it instead of re-synthesising via backend-specific code. The
     /// `Handle` payload is `Box<[u8]> + 2 small enums`, so a clone is
     /// effectively one heap allocation — the same cost as the
-    /// pre-PR-5.5 `synth_handle`.
-    fn synth_handle(&self) -> Handle {
+    /// pre-PR-5.5 `cloned_handle`.
+    fn cloned_handle(&self) -> Handle {
         self.handle.clone()
     }
 
@@ -521,7 +521,7 @@ impl ClaimedTask {
         // raw transport errors bubble up without stopping renewal so
         // the `Drop` warning still fires if the caller later drops
         // `self` without retrying.
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let out = self.backend.delay(&handle, delay_until).await;
         if fcall_landed(&out) {
             self.stop_renewal();
@@ -536,7 +536,7 @@ impl ClaimedTask {
     pub async fn move_to_waiting_children(self) -> Result<(), SdkError> {
         // RFC-012 Stage 1b: forwards through `backend.wait_children`.
         // See `delay_execution` for the stop_renewal contract.
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let out = self.backend.wait_children(&handle).await;
         if fcall_landed(&out) {
             self.stop_renewal();
@@ -566,7 +566,7 @@ impl ClaimedTask {
         // The FCALL body + the `ExecutionNotActive` replay reconciliation
         // (match same epoch + attempt_id + outcome=="success" → Ok)
         // moved to `ff_backend_valkey::complete_impl`.
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let out = self.backend.complete(&handle, result_payload).await;
         if fcall_landed(&out) {
             self.stop_renewal();
@@ -616,7 +616,7 @@ impl ClaimedTask {
         // match on the trait return today (none in-workspace).
         // Stage 1d (or issue #117) widens `FailureClass` with a
         // `Custom(String)` arm; this stash carrier retires then.
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let failure_reason = ff_core::backend::FailureReason::with_detail(
             reason.to_owned(),
             error_category.as_bytes().to_vec(),
@@ -648,7 +648,7 @@ impl ClaimedTask {
         // The 21-KEYS FCALL body, the `current_waitpoint_id` pre-read,
         // and the `ExecutionNotActive` → outcome=="cancelled" replay
         // reconciliation all moved to `ff_backend_valkey::cancel_impl`.
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let out = self.backend.cancel(&handle, reason).await;
         if fcall_landed(&out) {
             self.stop_renewal();
@@ -666,7 +666,7 @@ impl ClaimedTask {
     /// this method is the public entry point for workers that want
     /// to force a renew out-of-band.
     pub async fn renew_lease(&self) -> Result<(), SdkError> {
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         self.backend
             .renew(&handle)
             .await
@@ -690,7 +690,7 @@ impl ClaimedTask {
     /// stream-tail routes) MUST use [`Self::append_frame`] instead;
     /// `update_progress` is invisible to stream consumers.
     pub async fn update_progress(&self, pct: u8, message: &str) -> Result<(), SdkError> {
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         self.backend
             .progress(&handle, Some(pct), Some(message.to_owned()))
             .await
@@ -715,7 +715,7 @@ impl ClaimedTask {
         dimensions: &[(&str, u64)],
         dedup_key: Option<&str>,
     ) -> Result<ReportUsageResult, SdkError> {
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let mut dims = ff_core::backend::UsageDimensions::default();
         for (name, delta) in dimensions {
             dims.custom.insert((*name).to_owned(), *delta);
@@ -752,7 +752,7 @@ impl ClaimedTask {
         waitpoint_key: &str,
         expires_in_ms: u64,
     ) -> Result<(WaitpointId, WaitpointToken), SdkError> {
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let expires_in = std::time::Duration::from_millis(expires_in_ms);
         let pending = self
             .backend
@@ -814,7 +814,7 @@ impl ClaimedTask {
         metadata: Option<&str>,
         mode: ff_core::backend::StreamMode,
     ) -> Result<AppendFrameOutcome, SdkError> {
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let mut frame = ff_core::backend::Frame::new(
             payload.to_vec(),
             ff_core::backend::FrameKind::Event,
@@ -906,7 +906,7 @@ impl ClaimedTask {
         timeout: Option<(TimestampMs, TimeoutBehavior)>,
         resume_policy: ResumePolicy,
     ) -> Result<TrySuspendOutcome, SdkError> {
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         let (timeout_at, timeout_behavior) = match timeout {
             Some((at, b)) => (Some(at), b),
             None => (None, TimeoutBehavior::Fail),
@@ -1014,7 +1014,7 @@ impl ClaimedTask {
         // matchers + pipelined HGETALL signal_hash / GET
         // signal_payload) lives in
         // `ff_backend_valkey::observe_signals_impl`.
-        let handle = self.synth_handle();
+        let handle = self.cloned_handle();
         self.backend
             .observe_signals(&handle)
             .await
