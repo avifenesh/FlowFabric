@@ -357,11 +357,16 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Per-backend shape:
     ///
     /// * **Valkey** — `HGET {exec}:core current_attempt_index` on the
-    ///   execution's partition. Single command.
+    ///   execution's partition. Single command. A pre-claim execution
+    ///   (`exec_core` present but `current_attempt_index` absent or
+    ///   empty-string) reads back as `0` to match the pre-PR-3 inline
+    ///   SDK semantic — the downstream FCALL then surfaces the proper
+    ///   `NotAResumedExecution` / `ExecutionNotLeaseable` error.
     /// * **Postgres** — `SELECT attempt_index FROM ff_exec_core
-    ///   WHERE partition_key = $1 AND execution_id = $2`.
-    /// * **SQLite** — `SELECT attempt_index FROM ff_exec_core
-    ///   WHERE execution_id = ?`.
+    ///   WHERE partition_key = $1 AND execution_id = $2`; the column
+    ///   is `NOT NULL DEFAULT 0` so a pre-claim row naturally reads
+    ///   back as `0`. Missing row surfaces as `InvalidInput`.
+    /// * **SQLite** — same shape + semantics as PG.
     ///
     /// The default impl returns [`EngineError::Unavailable`] so the
     /// trait addition is non-breaking for out-of-tree backends (same

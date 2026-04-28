@@ -948,20 +948,20 @@ async fn read_current_attempt_index_impl(
         .await
         .map_err(transport_fk)?;
 
-    let Some(s) = raw else {
-        return Err(EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: format!(
-                "read_current_attempt_index: execution not found: {id}"
-            ),
-        });
-    };
-    let idx: u32 = s.parse().map_err(|e| EngineError::Validation {
-        kind: ValidationKind::Corruption,
-        detail: format!(
-            "read_current_attempt_index: exec_core.current_attempt_index not a u32: {s:?}: {e}"
-        ),
-    })?;
+    // Pre-claim state — `exec_core` exists but `current_attempt_index`
+    // is absent or empty-string until the first claim fires. Mirror the
+    // prior SDK inline-`HGET` semantic (`.and_then(parse).unwrap_or(0)`)
+    // so a resume-grant consumed against a not-yet-claimed execution
+    // reaches the backend FCALL / SQL, which then surfaces the proper
+    // business-logic error (`NotAResumedExecution` /
+    // `ExecutionNotLeaseable`) instead of this pre-read blowing up
+    // with `Corruption`. The missing-row case is likewise impossible
+    // on the resume-grant path (grant issuance requires `exec_core`),
+    // so `HGET` on an absent key returning `nil` is mapped to 0 too.
+    let idx = raw
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
     Ok(AttemptIndex::new(idx))
 }
 
