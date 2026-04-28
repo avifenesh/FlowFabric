@@ -281,6 +281,266 @@ impl FlowFabricAdminClient {
             raw_body: raw,
         })
     }
+
+    /// Request a lease-reclaim grant for an execution in
+    /// `lease_expired_reclaimable` or `lease_revoked` state (RFC-024
+    /// §3.5).
+    ///
+    /// Routes `POST /v1/executions/{execution_id}/reclaim`. The
+    /// ff-server handler dispatches through the `EngineBackend` trait
+    /// to whichever backend the server was started with (Valkey /
+    /// Postgres / SQLite).
+    ///
+    /// # worker_capabilities (RFC-024 §3.2 B-2)
+    ///
+    /// The request body carries `worker_capabilities`. Consumers typically
+    /// source these from their registered worker's configured
+    /// `WorkerConfig::capabilities` — the Lua
+    /// `ff_issue_reclaim_grant` validates the requested capability-hash
+    /// against the execution's route snapshot; a mismatch surfaces as
+    /// `IssueReclaimGrantResponse::NotReclaimable { detail:
+    /// "capability_mismatch" }`. The SDK does not re-read worker state
+    /// automatically — admin clients are not bound to a worker — so
+    /// the consumer threads the capabilities through at call-time.
+    ///
+    /// # Consumer flow (RFC-024 §4.4)
+    ///
+    /// 1. Consumer's `POST /v1/runs/:id/complete` returns
+    ///    `lease_expired`.
+    /// 2. Consumer calls this method; handles
+    ///    [`IssueReclaimGrantResponse::Granted`] → builds a
+    ///    [`ff_core::contracts::ReclaimGrant`] via
+    ///    [`IssueReclaimGrantResponse::into_grant`].
+    /// 3. Consumer passes the grant to
+    ///    [`crate::FlowFabricWorker::claim_from_reclaim_grant`] along
+    ///    with a fresh [`ff_core::contracts::ReclaimExecutionArgs`];
+    ///    the new attempt is minted with `HandleKind::Reclaimed`.
+    /// 4. Consumer drives terminal writes on the fresh lease.
+    ///
+    /// # Errors
+    ///
+    /// * [`SdkError::AdminApi`] — non-2xx response. 404 when the
+    ///   execution does not exist; 400 on malformed `execution_id` or
+    ///   body.
+    /// * [`SdkError::Http`] — transport error (connect, body
+    ///   decode, client-side timeout).
+    ///
+    /// # Retry semantics
+    ///
+    /// Idempotent on the Lua side: repeated calls against an execution
+    /// already re-leased (a concurrent reclaim beat this one) surface
+    /// as `NotReclaimable`. Safe to retry on transport faults.
+    pub async fn issue_reclaim_grant(
+        &self,
+        execution_id: &str,
+        req: IssueReclaimGrantRequest,
+    ) -> Result<IssueReclaimGrantResponse, SdkError> {
+        // Percent-encode `execution_id` in the URL path — the id is a
+        // free-form string and splicing verbatim would produce
+        // malformed URLs. Mirrors `claim_for_worker`'s handling.
+        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| SdkError::Config {
+            context: "admin_client: issue_reclaim_grant".into(),
+            field: Some("base_url".into()),
+            message: format!("invalid base_url '{}': {e}", self.base_url),
+        })?;
+        {
+            let mut segs = url.path_segments_mut().map_err(|_| SdkError::Config {
+                context: "admin_client: issue_reclaim_grant".into(),
+                field: Some("base_url".into()),
+                message: format!("base_url cannot be a base URL: '{}'", self.base_url),
+            })?;
+            segs.extend(&["v1", "executions", execution_id, "reclaim"]);
+        }
+        let url = url.to_string();
+        let resp = self
+            .http
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| SdkError::Http {
+                source: e,
+                context: "POST /v1/executions/{id}/reclaim".into(),
+            })?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .json::<IssueReclaimGrantResponse>()
+                .await
+                .map_err(|e| SdkError::Http {
+                    source: e,
+                    context: "decode issue_reclaim_grant response body".into(),
+                });
+        }
+
+        let status_u16 = status.as_u16();
+        let raw = resp.text().await.map_err(|e| SdkError::Http {
+            source: e,
+            context: format!(
+                "read issue_reclaim_grant error body (status {status_u16})"
+            ),
+        })?;
+        let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
+        Err(SdkError::AdminApi {
+            status: status_u16,
+            message: parsed
+                .as_ref()
+                .map(|b| b.error.clone())
+                .unwrap_or_else(|| raw.clone()),
+            kind: parsed.as_ref().and_then(|b| b.kind.clone()),
+            retryable: parsed.as_ref().and_then(|b| b.retryable),
+            raw_body: raw,
+        })
+    }
+}
+
+/// Request body for `POST /v1/executions/{execution_id}/reclaim`
+/// (RFC-024 §3.5).
+///
+/// Mirrors `ff_server::api::IssueReclaimGrantBody` 1:1. The
+/// `execution_id` goes in the URL path, not the body.
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueReclaimGrantRequest {
+    /// Worker identity requesting the grant. The Lua
+    /// `ff_reclaim_execution` validates grant consumption via
+    /// `grant.worker_id == args.worker_id` (RFC-024 §4.4) — the
+    /// worker consuming the grant must match this value.
+    pub worker_id: String,
+    /// Worker-instance identity. Informational at grant-issuance
+    /// time; stored on the grant so consumers can correlate events.
+    pub worker_instance_id: String,
+    /// Lane the execution belongs to. Needed by
+    /// `ff_issue_reclaim_grant` for `KEYS[*]` construction.
+    pub lane_id: String,
+    /// Capability hash for capability-match validation; `None` to
+    /// skip the match (the Lua's `ARGV[5]` defaults to empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_hash: Option<String>,
+    /// Grant TTL in milliseconds. Bounded server-side.
+    pub grant_ttl_ms: u64,
+    /// Route snapshot JSON carried onto the grant for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_snapshot_json: Option<String>,
+    /// Admission summary string carried onto the grant for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_summary: Option<String>,
+    /// Worker capability tokens. Consumers typically source these
+    /// from their registered worker's `WorkerConfig::capabilities`
+    /// (see [`FlowFabricAdminClient::issue_reclaim_grant`] rustdoc
+    /// for the override contract).
+    #[serde(default)]
+    pub worker_capabilities: Vec<String>,
+}
+
+/// Response body for `POST /v1/executions/{execution_id}/reclaim`
+/// (RFC-024 §3.5).
+///
+/// The server serializes this struct with a `status` discriminator so
+/// consumers can match on structured outcomes without re-parsing a
+/// 200-vs-4xx split for business-logic outcomes (mirrors
+/// `RotateWaitpointSecretResponse`'s precedent).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum IssueReclaimGrantResponse {
+    /// Grant issued. Build a
+    /// [`ff_core::contracts::ReclaimGrant`] via
+    /// [`Self::into_grant`] and feed it to
+    /// [`crate::FlowFabricWorker::claim_from_reclaim_grant`].
+    Granted {
+        execution_id: String,
+        partition_key: ff_core::partition::PartitionKey,
+        grant_key: String,
+        expires_at_ms: u64,
+        lane_id: String,
+    },
+    /// Execution is not in a reclaimable state (not
+    /// `lease_expired_reclaimable` / `lease_revoked`).
+    NotReclaimable {
+        execution_id: String,
+        detail: String,
+    },
+    /// `max_reclaim_count` exceeded; execution transitioned to
+    /// terminal_failed. Consumers stop retrying and surface a
+    /// structural failure.
+    ReclaimCapExceeded {
+        execution_id: String,
+        reclaim_count: u32,
+    },
+}
+
+impl IssueReclaimGrantResponse {
+    /// Convert a [`Self::Granted`] response into a typed
+    /// [`ff_core::contracts::ReclaimGrant`] for handoff to
+    /// [`crate::FlowFabricWorker::claim_from_reclaim_grant`].
+    ///
+    /// Returns [`SdkError::AdminApi`] when the wire variant is not
+    /// `Granted` (consumer asked for a grant but the server replied
+    /// with a terminal outcome) or when `execution_id` / `lane_id`
+    /// are malformed — the latter signals a drift between server and
+    /// SDK, so failing loud prevents silent misrouting.
+    pub fn into_grant(self) -> Result<ff_core::contracts::ReclaimGrant, SdkError> {
+        match self {
+            IssueReclaimGrantResponse::Granted {
+                execution_id,
+                partition_key,
+                grant_key,
+                expires_at_ms,
+                lane_id,
+            } => {
+                let eid = ff_core::types::ExecutionId::parse(&execution_id)
+                    .map_err(|e| SdkError::AdminApi {
+                        status: 200,
+                        message: format!(
+                            "issue_reclaim_grant: server returned malformed execution_id '{execution_id}': {e}"
+                        ),
+                        kind: Some("malformed_response".to_owned()),
+                        retryable: Some(false),
+                        raw_body: String::new(),
+                    })?;
+                let lane = ff_core::types::LaneId::try_new(lane_id.clone())
+                    .map_err(|e| SdkError::AdminApi {
+                        status: 200,
+                        message: format!(
+                            "issue_reclaim_grant: server returned malformed lane_id '{lane_id}': {e}"
+                        ),
+                        kind: Some("malformed_response".to_owned()),
+                        retryable: Some(false),
+                        raw_body: String::new(),
+                    })?;
+                Ok(ff_core::contracts::ReclaimGrant::new(
+                    eid,
+                    partition_key,
+                    grant_key,
+                    expires_at_ms,
+                    lane,
+                ))
+            }
+            IssueReclaimGrantResponse::NotReclaimable { execution_id, detail } => {
+                Err(SdkError::AdminApi {
+                    status: 200,
+                    message: format!(
+                        "issue_reclaim_grant: execution '{execution_id}' not reclaimable: {detail}"
+                    ),
+                    kind: Some("not_reclaimable".to_owned()),
+                    retryable: Some(false),
+                    raw_body: String::new(),
+                })
+            }
+            IssueReclaimGrantResponse::ReclaimCapExceeded {
+                execution_id,
+                reclaim_count,
+            } => Err(SdkError::AdminApi {
+                status: 200,
+                message: format!(
+                    "issue_reclaim_grant: execution '{execution_id}' hit reclaim cap ({reclaim_count})"
+                ),
+                kind: Some("reclaim_cap_exceeded".to_owned()),
+                retryable: Some(false),
+                raw_body: String::new(),
+            }),
+        }
+    }
 }
 
 /// Request body for `POST /v1/admin/rotate-waitpoint-secret`.

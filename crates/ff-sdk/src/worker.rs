@@ -1516,6 +1516,91 @@ impl FlowFabricWorker {
         Ok(task)
     }
 
+    /// Consume a [`ReclaimGrant`] to mint a fresh attempt for a
+    /// lease-expired / lease-revoked execution (RFC-024 §3.4).
+    ///
+    /// Backend-agnostic. Routes through
+    /// [`EngineBackend::reclaim_execution`] on whatever backend the
+    /// worker was connected with (Valkey via `connect` / `connect_with`,
+    /// Postgres / SQLite via `connect_with`). Distinct from
+    /// [`claim_from_resume_grant`]: reclaim creates a NEW attempt row
+    /// and bumps `lease_reclaim_count` (`HandleKind::Reclaimed`), while
+    /// resume re-uses the existing attempt under
+    /// `ff_claim_resumed_execution` (`HandleKind::Resumed`).
+    ///
+    /// # Return shape
+    ///
+    /// Returns the raw [`ReclaimExecutionOutcome`] so consumers match
+    /// on the four outcomes (`Claimed(Handle)`, `NotReclaimable`,
+    /// `ReclaimCapExceeded`, `GrantNotFound`) and decide their
+    /// dispatch. The `Claimed` variant carries a [`Handle`] whose
+    /// `kind` is [`HandleKind::Reclaimed`]; downstream ops (complete,
+    /// fail, renew, append_frame, …) take the handle directly via the
+    /// `EngineBackend` trait.
+    ///
+    /// This contrasts with [`claim_from_resume_grant`], which wraps
+    /// the handle in a [`ClaimedTask`] with a concurrency-permit and
+    /// auto-lease-renewal loop. Those affordances are
+    /// `valkey-default`-gated today (they depend on the bundled
+    /// `ferriskey::Client` + `lease_ttl_ms` renewal timer). The
+    /// reclaim surface is intentionally narrower so it compiles under
+    /// `--no-default-features, features = ["sqlite"]` and consumers
+    /// can drive the reclaim flow on any backend.
+    ///
+    /// # Feature compatibility
+    ///
+    /// No cfg-gate. Compiles + runs under every feature set ff-sdk
+    /// supports (including sqlite-only). Verified by the compile-time
+    /// type assertion in `sqlite_only_compile_surface_tests`.
+    ///
+    /// # worker_capabilities
+    ///
+    /// `ReclaimExecutionArgs::worker_capabilities` is NOT part of the
+    /// Lua FCALL (the reclaim Lua validates grant consumption via
+    /// `grant.worker_id == args.worker_id` only — see
+    /// `crates/ff-script/src/flowfabric.lua:3088` and RFC-024 §4.4).
+    /// Capability matching happens at grant-issuance time (see
+    /// [`FlowFabricAdminClient::issue_reclaim_grant`]
+    /// — in the `ff-sdk::admin` module, `valkey-default`-gated).
+    ///
+    /// # Errors
+    ///
+    /// * [`SdkError::Engine`] — the backend's `reclaim_execution`
+    ///   returned an [`EngineError`] (transport fault, validation
+    ///   failure, `Unavailable` from a backend that does not
+    ///   implement RFC-024 — currently only pre-RFC out-of-tree
+    ///   backends).
+    ///
+    /// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
+    /// [`ReclaimExecutionOutcome`]: ff_core::contracts::ReclaimExecutionOutcome
+    /// [`Handle`]: ff_core::backend::Handle
+    /// [`HandleKind::Reclaimed`]: ff_core::backend::HandleKind::Reclaimed
+    /// [`EngineBackend::reclaim_execution`]: ff_core::engine_backend::EngineBackend::reclaim_execution
+    /// [`EngineError`]: ff_core::engine_error::EngineError
+    /// [`claim_from_resume_grant`]: FlowFabricWorker::claim_from_resume_grant
+    /// [`FlowFabricAdminClient::issue_reclaim_grant`]: crate::admin::FlowFabricAdminClient::issue_reclaim_grant
+    pub async fn claim_from_reclaim_grant(
+        &self,
+        _grant: ff_core::contracts::ReclaimGrant,
+        args: ff_core::contracts::ReclaimExecutionArgs,
+    ) -> Result<ff_core::contracts::ReclaimExecutionOutcome, SdkError> {
+        // `ReclaimGrant` is accepted as a parameter so the call-site
+        // shape matches RFC-024 §3.4 (consumer receives a grant from
+        // `issue_reclaim_grant` and feeds it + args into
+        // `claim_from_reclaim_grant`). The grant metadata is
+        // already embedded in the backend's server-side store
+        // (Valkey `claim_grant` hash, PG/SQLite `ff_claim_grant`
+        // table) keyed by (execution_id, grant_key) — the trait
+        // method looks it up from `args.execution_id`. Binding the
+        // grant to the signature preserves the two-step flow on
+        // the consumer API without a runtime assertion that the
+        // grant matches the args.
+        self.backend
+            .reclaim_execution(args)
+            .await
+            .map_err(|e| SdkError::Engine(Box::new(e)))
+    }
+
     /// Low-level resume claim. Forwards through
     /// [`EngineBackend::claim_resumed_execution`](ff_core::engine_backend::EngineBackend::claim_resumed_execution)
     /// — the trait-level trigger surface landed in issue #150 — and

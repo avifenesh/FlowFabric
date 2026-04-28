@@ -165,24 +165,197 @@ test bodies (unsafe under parallel test harness on Rust 2024).
 | `FF_SQLITE_PATH` | `:memory:` | File path (`/tmp/ff-dev.db`) or URI (`file:name?mode=memory&cache=shared`). |
 | `FF_SQLITE_POOL_SIZE` | `4` | Pool size (1 writer + N–1 readers). |
 
+### 7. RFC-024 — lease-reclaim consumer surface
+
+RFC-024 (accepted 2026-04-26) lands in v0.12.0 alongside RFC-023.
+Closes the pull-mode deadlock at issue #371: consumers that drive
+FlowFabric one HTTP request at a time (cairn-fabric's model) could
+previously hit `lease_expired` on `POST /v1/runs/:id/complete` and
+have NO recovery path — `ff_issue_claim_grant` rejected with
+`execution_not_eligible` because the execution was in
+`lifecycle_phase = active`, not `runnable`. RFC-024 adds a dedicated
+admission path for the `lease_expired_reclaimable` / `lease_revoked`
+states.
+
+#### Breaking changes (pre-existing surfaces)
+
+These landed in PR-B/PR-C and are already documented in
+`CHANGELOG.md`:
+
+- **`ReclaimGrant` renamed to `ResumeGrant`** (the pre-RFC type
+  always represented the resume-after-suspend semantic). `cargo fix`
+  handles most call-sites.
+- **Trait method rename** `EngineBackend::claim_from_reclaim` →
+  `EngineBackend::claim_from_resume_grant`. Matching SDK method
+  rename on `FlowFabricWorker`.
+- **`ReclaimExecutionArgs::max_reclaim_count`** type change:
+  `u32` → `Option<u32>`. `None` ⇒ Rust-surface default of 1000
+  (RFC-024 §4.6). Existing callers passing a value wrap in
+  `Some(...)`; the Lua fallback of 100 still applies to pre-RFC
+  call sites (wire-compatible under `#[serde(default)]`).
+- **`#[non_exhaustive]`** added to `ClaimGrant`, `ResumeGrant`,
+  new `ReclaimGrant`, `IssueReclaimGrantArgs`,
+  `ReclaimExecutionArgs`. Each type gains an explicit `::new`
+  constructor (per
+  `feedback_non_exhaustive_needs_constructor`).
+- **`HandleKind::Reclaimed`** variant added. `HandleKind` is already
+  `#[non_exhaustive]`; consumers matching exhaustively add an arm
+  (or rely on `_ =>` fallthrough).
+
+#### Additive (PR-G — this release)
+
+The three new consumer surfaces in v0.12.0:
+
+- `FlowFabricAdminClient::issue_reclaim_grant(&self, execution_id,
+  IssueReclaimGrantRequest) -> Result<IssueReclaimGrantResponse,
+  SdkError>` — HTTP `POST /v1/executions/{id}/reclaim`. Admits the
+  execution into the reclaim path; returns a `Granted` /
+  `NotReclaimable` / `ReclaimCapExceeded` outcome.
+- `FlowFabricWorker::claim_from_reclaim_grant(&self, ReclaimGrant,
+  ReclaimExecutionArgs) -> Result<ReclaimExecutionOutcome,
+  SdkError>` — backend-agnostic. Dispatches through
+  `EngineBackend::reclaim_execution` on whichever backend the
+  worker was connected with. NOT `valkey-default`-gated; compiles
+  and runs under `--no-default-features, features = ["sqlite"]`.
+- `POST /v1/executions/{id}/reclaim` HTTP endpoint on `ff-server`.
+  Request body carries worker identity + lane + capabilities;
+  response is a `status`-discriminated JSON outcome.
+
+#### Cairn migration pattern — F64 bridge retry loop → reclaim
+
+Pre-RFC cairn-fabric pattern at `cairn-rs/.../f64_bridge.rs`
+(marked `remove once FF#371 ships`):
+
+```rust
+// BEFORE (v0.11): retry-with-backoff on lease_expired. Eventually
+// fails because `ff_issue_claim_grant` gates on runnable phase.
+loop {
+    match worker.complete(handle, output).await {
+        Err(SdkError::Engine(e)) if is_lease_expired(&e) => {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;  // retries until grant_ttl drifts out
+        }
+        other => return other,
+    }
+}
+```
+
+```rust
+// AFTER (v0.12): one-shot reclaim on lease_expired.
+use ff_sdk::admin::{FlowFabricAdminClient, IssueReclaimGrantRequest};
+use ff_core::contracts::ReclaimExecutionArgs;
+
+match worker.complete(handle, output).await {
+    Err(SdkError::Engine(e)) if is_lease_expired(&e) => {
+        // 1. Issue a reclaim grant via the admin HTTP surface.
+        let req = IssueReclaimGrantRequest {
+            worker_id: worker.config().worker_id.to_string(),
+            worker_instance_id:
+                worker.config().worker_instance_id.to_string(),
+            lane_id: lane.to_string(),
+            capability_hash: None,
+            grant_ttl_ms: 30_000,
+            route_snapshot_json: None,
+            admission_summary: None,
+            worker_capabilities: worker
+                .config()
+                .capabilities
+                .clone(),
+        };
+        let resp = admin
+            .issue_reclaim_grant(&execution_id.to_string(), req)
+            .await?;
+        let grant = resp.into_grant()?; // → SdkError on non-Granted
+
+        // 2. Consume the grant to mint a fresh attempt.
+        let args = ReclaimExecutionArgs::new(
+            execution_id.clone(),
+            worker.config().worker_id.clone(),
+            worker.config().worker_instance_id.clone(),
+            lane.clone(),
+            None,                               // capability_hash
+            new_lease_id,
+            worker.config().lease_ttl_ms,
+            new_attempt_id,
+            String::new(),                      // attempt_policy_json
+            None,                               // max_reclaim_count → 1000
+            old_worker_instance_id,
+            current_attempt_index,
+        );
+        match worker.claim_from_reclaim_grant(grant, args).await? {
+            ReclaimExecutionOutcome::Claimed(handle) => {
+                // 3. Retry the terminal write on the fresh lease.
+                worker.complete(&handle, output).await
+            }
+            ReclaimExecutionOutcome::NotReclaimable { detail, .. } => {
+                Err(structural_error(&format!(
+                    "reclaim rejected: {detail}"
+                )))
+            }
+            ReclaimExecutionOutcome::ReclaimCapExceeded {
+                reclaim_count, ..
+            } => {
+                Err(structural_error(&format!(
+                    "reclaim cap exceeded at {reclaim_count}"
+                )))
+            }
+            ReclaimExecutionOutcome::GrantNotFound { .. } => {
+                Err(structural_error("reclaim grant not found"))
+            }
+            _ => Err(structural_error("unknown reclaim outcome")),
+        }
+    }
+    other => other,
+}
+```
+
+The operator gap between `issue_reclaim_grant` and
+`claim_from_reclaim_grant` is sub-100ms in-process; the
+two-FCALL timing window is orders of magnitude tighter than #371's
+original `complete`-vs-operator-pause gap (RFC-024 §7.3).
+
+#### Handle-kind awareness
+
+After `claim_from_reclaim_grant` returns `Claimed(handle)`, the
+handle's `kind` is `HandleKind::Reclaimed` (distinct from
+`HandleKind::Fresh` / `HandleKind::Resumed`). Downstream
+metrics/tracing paths that already match on
+`HandleKind::Fresh` vs `HandleKind::Resumed` should add a
+`Reclaimed` arm to distinguish first-attempt vs resume-after-suspend
+vs reclaim-after-lease-expiry observability. The enum is
+`#[non_exhaustive]`; consumers can `_ =>` fallthrough instead.
+
+#### `ReclaimGrant` vs `ResumeGrant` — do not confuse
+
+Cairn migrators holding a pre-v0.12 `ReclaimGrant` variable: the
+v0.12 `ReclaimGrant` is a **new, distinct** type for the
+lease-reclaim path. The rename you need to apply to your existing
+code is `ReclaimGrant → ResumeGrant` (the pre-RFC type was
+always a resume grant — the name was the bug; RFC-024 §3.1). Only
+reach for the new `ReclaimGrant` when wiring the #371 recovery
+flow.
+
 ## What's next for cairn
 
-- **RFC-024 reclaim wiring** — accepted 2026-04-26, landing v0.13.
-  Adds a dedicated claim-grant/reclaim-grant table on Postgres +
-  SQLite to unblock pull-mode deadlock scenarios. Consumer migration
-  for RFC-024 will be **additive** — no breaking changes to the
-  existing claim/reclaim surface — but cairn should review
-  `rfcs/RFC-024-reclaim-wiring.md` to understand the new admission
-  path. Tracking issue #371.
+- **Land the RFC-024 consumer migration** — replace the
+  `F64 bridge retry loop` with the snippet above, drop the
+  `remove once FF#371 ships` comment, close tracking issue #371.
+- **Optional: capability-hash correlation** — the
+  `IssueReclaimGrantRequest::capability_hash` field maps to the
+  execution's route-snapshot capability hash. Cairn's existing
+  capability plumbing at admission time can surface the same
+  hash on reclaim for stricter capability-match validation;
+  passing `None` (the ergonomic default) reuses the admission-
+  time stored hash.
 
 ## Non-changes
 
-- No Rust API break on Valkey or Postgres hot paths.
-- No wire-format change on the HTTP / JSON surface.
-- Valkey backend behaviour unchanged.
-- No new trait methods on `EngineBackend`.
-- `HandleKind` unchanged (three variants: `Fresh`, `Resumed`,
-  `Suspended`).
+- No Rust API break on Valkey or Postgres hot paths **outside
+  the RFC-024 rename-set above**.
+- No wire-format change on the HTTP / JSON surface **other than
+  the additive `POST /v1/executions/{id}/reclaim` endpoint**.
+- Valkey backend claim/resume hot-path behaviour unchanged —
+  reclaim is a new, additive path.
 
 ## Upgrade checklist
 

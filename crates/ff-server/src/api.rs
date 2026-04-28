@@ -608,6 +608,15 @@ pub fn router_with_metrics(
             "/v1/executions/{id}/revoke-lease",
             with_body_limit(post(revoke_lease), BODY_LIMIT_CONTROL),
         )
+        // RFC-024 PR-G: consumer-requested lease-reclaim grant for
+        // executions in lease_expired_reclaimable / lease_revoked
+        // state. Dispatches through the backend trait's
+        // `issue_reclaim_grant`; all three in-tree backends
+        // (Valkey/PG/SQLite) implement it at v0.12.0.
+        .route(
+            "/v1/executions/{id}/reclaim",
+            with_body_limit(post(issue_reclaim_grant), BODY_LIMIT_CONTROL),
+        )
         // Scheduler-routed claim (Batch C item 2). Worker POSTs lane +
         // identity + capabilities; server runs budget/quota/capability
         // admission via ff-scheduler and returns a ClaimGrant on
@@ -1137,6 +1146,136 @@ async fn revoke_lease(
         reason: "operator_revoke".to_owned(),
     };
     Ok(Json(server.backend().revoke_lease(args).await?))
+}
+
+// ── RFC-024 PR-G: issue reclaim grant ──
+//
+// `POST /v1/executions/{id}/reclaim` admits executions in
+// `lease_expired_reclaimable` or `lease_revoked` state into the
+// reclaim path. The handler dispatches through
+// `EngineBackend::issue_reclaim_grant`; all three in-tree backends
+// implement it at v0.12.0. Default-impl returns `Unavailable` for
+// out-of-tree backends so the handler surfaces 503 rather than a
+// mis-parsed error.
+
+#[derive(Deserialize)]
+struct IssueReclaimGrantBody {
+    worker_id: String,
+    worker_instance_id: String,
+    lane_id: String,
+    #[serde(default)]
+    capability_hash: Option<String>,
+    grant_ttl_ms: u64,
+    #[serde(default)]
+    route_snapshot_json: Option<String>,
+    #[serde(default)]
+    admission_summary: Option<String>,
+    #[serde(default)]
+    worker_capabilities: Vec<String>,
+}
+
+/// Wire shape for `ff_core::contracts::ReclaimGrant`. Opaque
+/// `partition_key` follows the `ClaimGrantDto` precedent (issue
+/// #91); consumers carry it verbatim back to
+/// `claim_from_reclaim_grant` without peeking at `PartitionFamily`.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum IssueReclaimGrantResponseDto {
+    Granted {
+        execution_id: String,
+        partition_key: ff_core::partition::PartitionKey,
+        grant_key: String,
+        expires_at_ms: u64,
+        lane_id: String,
+    },
+    NotReclaimable {
+        execution_id: String,
+        detail: String,
+    },
+    ReclaimCapExceeded {
+        execution_id: String,
+        reclaim_count: u32,
+    },
+}
+
+/// Maximum grant TTL accepted — mirrors `CLAIM_GRANT_TTL_MS_MAX` so
+/// a misconfigured client can't squat an execution on a multi-hour
+/// reclaim grant.
+const RECLAIM_GRANT_TTL_MS_MAX: u64 = 60_000;
+
+async fn issue_reclaim_grant(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    AppJson(body): AppJson<IssueReclaimGrantBody>,
+) -> Result<Response, ApiError> {
+    let execution_id = parse_execution_id(&id)?;
+    validate_identifier("worker_id", &body.worker_id)?;
+    validate_identifier("worker_instance_id", &body.worker_instance_id)?;
+    let worker_id = WorkerId::new(body.worker_id);
+    let worker_instance_id = WorkerInstanceId::new(body.worker_instance_id);
+    let lane_id = LaneId::try_new(body.lane_id).map_err(|e| {
+        ApiError(ServerError::InvalidInput(format!("lane_id: {e}")))
+    })?;
+    if body.grant_ttl_ms == 0 || body.grant_ttl_ms > RECLAIM_GRANT_TTL_MS_MAX {
+        return Err(ApiError(ServerError::InvalidInput(format!(
+            "grant_ttl_ms must be in 1..={RECLAIM_GRANT_TTL_MS_MAX}"
+        ))));
+    }
+    let caps: std::collections::BTreeSet<String> =
+        body.worker_capabilities.into_iter().collect();
+
+    let args = ff_core::contracts::IssueReclaimGrantArgs::new(
+        execution_id.clone(),
+        worker_id,
+        worker_instance_id,
+        lane_id.clone(),
+        body.capability_hash,
+        body.grant_ttl_ms,
+        body.route_snapshot_json,
+        body.admission_summary,
+        caps,
+        ff_core::types::TimestampMs::now(),
+    );
+
+    match server.backend().issue_reclaim_grant(args).await? {
+        IssueReclaimGrantOutcome::Granted(grant) => {
+            let dto = IssueReclaimGrantResponseDto::Granted {
+                execution_id: grant.execution_id.to_string(),
+                partition_key: grant.partition_key,
+                grant_key: grant.grant_key,
+                expires_at_ms: grant.expires_at_ms,
+                lane_id: grant.lane_id.as_str().to_owned(),
+            };
+            Ok((StatusCode::OK, Json(dto)).into_response())
+        }
+        IssueReclaimGrantOutcome::NotReclaimable { execution_id, detail } => {
+            let dto = IssueReclaimGrantResponseDto::NotReclaimable {
+                execution_id: execution_id.to_string(),
+                detail,
+            };
+            Ok((StatusCode::OK, Json(dto)).into_response())
+        }
+        IssueReclaimGrantOutcome::ReclaimCapExceeded {
+            execution_id,
+            reclaim_count,
+        } => {
+            let dto = IssueReclaimGrantResponseDto::ReclaimCapExceeded {
+                execution_id: execution_id.to_string(),
+                reclaim_count,
+            };
+            Ok((StatusCode::OK, Json(dto)).into_response())
+        }
+        // `IssueReclaimGrantOutcome` is `#[non_exhaustive]`; surface
+        // any future variant as 503 pointing at a client/server
+        // version mismatch.
+        _ => Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody::plain(
+                "issue_reclaim_grant: backend returned a non-exhaustive outcome this server build does not understand".to_owned(),
+            )),
+        )
+            .into_response()),
+    }
 }
 
 // ── Scheduler-routed claim (Batch C item 2 PR-B) ──
