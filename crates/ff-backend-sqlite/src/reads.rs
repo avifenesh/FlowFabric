@@ -438,3 +438,50 @@ pub(crate) async fn read_current_attempt_index_impl(
     })?;
     Ok(ff_core::types::AttemptIndex::new(attempt_index_u))
 }
+
+// ─── read_total_attempt_count (v0.12 PR-5.5 retry-path fix) ────────
+
+/// Point-read of `total_attempt_count` from `ff_exec_core.raw_fields`
+/// JSON. The field is stored as a JSON string inside the raw_fields
+/// bag (seeded to `"0"` by `build_raw_fields`) — mirrors PG.
+///
+/// SQL uses `CAST(json_extract(raw_fields, '$.total_attempt_count')
+/// AS INTEGER)`; the same idiom `queries/operator.rs` uses for
+/// `replay_count`. Missing row → `InvalidInput`; missing/null field →
+/// `0` (FCALL surface handles the loud error case).
+pub(crate) async fn read_total_attempt_count_impl(
+    pool: &SqlitePool,
+    id: &ExecutionId,
+) -> Result<ff_core::types::AttemptIndex, EngineError> {
+    let (part, exec_uuid) = split_exec_id(id)?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT CAST(json_extract(raw_fields, '$.total_attempt_count')
+                    AS INTEGER) AS total_attempt_count
+          FROM ff_exec_core
+         WHERE partition_key = ?1 AND execution_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "read_total_attempt_count: execution not found: {id}"
+            ),
+        });
+    };
+    let total_i: Option<i64> = row
+        .try_get("total_attempt_count")
+        .map_err(map_sqlx_error)?;
+    let count = total_i
+        .and_then(|v| u32::try_from(v.max(0)).ok())
+        .unwrap_or(0);
+    Ok(ff_core::types::AttemptIndex::new(count))
+}

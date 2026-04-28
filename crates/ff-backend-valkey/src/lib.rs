@@ -968,6 +968,47 @@ async fn read_current_attempt_index_impl(
     Ok(AttemptIndex::new(idx))
 }
 
+/// Point-read of the execution's **total attempt counter** from the
+/// `{exec}:core` hash. Single `HGET total_attempt_count` — the same
+/// field Lua 5920's `ff_claim_execution` consults when computing
+/// `next_att_idx`. Missing hash / missing field / empty string all
+/// map to `0` (pre-claim state, first-claim about to mint attempt 0);
+/// the FCALL itself surfaces the loud error if the exec truly
+/// doesn't exist.
+///
+/// Distinct from [`read_current_attempt_index_impl`] — this is the
+/// monotonic counter used to assign the *next* attempt on a fresh
+/// claim, not the pointer at the currently-leased attempt row. See
+/// `EngineBackend::read_total_attempt_count` rustdoc for the
+/// retry-path bug this split fixes.
+#[tracing::instrument(
+    name = "ff.read_total_attempt_count",
+    skip_all,
+    fields(backend = "valkey", execution_id = %id)
+)]
+async fn read_total_attempt_count_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<AttemptIndex, EngineError> {
+    let partition = execution_partition(id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, id);
+
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("total_attempt_count")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    let count = raw
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    Ok(AttemptIndex::new(count))
+}
+
 /// List suspended executions in one partition, cursor-paginated,
 /// with suspension `reason_code` populated per entry (issue #183).
 ///
@@ -5114,6 +5155,20 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "read_current_attempt_index: HGET exec_core.current_attempt_index",
+                )
+            })
+    }
+
+    async fn read_total_attempt_count(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<AttemptIndex, EngineError> {
+        read_total_attempt_count_impl(&self.client, &self.partition_config, execution_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "read_total_attempt_count: HGET exec_core.total_attempt_count",
                 )
             })
     }

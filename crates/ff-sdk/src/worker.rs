@@ -795,15 +795,25 @@ impl FlowFabricWorker {
         partition: &ff_core::partition::Partition,
         now: TimestampMs,
     ) -> Result<ClaimedTask, SdkError> {
-        // v0.12 PR-5.5 — pre-read the expected attempt index via the
-        // `EngineBackend::read_current_attempt_index` trait method
-        // (PR-3). Replaces the pre-PR inline `HGET total_attempt_count`
-        // against the Valkey client. The trait impl wraps the same HGET
-        // so the Valkey wire is preserved byte-for-byte; the PG/SQLite
-        // impls fulfill the same contract on their tables.
+        // v0.12 PR-5.5 retry-path fix — pre-read the **total attempt
+        // counter**, not the current-attempt pointer. The fresh-claim
+        // path mints a new attempt row whose index is the counter's
+        // current value (the backend's Lua 5920 / PG `ff_claim_execution`
+        // / SQLite `claim_impl` all consult this same counter to compute
+        // `next_att_idx`). Pre-PR-5.5 this call went inline as `HGET
+        // {exec}:core total_attempt_count` on the Valkey client; the
+        // first PR-5.5 landing mistakenly routed it to
+        // `read_current_attempt_index`, which returns the *pointer* at
+        // the previously-leased attempt — on a retry-of-a-retry that
+        // still named the terminal-failed prior attempt and the new
+        // claim collided with it. `read_total_attempt_count` wraps
+        // the same byte-for-byte HGET on Valkey and provides the JSONB
+        // / json_extract equivalents on PG / SQLite. See
+        // `EngineBackend::read_total_attempt_count` rustdoc for the
+        // pointer-vs-counter distinction.
         let att_idx = self
             .backend
-            .read_current_attempt_index(execution_id)
+            .read_total_attempt_count(execution_id)
             .await
             .map_err(|e| SdkError::Engine(Box::new(e)))?;
 
@@ -1681,6 +1691,24 @@ mod sqlite_only_compile_surface_tests {
             id: &ExecutionId,
         ) -> Result<AttemptIndex, EngineError> {
             b.read_current_attempt_index(id).await
+        }
+    }
+
+    /// v0.12 PR-5.5 retry-path-fix compile anchor — the new
+    /// [`EngineBackend::read_total_attempt_count`] trait method MUST
+    /// be addressable under `--no-default-features --features sqlite`.
+    /// Mirrors the PR-3 `read_current_attempt_index` anchor.
+    #[test]
+    fn read_total_attempt_count_addressable_under_sqlite_only() {
+        use ff_core::engine_error::EngineError;
+        use ff_core::types::{AttemptIndex, ExecutionId};
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            id: &ExecutionId,
+        ) -> Result<AttemptIndex, EngineError> {
+            b.read_total_attempt_count(id).await
         }
     }
 
