@@ -1079,6 +1079,30 @@ pub trait EngineBackend: Send + Sync + 'static {
         "unknown"
     }
 
+    /// Backend downcast escape hatch (v0.12 PR-7a transitional).
+    ///
+    /// Scanner supervisors in `ff-engine` still dispatch through a
+    /// concrete `ferriskey::Client`; to keep the engine's public
+    /// boundary backend-agnostic (`Arc<dyn EngineBackend>`) while the
+    /// scanner internals remain Valkey-shaped, the engine downcasts
+    /// via this method and reaches in for the embedded client. Every
+    /// backend that wants to be consumed by `Engine::start_with_completions`
+    /// overrides this to return `self` as `&dyn Any`; the default
+    /// returns a placeholder so a stray `downcast_ref` fails cleanly
+    /// rather than risking unsound behaviour.
+    ///
+    /// v0.13 (PR-7b) will trait-ify individual scanners onto
+    /// `EngineBackend` and retire `ff-engine`'s dependence on this
+    /// downcast path. The method itself will remain on the trait
+    /// (likely deprecated) rather than be removed — removing a
+    /// public trait method is a breaking change for external
+    /// `impl EngineBackend` blocks.
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        // Placeholder so the default does not expose `Self` for
+        // downcast. Backends override to return `self`.
+        &()
+    }
+
     /// RFC-018 Stage A: snapshot of this backend's identity + the
     /// flat `Supports` surface it can actually service. Consumers use
     /// this at startup to gate UI features / choose between alternative

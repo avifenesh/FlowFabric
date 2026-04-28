@@ -1072,6 +1072,7 @@ version = "0.11.0"
 dependencies = [
  "ferriskey",
  "ff-backend-postgres",
+ "ff-backend-valkey",
  "ff-core",
  "ff-observability",
  "futures",

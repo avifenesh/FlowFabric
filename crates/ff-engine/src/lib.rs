@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
 use ff_core::completion_backend::CompletionStream;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::partition::PartitionConfig;
 use ff_core::types::LaneId;
 use tokio::sync::watch;
@@ -188,10 +189,20 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Start the engine with the given config and Valkey client.
+    /// Start the engine with the given config and backend.
     ///
     /// Spawns background scanner tasks. Returns immediately.
-    pub fn start(config: EngineConfig, client: ferriskey::Client) -> Self {
+    ///
+    /// `backend` must be a backend whose [`EngineBackend::as_any`]
+    /// downcasts to a supported concrete type. In v0.12 (PR-7a) that
+    /// is [`ff_backend_valkey::ValkeyBackend`] only; v0.13 (PR-7b)
+    /// will trait-ify the scanner surface and accept any
+    /// `EngineBackend` implementation. Passing a non-Valkey backend
+    /// today panics immediately inside this constructor (before any
+    /// scanner tasks are spawned) — by design; the cairn embedding
+    /// path that motivated this signature goes through Valkey until
+    /// the trait-ification lands.
+    pub fn start(config: EngineConfig, backend: Arc<dyn EngineBackend>) -> Self {
         // Construct a fresh metrics handle here so direct callers
         // (examples, tests) don't need to. Under the default build
         // (`observability` feature off) this is the no-op shim. With
@@ -201,7 +212,7 @@ impl Engine {
         // isolation. Production code uses
         // [`Self::start_with_metrics`] to plumb the same handle
         // through the HTTP /metrics route.
-        Self::start_with_metrics(config, client, Arc::new(ff_observability::Metrics::new()))
+        Self::start_with_metrics(config, backend, Arc::new(ff_observability::Metrics::new()))
     }
 
     /// PR-94: start the engine with a shared observability registry.
@@ -213,10 +224,10 @@ impl Engine {
     /// `MeterProvider`; otherwise the shim no-ops.
     pub fn start_with_metrics(
         config: EngineConfig,
-        client: ferriskey::Client,
+        backend: Arc<dyn EngineBackend>,
         metrics: Arc<ff_observability::Metrics>,
     ) -> Self {
-        Self::start_internal(config, client, metrics, None)
+        Self::start_internal(config, backend, metrics, None)
     }
 
     /// Start the engine with a shared observability registry and a
@@ -229,21 +240,78 @@ impl Engine {
     /// latency from `interval × levels` to `~RTT × levels`. The
     /// `dependency_reconciler` scanner remains as a safety net for
     /// completions missed during subscriber reconnect windows.
+    ///
+    /// # Backend parameter (v0.12 PR-7a)
+    ///
+    /// `backend` is an `Arc<dyn EngineBackend>` so the public
+    /// constructor signature is backend-agnostic — cairn and other
+    /// consumers can sequence their engine construction around this
+    /// shape without waiting for the scanner trait-ification. Runtime
+    /// support in v0.12 is still Valkey-only: the scanner supervisors
+    /// today speak ferriskey, so this constructor downcasts
+    /// `backend.as_any()` to [`ff_backend_valkey::ValkeyBackend`] and
+    /// reaches for the embedded `ferriskey::Client`. v0.13 (PR-7b)
+    /// will trait-ify each scanner onto `EngineBackend` and retire
+    /// the downcast — the public signature stays stable through that
+    /// transition, so consumers wiring up the v0.12 shape today
+    /// don't change their call site.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `backend.as_any().downcast_ref::<ValkeyBackend>()`
+    /// is `None`. The only in-tree caller (`ff-server`) constructs a
+    /// `ValkeyBackend` before calling; external consumers that want
+    /// non-Valkey support must wait for PR-7b.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use ff_core::engine_backend::EngineBackend;
+    /// # async fn ex(
+    /// #     cfg: ff_engine::EngineConfig,
+    /// #     metrics: Arc<ff_observability::Metrics>,
+    /// #     stream: ff_core::completion_backend::CompletionStream,
+    /// #     backend: Arc<dyn EngineBackend>, // e.g. from ValkeyBackend::connect
+    /// # ) {
+    /// // Valkey backend: works today (v0.12 PR-7a).
+    /// let engine = ff_engine::Engine::start_with_completions(
+    ///     cfg, backend, metrics, stream,
+    /// );
+    /// # let _ = engine;
+    /// # }
+    /// ```
     pub fn start_with_completions(
         config: EngineConfig,
-        client: ferriskey::Client,
+        backend: Arc<dyn EngineBackend>,
         metrics: Arc<ff_observability::Metrics>,
         completions: CompletionStream,
     ) -> Self {
-        Self::start_internal(config, client, metrics, Some(completions))
+        Self::start_internal(config, backend, metrics, Some(completions))
     }
 
     fn start_internal(
         config: EngineConfig,
-        client: ferriskey::Client,
+        backend: Arc<dyn EngineBackend>,
         metrics: Arc<ff_observability::Metrics>,
         completions: Option<CompletionStream>,
     ) -> Self {
+        // v0.12 PR-7a transitional downcast. Scanners today still
+        // speak ferriskey directly; until PR-7b trait-ifies them,
+        // reach in for the embedded client. Only in-tree consumer is
+        // ff-server which always constructs a `ValkeyBackend`.
+        let client = match backend
+            .as_any()
+            .downcast_ref::<ff_backend_valkey::ValkeyBackend>()
+        {
+            Some(vb) => vb.client().clone(),
+            None => panic!(
+                "Engine::start_* in v0.12 requires ValkeyBackend \
+                 (got backend_label={:?}); non-Valkey support lands \
+                 in v0.13 (PR-7b).",
+                backend.backend_label(),
+            ),
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let num_partitions = config.partition_config.num_flow_partitions;
         let router = Arc::new(PartitionRouter::new(config.partition_config));

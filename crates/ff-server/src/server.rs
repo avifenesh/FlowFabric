@@ -454,9 +454,19 @@ impl Server {
                 "subscribe_completions: {e}"
             )))?;
 
+        // PR-7a: `Engine::start_with_completions` takes
+        // `Arc<dyn EngineBackend>` on the boundary (scanners still
+        // downcast to `ValkeyBackend` internally — v0.13 PR-7b
+        // retires that). Reuse `completion_backend`: it already
+        // wraps the same `client` via
+        // `from_client_partitions_and_connection`, so this is a
+        // plain `Arc<ValkeyBackend>` → `Arc<dyn EngineBackend>`
+        // coercion, no second dial.
+        let engine_backend: Arc<dyn EngineBackend> =
+            completion_backend.clone() as Arc<dyn EngineBackend>;
         let engine = Engine::start_with_completions(
             engine_cfg,
-            client.clone(),
+            engine_backend,
             metrics.clone(),
             completion_stream,
         );
