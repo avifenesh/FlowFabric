@@ -277,6 +277,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **ff-backend-sqlite: claim path writes `public_state = 'running'` to
+  `ff_exec_core`.** Matches the Postgres parity write at
+  `ff-backend-postgres/src/suspend_ops.rs:958-960`. Before the fix the
+  column stayed at its create-time `'waiting'` literal on claimed
+  executions (`'pending'` is the sibling `attempt_state` literal, not
+  `public_state`); the Spine-B read normaliser inferred the correct
+  `PublicState::Active` from lifecycle + ownership so downstream
+  consumers were unaffected, but direct SQL reads against
+  `ff_exec_core.public_state` observed the wrong state.
+- **ff-backend-sqlite: `SqliteBackend::new` `is_memory` detection now
+  catches `file:*?mode=memory*` URIs (closes #372).** The prior
+  detector (`path == ":memory:" || path.starts_with("file::memory:")`)
+  missed the RFC-023 §4.6 recommended test-isolation form
+  (`file:ff-test-<uuid>?mode=memory&cache=shared`), so WAL mode was
+  applied inappropriately and no sentinel connection was held — a
+  pool-idle cycle dropped the shared cache mid-test and risked data
+  loss under parallel test harnesses. Detection is extracted into a
+  dedicated `is_memory_uri` helper with a unit test covering all three
+  supported forms.
 - **ferriskey: expose `Client::force_cluster_slot_refresh` (closes
   #369).** New `pub async fn force_cluster_slot_refresh(&self) ->
   Result<()>` on `ferriskey::Client` (and on the internal
