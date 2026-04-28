@@ -2376,10 +2376,11 @@ impl SqliteBackend {
         // file creation still dedup.
         //
         // F1: bare `:memory:` is rewritten to
-        // `file::memory:?cache=shared&uri=true` so a multi-connection
-        // pool shares ONE in-memory database. Without this rewrite,
-        // each pool connection opens its own private DB and tests see
-        // schema mismatches silently.
+        // `file::memory:?cache=shared` so a multi-connection pool shares
+        // ONE in-memory database. Without this rewrite, each pool
+        // connection opens its own private DB and tests see schema
+        // mismatches silently. (sqlx infers URI mode from the `file:`
+        // prefix, so no explicit `uri=true` query parameter is needed.)
         let is_memory = is_memory_uri(path);
         let effective_path: std::borrow::Cow<'_, str> = if path == ":memory:" {
             std::borrow::Cow::Borrowed("file::memory:?cache=shared")

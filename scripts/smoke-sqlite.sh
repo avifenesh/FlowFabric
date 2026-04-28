@@ -52,17 +52,32 @@ trap 'rm -f "${OUT}" "${GUARD_OUT}"' EXIT
 
 echo "==> smoke-sqlite: verify production guard refuses without FF_DEV_MODE"
 # Invoke the pre-built binary directly. Scrub `FF_DEV_MODE` from the
-# child env even if the caller set it so the leg is deterministic. The
-# assertion is stricter than "non-zero exit": we grep for the specific
-# refusal message, so a crash / panic / link error cannot false-pass
-# the leg.
-if env -u FF_DEV_MODE "${FF_DEV_BIN}" > "${GUARD_OUT}" 2>&1 ; then
+# child env even if the caller set it so the leg is deterministic.
+#
+# The guard leg asserts three independent conditions so a compile-fail
+# / panic / link error cannot false-pass by producing empty output:
+#   (1) binary exists + is executable (checked above)
+#   (2) binary exits non-zero without FF_DEV_MODE=1
+#   (3) stderr/stdout contains the exact refusal message
+#
+# Condition (3) is checked against a captured exit code (not chained
+# inside an `if` with `set -e` semantics) so the "no output" case
+# produces a DISTINCT failure mode from the "exit-zero" case.
+set +e
+env -u FF_DEV_MODE "${FF_DEV_BIN}" > "${GUARD_OUT}" 2>&1
+GUARD_EXIT=$?
+set -e
+if [[ "${GUARD_EXIT}" -eq 0 ]]; then
     echo "FAIL: ff-dev exited 0 without FF_DEV_MODE=1 — production guard regressed" >&2
     tail -n 40 "${GUARD_OUT}" >&2 || true
     exit 2
 fi
+if [[ ! -s "${GUARD_OUT}" ]]; then
+    echo "FAIL: ff-dev exited ${GUARD_EXIT} but produced no output — likely crash/link-error, not a clean refusal" >&2
+    exit 2
+fi
 if ! grep -Fq "FF_DEV_MODE=1 is required" "${GUARD_OUT}"; then
-    echo "FAIL: guard-leg exited non-zero but refusal message not present — assumed regression" >&2
+    echo "FAIL: ff-dev exited ${GUARD_EXIT} with output but refusal message missing — guard regressed or refusal text changed" >&2
     tail -n 40 "${GUARD_OUT}" >&2 || true
     exit 2
 fi

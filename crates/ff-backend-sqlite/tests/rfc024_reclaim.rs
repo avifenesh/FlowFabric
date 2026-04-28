@@ -449,6 +449,46 @@ async fn reclaim_execution_cap_exceeded() {
     assert_eq!(public_state, "failed");
 }
 
+/// Investigation: per memory project_reclaim_cap_exceeded_investigation.md,
+/// the PR-F (#402) agent observed `lease_reclaim_count=4, max=Some(4)`
+/// returning `Claimed` instead of `ReclaimCapExceeded` on Valkey. This
+/// SQLite parallel asserts the same exact-boundary scenario enforces
+/// the cap here too — the SQLite backend shares none of the Lua code
+/// path, but the contract (reclaim_count >= max_reclaim_count → cap
+/// exceeded) must be uniform across backends.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn reclaim_execution_cap_exceeded_at_exact_boundary() {
+    let b = fresh_backend().await;
+    let (exec_id, lane_id, _handle) = create_and_claim(&b).await;
+    let exec_uuid = uuid_of(&exec_id);
+    force_lease_expired(&b, exec_uuid).await;
+
+    sqlx::query(
+        "UPDATE ff_exec_core SET lease_reclaim_count = 4 \
+         WHERE partition_key=0 AND execution_id=?1",
+    )
+    .bind(exec_uuid)
+    .execute(b.pool_for_test())
+    .await
+    .unwrap();
+
+    let _ = b
+        .issue_reclaim_grant(issue_args(&exec_id, &lane_id))
+        .await
+        .expect("issue");
+
+    let r = b
+        .reclaim_execution(reclaim_args(&exec_id, &lane_id, "w1", "w1-i2", 0, Some(4)))
+        .await
+        .expect("reclaim");
+
+    assert!(
+        matches!(r, ReclaimExecutionOutcome::ReclaimCapExceeded { .. }),
+        "expected ReclaimCapExceeded at lease_reclaim_count=max=4 boundary, got {r:?}"
+    );
+}
+
 // -- Review-finding regression tests (F1, F2+F3, F4, F5, F7) ---------
 
 /// F1+F6: if the exec transitions to terminal between grant issuance

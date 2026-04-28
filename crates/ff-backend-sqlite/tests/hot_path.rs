@@ -186,11 +186,10 @@ async fn claim_happy_path_mints_handle_and_transitions_state() {
     // `public_state = 'running'` parity write with Postgres
     // (`ff-backend-postgres/src/suspend_ops.rs:958-960`). The
     // Spine-B normaliser maps the raw literal back to
-    // `PublicState::Active`; before the fix the `public_state`
-    // column remained at its create-time `'waiting'` literal
-    // (`'pending'` is the sibling `attempt_state` literal, not
-    // `public_state`) and direct SQL readers observed the wrong
-    // public state even though the inferred enum was correct.
+    // `PublicState::Active`; before the fix the claim path did not
+    // update `public_state` at all, so direct SQL readers saw
+    // whatever pre-claim literal the row was seeded with even
+    // though the inferred enum was correct.
     assert_eq!(
         read_exec_public_state(&backend, exec_uuid).await,
         "running"
