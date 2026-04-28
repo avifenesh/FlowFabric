@@ -153,13 +153,14 @@ pub struct ClaimedTask {
     /// `EngineBackend` the trait-migrated ops forward through.
     ///
     /// **RFC-012 Stage 1b + Round-7.** Today this is always a
-    /// `ValkeyBackend` wrapping `client`. Most per-task ops
+    /// `ValkeyBackend` wrapping an internal `ferriskey::Client`. Most
+    /// per-task ops
     /// (`complete`/`fail`/`cancel`/`delay_execution`/
     /// `move_to_waiting_children`/`update_progress`/`resume_signals`/
     /// `create_pending_waitpoint`/`append_frame`/`report_usage`) route
-    /// through `backend.*()`. `suspend` still uses
-    /// `client.fcall("ff_suspend_execution", ...)` directly — this is
-    /// the deferred suspend per RFC-012 §R7.6.1, pending Stage 1d
+    /// through `backend.*()`. `suspend` still uses the backend's
+    /// internal `fcall("ff_suspend_execution", ...)` directly — this
+    /// is the deferred suspend per RFC-012 §R7.6.1, pending Stage 1d
     /// input-shape work. Lease renewal goes through
     /// `backend.renew(&handle)`. Round-7 (#135/#145) closed the four
     /// trait-shape gaps tracked by #117.
@@ -226,6 +227,11 @@ impl ClaimedTask {
     ///
     /// # Arguments
     ///
+    /// * `backend` — `Arc<dyn EngineBackend>` the per-task ops
+    ///   (`complete`/`fail`/`cancel`/`renew`/`append_frame`/…) forward
+    ///   through, plus the background lease-renewal task. Today this
+    ///   is always a `ValkeyBackend` (see the struct doc on `backend`
+    ///   above); RFC-023 widens the admissible backends.
     /// * `partition_config` — partition topology snapshot read at
     ///   `FlowFabricWorker::connect`. Used for key construction on
     ///   the lifetime of this task.
