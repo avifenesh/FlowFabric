@@ -112,7 +112,7 @@ pub struct Supports {
     /// land together on every in-tree backend per RFC-024 §3.6, so
     /// one bool covers the consumer-visible reclaim surface).
     /// `false` on out-of-tree backends via `Supports::none()`; `true`
-    /// on Valkey (v0.12.0 per RFC-024 PR-F), Postgres (PR-D), SQLite
+    /// on Valkey (v0.11.0 per RFC-024 PR-F), Postgres (PR-D), SQLite
     /// (PR-E).
     pub issue_reclaim_grant: bool,
 

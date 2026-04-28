@@ -4012,10 +4012,14 @@ async fn issue_reclaim_grant_impl(
     let idx = IndexKeys::new(&partition);
 
     // Build the caps CSV (sorted, deterministic) matching `claim_impl`.
-    let mut sorted_caps: Vec<String> = args.worker_capabilities.iter().cloned().collect();
-    sorted_caps.sort();
-    sorted_caps.dedup();
-    let caps_csv = sorted_caps.join(",");
+    // `worker_capabilities` is a `BTreeSet<String>`, already sorted +
+    // deduplicated by the collection itself — iterate directly.
+    let caps_csv = args
+        .worker_capabilities
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
 
     let core_k = ctx.core();
     let grant_k = ctx.claim_grant();
@@ -4049,11 +4053,18 @@ async fn issue_reclaim_grant_impl(
 
     let parsed = FcallResult::parse(&raw).map_err(EngineError::from)?;
     if parsed.success {
-        // Lua wrote the grant hash with PEXPIREAT at `now + grant_ttl_ms`.
-        // The Lua TIME reading isn't returned; compute the client-side
-        // `expires_at_ms` from the caller's `now + grant_ttl_ms` as the
-        // consumer-visible upper bound.
-        let expires_at_ms = (args.now.0 as u64).saturating_add(args.grant_ttl_ms);
+        // RFC-024 §3.1: grant-carried fields come from server. Lua returns
+        // `ok(execution_id, grant_expires_at)` where `grant_expires_at`
+        // is derived from the server's `TIME` + `grant_ttl_ms` — use it
+        // directly rather than recomputing `args.now + grant_ttl_ms`
+        // client-side (which would diverge under Rust↔Valkey clock skew).
+        let expires_at_ms = parsed.field_str(1).parse::<u64>().map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "ff_issue_reclaim_grant".into(),
+                execution_id: Some(args.execution_id.to_string()),
+                message: format!("bad grant_expires_at: {e}"),
+            })
+        })?;
         let grant = ReclaimGrant::new(
             args.execution_id.clone(),
             ff_core::partition::PartitionKey::from(&partition),
@@ -4218,6 +4229,16 @@ async fn reclaim_execution_impl(
         let handle = handle_codec::encode_handle(&fields, HandleKind::Reclaimed);
         return Ok(ReclaimExecutionOutcome::Claimed(handle));
     }
+    // Pre-extract the authoritative cap value before we consume `parsed`
+    // with `into_success()`. For `max_retries_exhausted` the Lua tail is
+    // `err("max_retries_exhausted", tostring(max_reclaim))` where
+    // `max_reclaim` is the post-policy-override enforced cap (RFC-024
+    // §4.6 resolution order). Falling back to `default_max` preserves
+    // the previous behaviour if the field is missing or unparseable.
+    let authoritative_cap: u32 = parsed
+        .field_str(0)
+        .parse::<u32>()
+        .unwrap_or(default_max);
     match parsed.into_success().unwrap_err() {
         ScriptError::InvalidClaimGrant => Ok(ReclaimExecutionOutcome::GrantNotFound {
             execution_id: args.execution_id,
@@ -4227,13 +4248,14 @@ async fn reclaim_execution_impl(
             detail: "execution_not_reclaimable".into(),
         }),
         ScriptError::MaxRetriesExhausted => {
-            // Lua set terminal_failed + returned `max_retries_exhausted`. The
-            // exact count is unavailable from the err payload (Lua doesn't
-            // echo it back); report the caller's `default_max` as the
-            // observed cap.
+            // Lua set terminal_failed + returned
+            // `err("max_retries_exhausted", tostring(max_reclaim))`. Use
+            // the authoritative value (which reflects per-execution
+            // policy override if present) rather than the caller's
+            // Rust-side `default_max`.
             Ok(ReclaimExecutionOutcome::ReclaimCapExceeded {
                 execution_id: args.execution_id,
-                reclaim_count: default_max,
+                reclaim_count: authoritative_cap,
             })
         }
         err => Err(EngineError::from(err)),
