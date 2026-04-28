@@ -328,6 +328,7 @@ impl ReclaimGrant {
 // ─── claim_execution ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClaimExecutionArgs {
     pub execution_id: ExecutionId,
     pub worker_id: WorkerId,
@@ -351,6 +352,43 @@ pub struct ClaimExecutionArgs {
     pub now: TimestampMs,
 }
 
+impl ClaimExecutionArgs {
+    /// Construct a `ClaimExecutionArgs`. Added alongside
+    /// `#[non_exhaustive]` per `feedback_non_exhaustive_needs_constructor`
+    /// so consumers (SDK worker, backend impls) can still build the
+    /// args after the struct was sealed for forward-compat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        lane_id: LaneId,
+        lease_id: LeaseId,
+        lease_ttl_ms: u64,
+        attempt_id: AttemptId,
+        expected_attempt_index: AttemptIndex,
+        attempt_policy_json: String,
+        attempt_timeout_ms: Option<u64>,
+        execution_deadline_at: Option<i64>,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            execution_id,
+            worker_id,
+            worker_instance_id,
+            lane_id,
+            lease_id,
+            lease_ttl_ms,
+            attempt_id,
+            expected_attempt_index,
+            attempt_policy_json,
+            attempt_timeout_ms,
+            execution_deadline_at,
+            now,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimedExecution {
     pub execution_id: ExecutionId,
@@ -362,7 +400,14 @@ pub struct ClaimedExecution {
     pub lease_expires_at: TimestampMs,
 }
 
+/// Typed outcome of [`crate::engine_backend::EngineBackend::claim_execution`].
+///
+/// Single-variant today; `#[non_exhaustive]` reserves room for future
+/// outcomes (e.g. an explicit `NoGrant` variant if RFC-024 splits it
+/// out of `InvalidClaimGrant`) without a breaking match-arm churn on
+/// consumers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ClaimExecutionResult {
     /// Successfully claimed.
     Claimed(ClaimedExecution),
