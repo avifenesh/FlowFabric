@@ -8,8 +8,13 @@ chronological** — latest at top. Patch releases nest under their minor.
 > directly). Pure HTTP-API consumers only need rows labelled
 > `[wire]`.
 >
-> **When this page rolls:** v1.0 release drops v0.7 off the bottom;
-> the oldest minor is archived to `docs/archive/MIGRATION_v0.7.md`.
+> **When this page rolls:** each minor release drops the oldest in
+> the 3-minor window off the bottom; the archived minor moves to
+> `docs/archive/MIGRATIONS-v<minor>.md`. Current rolling window:
+> **v0.10 / v0.11 / v0.12**. v0.8 was archived at v0.12.0 (see
+> [`docs/archive/MIGRATIONS-v0.8.md`](archive/MIGRATIONS-v0.8.md)).
+> v0.9 content is preserved in-page for now because the umbrella-
+> crate appendix it relies on is referenced across the window.
 > Per CLAUDE.md §5 item 5, this page is a release-gate artifact —
 > every tag PR validates it against `CHANGELOG.md` before tagging.
 
@@ -21,6 +26,114 @@ chronological** — latest at top. Patch releases nest under their minor.
 | `[additive]` | New surface; existing code still compiles. Adopt if you want the simplification; ignore otherwise. |
 | `[wire]` | HTTP / wire-format change visible to non-Rust consumers. |
 | `[infra]` | Environment / deployment / CI change (not a code API change). |
+
+---
+
+## v0.12 — SQLite dev-only backend (RFC-023)
+
+### v0.12.0 — 2026-04-26
+
+Third `EngineBackend` implementation lands: **SQLite**, scoped
+permanently to dev-only / `cargo test` / contributor onboarding per
+[RFC-023](../rfcs/RFC-023-sqlite-dev-only-backend.md). Mostly additive;
+two minor breaking shape adjustments on ff-server types fall out of
+wiring the third backend.
+
+Positioning: **SQLite is a testing harness; Valkey is the engine;
+Postgres is the enterprise persistence layer.** SQLite is NOT a
+deployment target — see [`DEPLOYMENT.md`](DEPLOYMENT.md) §0 and
+[`dev-harness.md`](dev-harness.md).
+
+See `docs/CONSUMER_MIGRATION_0.12.md` for the full consumer
+checklist; this page gives the rolling-window summary.
+
+#### Breaking
+
+- **`ServerError` gains `SqliteRequiresDevMode` variant + becomes
+  `#[non_exhaustive]`** `[break]`. Consumers writing exhaustive
+  `match` arms on `ServerError` must add a wildcard arm (or the new
+  variant). Pre-v0.12 the enum was not sealed; sealing it now means
+  future variant additions are additive.
+- **`ServerConfig` gains `sqlite: SqliteServerConfig` field + becomes
+  `#[non_exhaustive]`** `[break]`. Consumers constructing
+  `ServerConfig` via struct literal must migrate to
+  `ServerConfig::from_env()`, the new `ServerConfig::sqlite_dev()`
+  builder, or `..Default::default()` spread.
+- **`ff_sdk::worker` module cfg-gating shift** `[break]` (forward-
+  looking; no shipped consumer exercises this today). The
+  `FlowFabricWorker` type + `connect_with` re-export move from
+  `valkey-default`-gated to always-compiled. The Valkey-specific
+  methods (`connect`, `claim_next`, `claim_from_grant`,
+  `claim_via_server`, `claim_from_reclaim_grant`,
+  `claim_resumed_execution`, `claim_execution`,
+  `read_execution_context`, `deliver_signal`) stay at the item level
+  and are ABSENT under `--no-default-features`. Consumers on non-
+  Valkey backends drive ops through `worker.backend()` and the
+  `EngineBackend` trait directly.
+
+#### Additive
+
+- **`ff-backend-sqlite` crate published** `[additive]`. Third
+  `EngineBackend` impl; `cargo add ff-backend-sqlite` (or enable
+  `flowfabric`'s future `sqlite` feature). See
+  [`dev-harness.md`](dev-harness.md) for the canonical setup.
+- **`BackendKind::Sqlite`, `SqliteServerConfig`,
+  `ServerConfig::sqlite_dev()`, `SqliteBackend::new`,
+  `BackendError::RequiresDevMode`, `BackendTag::Sqlite` (wire byte
+  `0x03`)** `[additive]`. New public APIs per RFC-023 §4.4.
+  `BackendTag` was already `#[non_exhaustive]`; every consumer match
+  site uses wildcard or inequality checks, so the `Sqlite` variant
+  addition is compile-safe.
+- **`ff_sdk::SqliteBackend` re-export** `[additive]`. Under
+  `ff-sdk = { default-features = false, features = ["sqlite"] }`,
+  consumers can name `ff_sdk::SqliteBackend` without pinning
+  `ff-backend-sqlite` directly.
+- **Production guard — `FF_DEV_MODE=1` required** `[additive]`.
+  `FF_BACKEND=sqlite` and `SqliteBackend::new` both refuse to
+  activate without `FF_DEV_MODE=1`; guard lives on the type so
+  every path pays it. Banner emits at WARN level on every
+  construction. Orthogonal to `FF_ENV=development` /
+  `FF_BACKEND_ACCEPT_UNREADY=1`.
+- **Scanner supervisor collapses to N=1 on SQLite** `[additive]`.
+  Single-writer / single-process → no partition fan-out. Ports
+  `budget_reset` reconciler; other reconcilers land in subsequent
+  phases per RFC-023 §4.3 parity commitment.
+
+#### Infra
+
+- **New env vars** `[infra]`. Added to the `ServerConfig::from_env`
+  surface:
+  - `FF_BACKEND=sqlite` — selects the SQLite backend (alongside
+    `valkey` / `postgres`).
+  - `FF_DEV_MODE=1` — SQLite-specific production guard. Required
+    for `FF_BACKEND=sqlite` and direct `SqliteBackend::new`
+    construction. Has no effect on other backends.
+  - `FF_SQLITE_PATH` (default `:memory:`) — file path or URI.
+    Supports `:memory:?cache=shared`,
+    `file:name?mode=memory&cache=shared` (per-test isolation),
+    `/tmp/ff-dev.db` (file-backed).
+  - `FF_SQLITE_POOL_SIZE` (default `4`) — 1 writer + N–1 readers.
+- **SQLite migrations 0001–0014** `[infra]`. Hand-ported SQLite-
+  dialect migrations in `crates/ff-backend-sqlite/migrations/`,
+  1:1 numbered with Postgres for parity-drift detection. Applied
+  idempotently on pool init via `sqlx::migrate!`; first-time SQLite
+  users need nothing extra.
+- **Postgres migration 0016 — `ff_exec_core.started_at_ms`**
+  `[infra]`. Additive, forward-only. Set-once first-claim
+  timestamp; drops the LATERAL / correlated-subquery on
+  `ff_attempt.started_at_ms` from the Wave-9 Spine-B read path.
+  Backfilled from `MIN(ff_attempt.started_at_ms)` per execution.
+  Migration number 0015 is reserved for RFC-024 (claim-grant
+  table) — renumbers safely if RFC-024 lands first.
+
+#### Parity matrix
+
+See [`POSTGRES_PARITY_MATRIX.md`](POSTGRES_PARITY_MATRIX.md) (which
+gains a SQLite column at v0.12). Every Wave-9 method `impl` on PG
+at v0.11 is `impl` on SQLite at v0.12, with the documented
+exceptions: `claim_for_worker` is `stub` on SQLite (no scheduler —
+RFC-023 §5 non-goal); `subscribe_instance_tags` is `n/a` on all
+three backends per #311.
 
 ---
 
@@ -196,276 +309,17 @@ trait-level boot prep instead of `BackendKind::Valkey` branches.
 
 ---
 
-## v0.8 — Postgres backend first-class + v0.7 cycle rollup
+## v0.8 — Postgres backend first-class + v0.7 cycle rollup (archived)
 
-### v0.8.1 — 2026-04-25
+> **Archived at v0.12.0.** The full v0.8 release body (breaking
+> changes, upgrading checklist, `ServerConfig` reshape,
+> `PendingWaitpointInfo` wire-format break, `FF_BACKEND=postgres`
+> setup, `EngineBackend` trait expansion) now lives at
+> [`docs/archive/MIGRATIONS-v0.8.md`](archive/MIGRATIONS-v0.8.md).
+> The umbrella-crate appendix referenced from the v0.9 entry is
+> preserved in-page below because it is cross-referenced inside the
+> current rolling window.
 
-Patch release for v0.8.0 publish-infra breakage. No consumer API
-impact.
-
-- **Publish order corrected** `[infra]`. `ff-scheduler` now publishes
-  before `ff-backend-valkey` (RFC-017 Stage C added
-  `ff-backend-valkey → ff-scheduler` dep; publish-list wasn't
-  updated). v0.8.0 partial-published ferriskey + ff-core + ff-script
-  + ff-observability + ff-observability-http; those were yanked and
-  re-released at 0.8.1.
-- **Smoke-gate env override** `[infra]`.
-  `FF_SMOKE_FANOUT_P99_MS` allows CI hardware variance without hiding
-  perf regressions locally (master spec 500 ms stays strict; CI
-  runners use 1200 ms).
-
-### v0.8.0 — 2026-04-24
-
-RFC-017 Wave 8 — Postgres backend ships first-class over the full
-HTTP surface and the v0.7 `/v1/pending-waitpoints` compatibility
-shim is retired.
-
-> Sources preserved verbatim below from the previous
-> `docs/CONSUMER_MIGRATION_v0.8.md`. See also
-> [`docs/POSTGRES_PARITY_MATRIX.md`](POSTGRES_PARITY_MATRIX.md) for
-> the per-method v0.8.0 parity audit.
-
-#### Breaking
-
-- **`ServerConfig` flat Valkey fields removed** `[break]`. Closes
-  v0.7-era deprecation. See [§ ServerConfig reshape](#serverconfig-flat-valkey-fields-removed) below.
-- **`PendingWaitpointInfo` wire-shape change** `[break] [wire]`. Raw
-  `waitpoint_token` removed; correlate via `(token_kid,
-  token_fingerprint)`. `Deprecation: ff-017` header gone. See
-  [§ PendingWaitpointInfo](#pendingwaitpointinfo-wire-format-break).
-- **`ClaimPolicy::immediate()` removed, `ClaimPolicy::new`
-  signature** `[break]`. Now
-  `ClaimPolicy::new(worker_id, worker_instance_id, lease_ttl_ms,
-  max_wait)`. (v0.7 cycle break, landed at v0.8 tag.)
-- **`ReclaimToken::new` gained worker identity args** `[break]`.
-  `ReclaimToken::new(grant, worker_id, worker_instance_id,
-  lease_ttl_ms)`, mirroring the `ClaimPolicy` shape. (v0.7 cycle.)
-- **`EngineBackend` trait expanded by ~17 methods** `[break]` for
-  custom backend impls. `HookedBackend` / `PassthroughBackend` /
-  `ValkeyBackend` / `PostgresBackend` all carry in-tree impls and are
-  the reference for "complete".
-- **`ServerError` additive variants** `[break]`. `#[non_exhaustive]`
-  variants added across Stages D1–E3 for Postgres-path error
-  classification. Catch-all arm required.
-- **`ContentionKind::RetryExhausted` additive variant** `[break]`
-  (minor — on a `#[non_exhaustive]` enum; blanket `Contention(_)`
-  arms keep working).
-- **`Server::client()` accessor + `Server::client` field removed**
-  `[break]`. Consumers needing Valkey connectivity should build their
-  own `ferriskey::ClientBuilder` using the same
-  `ServerConfig::valkey` parameters, or go through `EngineBackend`.
-- **`Server::fcall_with_reload` removed** `[break]`. Inlined into
-  the Valkey backend impl.
-- **`Server::scheduler` field removed** `[break]`. Replaced by
-  trait-routed dispatch on `backend.claim_for_worker`.
-
-#### Additive
-
-- **Postgres backend first-class** `[additive]`. `FF_BACKEND=postgres`
-  boots natively — the v0.7-era `FF_BACKEND_ACCEPT_UNREADY=1` /
-  `FF_ENV=development` dev-override is gone;
-  `BACKEND_STAGE_READY` now lists both `valkey` and `postgres`.
-- **`PostgresScheduler` + 6 reconcilers** `[additive]`. Stage E3
-  Postgres execution-dispatch scheduler plus sibling-cancel,
-  lease-timeout, completion-listener, cancel-backlog, flow-staging,
-  and edge-group-policy reconcilers on the Wave 3 schema.
-- **`Server::start_with_backend`** `[additive]`. Test-injection entry
-  point accepting a constructed `EngineBackend` trait object
-  (`crates/ff-test/tests/http_postgres_smoke.rs` exercises it
-  without the env-var dance).
-- **`http_postgres_smoke` integration test** `[additive]`. End-to-end
-  POST/GET coverage of the HTTP API against `PostgresBackend`, gated
-  on the `postgres-e2e` feature.
-
-#### v0.7-cycle content (shipped inside 0.8.0, no v0.7 tag)
-
-See [§ v0.7 cycle content](#v07--content-shipped-inside-v080) below
-for the full list (caps extraction, handle codec with `BackendTag`,
-`Handle.opaque` wire-v2, `rotate_waitpoint_hmac_secret_all`
-trait method, Valkey `claim` + `claim_from_reclaim` implementations,
-Postgres flow family, `ClaimPolicy` / `ReclaimToken` reshape).
-
----
-
-### Upgrading from v0.7 → v0.8 (action list)
-
-1. Bump `ff-*` deps to `0.8.1` (NOT `0.8.0` — partial-publish yanked).
-2. Update `ServerConfig` construction sites ([§ below](#serverconfig-flat-valkey-fields-removed)).
-3. Drop `waitpoint_token` from your `/v1/pending-waitpoints`
-   deserialiser ([§ below](#pendingwaitpointinfo-wire-format-break)).
-4. If you match on `ClaimPolicy::immediate()`, adjust to
-   `ClaimPolicy::new(..)`.
-5. Add a catch-all arm to any `match` on `ServerError`.
-6. If migrating to Postgres, set `FF_BACKEND=postgres` +
-   `FF_POSTGRES_URL` + `FF_WAITPOINT_HMAC_SECRET`
-   ([§ FF_BACKEND=postgres setup](#ff_backendpostgres-setup)).
-7. Re-run your integration smoke. File issues against this repo for any
-   migration-guide gap you hit; RFC-017 design record lives in the
-   [archive repo](https://github.com/avifenesh/flowfabric-archive/blob/main/rfcs/RFC-017-ff-server-backend-abstraction.md)
-   (private).
-
----
-
-### `ServerConfig` flat Valkey fields removed
-
-**Before (v0.7.x):**
-
-```rust
-use ff_server::config::ServerConfig;
-
-let cfg = ServerConfig {
-    host: "valkey-0.internal".into(),
-    port: 6379,
-    tls: true,
-    cluster: true,
-    skip_library_load: false,
-    // ... other fields ...
-    ..ServerConfig::default()
-};
-```
-
-**After (v0.8.0):**
-
-```rust
-use ff_server::config::{ServerConfig, ValkeyServerConfig, BackendKind};
-
-let cfg = ServerConfig {
-    backend: BackendKind::Valkey,
-    valkey: ValkeyServerConfig {
-        host: "valkey-0.internal".into(),
-        port: 6379,
-        tls: true,
-        cluster: true,
-        skip_library_load: false,
-    },
-    // ... other fields ...
-    ..ServerConfig::default()
-};
-```
-
-The `valkey: ValkeyServerConfig` field mirrors the pre-existing
-`postgres: PostgresServerConfig` and is ignored when
-`backend == BackendKind::Postgres`. Env-var loading via
-`ServerConfig::from_env()` is unchanged (`FF_HOST` / `FF_PORT` / etc.
-still read into `cfg.valkey.*`).
-
-`ValkeyServerConfig` is **not** `#[non_exhaustive]` — you can
-construct the struct literal directly. Adding a field is a v0.y.0
-breaking bump; insulate with `..ValkeyServerConfig::default()` if you
-prefer.
-
-### `PendingWaitpointInfo` wire-format break
-
-`GET /v1/executions/{id}/pending-waitpoints` no longer includes a raw
-`waitpoint_token` HMAC in each entry. Clients correlate waitpoints by
-`(token_kid, token_fingerprint)`.
-
-**Before (v0.7.x):**
-
-```json
-{
-  "entries": [
-    {
-      "execution_id": "...",
-      "waitpoint_id": "...",
-      "token_kid": "v1",
-      "token_fingerprint": "sha256:...",
-      "waitpoint_token": "v1.eyJhbGciOi...",
-      "...": "..."
-    }
-  ]
-}
-```
-
-Response also carried a `Deprecation: ff-017` header and bumped the
-`ff_pending_waitpoint_legacy_token_served_total` counter.
-
-**After (v0.8.0):**
-
-```json
-[
-  {
-    "execution_id": "...",
-    "waitpoint_id": "...",
-    "token_kid": "v1",
-    "token_fingerprint": "sha256:...",
-    "...": "..."
-  }
-]
-```
-
-Top-level response is the sanitised `PendingWaitpointInfo` array
-directly (no `{"entries": [...]}` wrapper). The `Deprecation` header
-is gone. Re-sign / verify against `(token_kid, token_fingerprint)`
-if you were doing client-side token checks.
-
-The Rust type `ff_core::PendingWaitpointInfo` no longer carries a
-`waitpoint_token` field. The Valkey-only inherent
-`Server::fetch_waitpoint_token_v07` + `EngineBackend` trait method of
-the same name are removed.
-
-### `FF_BACKEND=postgres` setup
-
-Postgres boots natively at v0.8.0 — no `FF_BACKEND_ACCEPT_UNREADY=1` /
-`FF_ENV=development` escape hatch.
-
-#### Required env vars
-
-| Env var | Default | Notes |
-|---|---|---|
-| `FF_BACKEND` | `valkey` | Set to `postgres` to boot the Postgres path. |
-| `FF_POSTGRES_URL` | *(empty)* | Required on the Postgres path. `postgres://user:pass@host:port/db` shape (libpq / sqlx). |
-| `FF_POSTGRES_POOL_SIZE` | `10` | Max pool connections; ignored on Valkey path. |
-| `FF_WAITPOINT_HMAC_SECRET` | *(empty)* | Required on both paths. |
-
-#### Migrations
-
-`ff-server` auto-runs `apply_migrations` at boot against
-`FF_POSTGRES_URL`. The initial schema (Waves 3 + 3b) seeds the full
-execution / flow / attempt / budget tableset. Re-runs are idempotent.
-
-#### Parity
-
-See [`docs/POSTGRES_PARITY_MATRIX.md`](POSTGRES_PARITY_MATRIX.md) for
-the per-method status at v0.8.0. At release time, the Postgres path
-ships:
-
-- Full create/read-ingress parity (create_flow, create_execution,
-  add_execution_to_flow, stage_dependency_edge,
-  apply_dependency_to_child).
-- Full flow family (describe_flow, list_flows, list_edges,
-  describe_edge, cancel_flow, set_edge_group_policy).
-- Scheduler + `claim_for_worker` + 6 reconcilers.
-- `ping`, `backend_label`, `shutdown_prepare`.
-
-Rows marked `stub` on the Postgres column return
-`EngineError::Unavailable { op }` → HTTP 503 with a structured body:
-
-- operator control (`cancel_execution`, `change_priority`,
-  `replay_execution`, `revoke_lease`)
-- read model (`read_execution_info`, `read_execution_state`,
-  `get_execution_result`)
-- budget / quota admin
-- `list_pending_waitpoints`
-- `rotate_waitpoint_hmac_secret_all` (resolved at v0.9 — now implemented on Postgres)
-
-The remaining stubs land in Wave 9. If your consumer needs any of them
-against Postgres before Wave 9 ships, stay on the Valkey backend for now.
-
-### `EngineBackend` trait expansion (custom backend impls)
-
-If you implement `EngineBackend` for a bespoke backend (test doubles,
-alternate storage), the trait grew by ~17 methods between Wave 4 and
-Wave 8. All new methods carry sensible defaults:
-
-- Most return `Err(EngineError::Unavailable { op: "<name>" })`.
-- `backend_label` returns `"custom"` if unset.
-- `ping` returns `Ok(())` if unset.
-- `shutdown_prepare` returns `Ok(())` if unset.
-
-The `HookedBackend`, `PassthroughBackend`, `ValkeyBackend`, and
-`PostgresBackend` impls in-tree cover every method concretely and
-are the reference for what a "complete" impl looks like.
 
 ### Umbrella crate (`flowfabric`)
 
@@ -573,11 +427,12 @@ at the consumer side.
 
 ## Retired (pre-v0.9)
 
-Current rolling window: v0.9 / v0.10 / v0.11. The v0.8 section above
-falls outside the window at v0.11.0 but is kept inline during the
-roll transition so cross-links (e.g. the umbrella-crate appendix
-referenced from the v0.9 entry) stay resolvable. Fully-retired
-content is archived at
+Current rolling window: **v0.10 / v0.11 / v0.12**. v0.8 was archived
+at v0.12.0 to
+[`docs/archive/MIGRATIONS-v0.8.md`](archive/MIGRATIONS-v0.8.md); the
+umbrella-crate appendix referenced from the v0.9 entry stays in-page
+above because it is cross-referenced inside the window. Fully-retired
+content older than v0.8 is archived at
 https://github.com/avifenesh/flowfabric-archive/blob/main/docs/MIGRATIONS-pre-v0.8.md
 (private). For older versions, consult `CHANGELOG.md` entries for
 v0.6 / v0.5 / v0.4 / v0.3 directly.

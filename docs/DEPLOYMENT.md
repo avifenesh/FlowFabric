@@ -9,6 +9,35 @@ as guidance, not a contract.
 > `FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32)` — the README's
 > quickstart section is simpler than this guide.
 
+## 0. SQLite is NOT a deployment target
+
+FlowFabric v0.12 ships a third backend — `FF_BACKEND=sqlite` — scoped
+**permanently** to dev-only / `cargo test` / contributor onboarding
+per [RFC-023](../rfcs/RFC-023-sqlite-dev-only-backend.md) §1.0. It is
+not a deployment target.
+
+Positioning: **SQLite is a testing harness; Valkey is the engine;
+Postgres is the enterprise persistence layer.** Pick Valkey or
+Postgres for every production deployment.
+
+Production guard:
+
+- `FF_BACKEND=sqlite` refuses to start without `FF_DEV_MODE=1`, and
+  `SqliteBackend::new` refuses to construct without it at the
+  library level. The gate lives on the type so every path that
+  yields a `SqliteBackend` handle pays the guard — it cannot be
+  trivially bypassed.
+- When active, every process-start emits a WARN-level banner
+  visible in JSON logs so aggregators can alert if a SQLite
+  backend ever reaches an environment it should not.
+- Permanent non-goals (RFC-023 §5): no production-scale SQLite, no
+  multi-writer, no clustered SQLite, no Litestream / HA, no cross-
+  process pub/sub, no v2 expansion toward production SQLite.
+
+If you are standing up a local dev loop, see
+[`docs/dev-harness.md`](dev-harness.md) for the canonical SQLite
+setup. This deployment guide covers only Valkey + Postgres.
+
 ## Topology
 
 ```
