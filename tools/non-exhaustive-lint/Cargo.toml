@@ -1,0 +1,12 @@
+[package]
+name = "non-exhaustive-lint"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata.release]
+release = false
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+walkdir = "2"

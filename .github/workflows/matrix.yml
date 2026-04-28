@@ -438,6 +438,139 @@ jobs:
             exit 1
           fi
 
+      # Additive guard (2026-04 release-automation batch). If this PR
+      # touches any .lua source — either the sharded `lua/**/*.lua`
+      # sources or the generated `crates/ff-script/**/*.lua` bundle —
+      # the `flowfabric_lua_version` counter MUST also change. The
+      # ff-script loader only reloads the Lua library when the
+      # checked-in version number changes; Lua edits without a bump
+      # leave deployed consumers on the old cached FUNCTION LIBRARY
+      # (silent stale FCALLs). See project_ff_script_stale_lua_in_dev.md.
+      #
+      # Uses `github.base_ref` for PRs. On push-to-main this step is
+      # skipped via the `if` — the diff would resolve against the
+      # same commit and yield nothing meaningful.
+      - name: Require flowfabric_lua_version bump when Lua changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          changed=$(git diff --name-only "origin/${BASE_REF}...HEAD" -- \
+            'crates/ff-script/**/*.lua' 'lua/**/*.lua' || true)
+          if [ -z "$changed" ]; then
+            echo "No Lua source changes — version bump not required."
+            exit 0
+          fi
+          echo "Lua source changes in this PR:"
+          echo "$changed"
+          version_diff=$(git diff --name-only "origin/${BASE_REF}...HEAD" -- \
+            crates/ff-script/src/flowfabric_lua_version || true)
+          if [ -z "$version_diff" ]; then
+            echo "::error::Lua sources changed but crates/ff-script/src/flowfabric_lua_version did NOT. ff-script gates FUNCTION LIBRARY reloads on this counter; edits without a bump leave deployed consumers on stale Lua (silent stale FCALLs). Bump the counter in the same commit. See project_ff_script_stale_lua_in_dev.md." >&2
+            exit 1
+          fi
+          echo "flowfabric_lua_version bumped — ok."
+
+  # ── Release-automation guardrails (chore/release-automation) ────────
+  #
+  # Three additive CI checks + one extension above. None modify
+  # existing gate behaviour. Each enforces an exact memory-file
+  # lesson the project has already paid for:
+  #
+  #   publish-list-drift     -> feedback_release_publish_list_drift.md
+  #   non-exhaustive-lint    -> feedback_non_exhaustive_needs_constructor.md
+  #   feature-propagation    -> feedback_feature_flag_propagation.md
+  #   (lua-version-bump step above) -> project_ff_script_stale_lua_in_dev.md
+
+  publish-list-drift:
+    name: publish-list drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+        with:
+          key: tools-publish-list-lint
+      - name: cargo run -p publish-list-lint
+        run: cargo run -p publish-list-lint
+
+  non-exhaustive-lint:
+    name: non_exhaustive constructor lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+        with:
+          key: tools-non-exhaustive-lint
+      - name: cargo run -p non-exhaustive-lint
+        run: cargo run -p non-exhaustive-lint
+
+  # feature-flag propagation audit. For each publishable crate,
+  # verify `--no-default-features` builds, then exercise each
+  # feature from that crate's `[features]` table in isolation.
+  # Catches internal feature leaks where a dependent crate forgot
+  # `default-features = false` and silently pulled in a flag via
+  # the default set (v0.3.2: feedback_feature_flag_propagation.md).
+  #
+  # One matrix cell per publishable crate; inside each cell a shell
+  # loop iterates features (N+1 checks; the Cartesian option is
+  # rejected). Crate list hardcoded to match publish-list-lint's
+  # source of truth — if the two disagree, publish-list-drift fails
+  # first so this list cannot silently drift.
+  feature-propagation:
+    name: feature-propagation (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - ferriskey
+          - ff-core
+          - ff-script
+          - ff-observability
+          - ff-observability-http
+          - ff-scheduler
+          - ff-backend-valkey
+          - ff-backend-postgres
+          - ff-backend-sqlite
+          - ff-engine
+          - ff-sdk
+          - ff-server
+          - flowfabric
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+        with:
+          key: feature-propagation-${{ matrix.crate }}
+      - name: cargo check --no-default-features
+        env:
+          CRATE: ${{ matrix.crate }}
+        run: cargo check -p "$CRATE" --no-default-features
+      - name: cargo check --no-default-features --features <each>
+        env:
+          CRATE: ${{ matrix.crate }}
+        # Extract feature keys from `cargo metadata` for $CRATE and
+        # exercise each one in isolation. `default` is skipped —
+        # that's the opt-in alias, already exercised above via
+        # `--no-default-features`.
+        run: |
+          feats=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import sys,json,os; m=json.load(sys.stdin); \
+                p=[x for x in m['packages'] if x['name']==os.environ['CRATE']][0]; \
+                print('\n'.join(f for f in p['features'] if f!='default'))")
+          if [ -z "$feats" ]; then
+            echo "no non-default features for $CRATE — nothing to do"
+            exit 0
+          fi
+          while IFS= read -r feat; do
+            [ -z "$feat" ] && continue
+            echo "== cargo check -p $CRATE --no-default-features --features $feat =="
+            cargo check -p "$CRATE" --no-default-features --features "$feat"
+          done <<< "$feats"
+
   # RFC-023 §4.1 + issue #365 — parity-drift lint for the PG ↔ SQLite
   # migration pair. Blocks PRs that add a PG migration without a
   # matching SQLite port (or an `.sqlite-skip` entry with an issue
@@ -471,7 +604,15 @@ jobs:
 
   matrix-tests-complete:
     name: matrix-tests-complete
-    needs: [matrix, matrix-postgres, lua-drift, migration-parity, smoke-sqlite]
+    needs:
+      - matrix
+      - matrix-postgres
+      - lua-drift
+      - migration-parity
+      - smoke-sqlite
+      - publish-list-drift
+      - non-exhaustive-lint
+      - feature-propagation
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -482,6 +623,9 @@ jobs:
           DRIFT_RESULT: ${{ needs.lua-drift.result }}
           MIGRATION_PARITY_RESULT: ${{ needs.migration-parity.result }}
           SMOKE_SQLITE_RESULT: ${{ needs.smoke-sqlite.result }}
+          PUBLISH_LIST_DRIFT_RESULT: ${{ needs.publish-list-drift.result }}
+          NON_EXHAUSTIVE_LINT_RESULT: ${{ needs.non-exhaustive-lint.result }}
+          FEATURE_PROPAGATION_RESULT: ${{ needs.feature-propagation.result }}
         run: |
           fail=0
           case "$MATRIX_RESULT" in
@@ -503,5 +647,17 @@ jobs:
           case "$SMOKE_SQLITE_RESULT" in
             success|skipped) echo "smoke-sqlite: $SMOKE_SQLITE_RESULT — ok" ;;
             *) echo "smoke-sqlite: $SMOKE_SQLITE_RESULT — blocking merge" >&2; fail=1 ;;
+          esac
+          case "$PUBLISH_LIST_DRIFT_RESULT" in
+            success|skipped) echo "publish-list-drift: $PUBLISH_LIST_DRIFT_RESULT — ok" ;;
+            *) echo "publish-list-drift: $PUBLISH_LIST_DRIFT_RESULT — blocking merge" >&2; fail=1 ;;
+          esac
+          case "$NON_EXHAUSTIVE_LINT_RESULT" in
+            success|skipped) echo "non-exhaustive-lint: $NON_EXHAUSTIVE_LINT_RESULT — ok" ;;
+            *) echo "non-exhaustive-lint: $NON_EXHAUSTIVE_LINT_RESULT — blocking merge" >&2; fail=1 ;;
+          esac
+          case "$FEATURE_PROPAGATION_RESULT" in
+            success|skipped) echo "feature-propagation: $FEATURE_PROPAGATION_RESULT — ok" ;;
+            *) echo "feature-propagation: $FEATURE_PROPAGATION_RESULT — blocking merge" >&2; fail=1 ;;
           esac
           exit $fail
