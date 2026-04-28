@@ -94,6 +94,8 @@ async fn migrations_apply_and_schema_is_present() {
         // 0014 — cancel backlog
         "ff_cancel_backlog",
         "ff_cancel_backlog_member",
+        // 0017 — RFC-024 PR-E claim-grant table
+        "ff_claim_grant",
     ] {
         assert!(
             names.iter().any(|n| n == expected),
@@ -113,7 +115,9 @@ async fn migrations_apply_and_schema_is_present() {
 async fn sqlx_migration_ledger_records_all_14() {
     // Naming kept for git-diff continuity; the real count floats as
     // new migrations land. Current set: 0001..=0014 + 0016 (RFC-020
-    // Wave 9 follow-up #356; 0015 reserved for RFC-024 claim-grant).
+    // Wave 9 follow-up #356) + 0017 (RFC-024 PR-E claim-grant table).
+    // 0015 was reserved for RFC-024 but 0016 landed first; RFC-024
+    // PR-E lands on 0017 to avoid sequence collisions.
     let backend = fresh_backend().await;
     let pool = backend.pool_for_test();
 
@@ -122,7 +126,10 @@ async fn sqlx_migration_ledger_records_all_14() {
             .fetch_one(pool)
             .await
             .expect("query _sqlx_migrations");
-    assert_eq!(count, 15, "expected 15 successful migrations (0001..=0014 + 0016), got {count}");
+    assert_eq!(
+        count, 16,
+        "expected 16 successful migrations (0001..=0014 + 0016 + 0017), got {count}"
+    );
 }
 
 #[tokio::test]
@@ -172,9 +179,8 @@ async fn ff_execution_capabilities_junction_schema() {
 #[serial(ff_dev_mode)]
 async fn migration_annotation_ledger_populated() {
     // Every migration INSERTs a row into `ff_migration_annotation`;
-    // verify the expected set landed. 0015 is reserved for RFC-024
-    // (claim-grant table) and not yet shipped, so the current ledger
-    // is 0001..=0014 + 0016.
+    // verify the expected set landed. Current ledger is 0001..=0014
+    // + 0016 + 0017 (RFC-024 PR-E claim-grant table).
     let backend = fresh_backend().await;
     let pool = backend.pool_for_test();
 
@@ -186,5 +192,6 @@ async fn migration_annotation_ledger_populated() {
     let versions: Vec<i64> = rows.into_iter().map(|(v,)| v).collect();
     let mut expected: Vec<i64> = (1..=14).collect();
     expected.push(16);
+    expected.push(17);
     assert_eq!(versions, expected);
 }
