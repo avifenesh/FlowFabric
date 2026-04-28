@@ -99,12 +99,12 @@ pub enum IssueClaimGrantResult {
 /// `ff-sdk` (consumer, via `FlowFabricWorker::claim_from_grant`).
 /// Lives in `ff-core` so neither crate needs a dep on the other.
 ///
-/// **Lane asymmetry with [`ReclaimGrant`]:** `ClaimGrant` does NOT
+/// **Lane asymmetry with [`ResumeGrant`]:** `ClaimGrant` does NOT
 /// carry `lane_id`. The issuing scheduler's caller already picked
 /// a lane (that's how admission reached this grant) and passes it
 /// through to `claim_from_grant` as a separate argument. The grant
 /// handle stays narrow to what uniquely identifies the admission
-/// decision. The matching field on [`ReclaimGrant`] is an
+/// decision. The matching field on [`ResumeGrant`] is an
 /// intentional divergence — see the note on that type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimGrant {
@@ -142,23 +142,34 @@ impl ClaimGrant {
     }
 }
 
-/// A reclaim grant issued for a resumed (attempt_interrupted) execution.
+/// A resume grant issued for a resumed (attempt_interrupted) execution.
 ///
 /// Issued by a producer (typically `ff-scheduler` once a Batch-C
 /// reclaim scanner is in place; test fixtures in the interim — no
 /// production Rust caller exists in-tree today). Consumed by
-/// [`FlowFabricWorker::claim_from_reclaim_grant`], which calls
+/// [`FlowFabricWorker::claim_from_resume_grant`], which calls
 /// `ff_claim_resumed_execution` atomically: that FCALL validates the
 /// grant, consumes it, and transitions `attempt_interrupted` →
 /// `started` while preserving the existing `attempt_index` +
 /// `attempt_id` (a resumed execution re-uses its attempt; it does
 /// not start a new one).
 ///
+/// **Naming history (RFC-024).** This type was historically called
+/// `ReclaimGrant`, but its semantic has always been resume-after-
+/// suspend (the routing FCALL is `ff_claim_resumed_execution`, not
+/// `ff_reclaim_execution`). RFC-024 Rev 2 renames the type to
+/// `ResumeGrant` — the name now matches the semantic. A transitional
+/// compatibility alias `ReclaimGrant = ResumeGrant` is retained for
+/// one release to give consumers a `cargo fix`-compatible migration
+/// (no `#[deprecated]` marker — see the alias doc below for the
+/// rationale); the new lease-reclaim path uses a distinct (future)
+/// type.
+///
 /// Mirrors [`ClaimGrant`] for the resume path. Differences:
 ///
 ///   * [`ClaimGrant`] is issued against a freshly-eligible
 ///     execution and `ff_claim_execution` creates a new attempt.
-///   * [`ReclaimGrant`] is issued against an `attempt_interrupted`
+///   * `ResumeGrant` is issued against an `attempt_interrupted`
 ///     execution; `ff_claim_resumed_execution` re-uses the existing
 ///     attempt and bumps the lease epoch.
 ///
@@ -167,7 +178,7 @@ impl ClaimGrant {
 /// consumes it (`ff_claim_execution` for new attempts,
 /// `ff_claim_resumed_execution` for resumes).
 ///
-/// **Lane asymmetry with [`ClaimGrant`]:** `ReclaimGrant` CARRIES
+/// **Lane asymmetry with [`ClaimGrant`]:** `ResumeGrant` CARRIES
 /// `lane_id` as a field. The issuing path already knows the lane
 /// (it's read from `exec_core` at grant time); carrying it here
 /// spares the consumer a `HGET exec_core lane_id` round trip on
@@ -178,12 +189,12 @@ impl ClaimGrant {
 /// Shared wire-level type between the eventual `ff-scheduler`
 /// producer (Batch-C reclaim scanner — not yet in-tree; test
 /// fixtures construct this type today) and `ff-sdk` (consumer, via
-/// `FlowFabricWorker::claim_from_reclaim_grant`). Lives in
+/// `FlowFabricWorker::claim_from_resume_grant`). Lives in
 /// `ff-core` so neither crate needs a dep on the other.
 ///
-/// [`FlowFabricWorker::claim_from_reclaim_grant`]: https://docs.rs/ff-sdk
+/// [`FlowFabricWorker::claim_from_resume_grant`]: https://docs.rs/ff-sdk
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReclaimGrant {
+pub struct ResumeGrant {
     /// The execution granted for resumption.
     pub execution_id: ExecutionId,
     /// Opaque partition handle for this execution's hash-tag slot.
@@ -204,7 +215,7 @@ pub struct ReclaimGrant {
     pub lane_id: LaneId,
 }
 
-impl ReclaimGrant {
+impl ResumeGrant {
     /// Parse `partition_key` into a typed
     /// [`crate::partition::Partition`]. See [`ClaimGrant::partition`]
     /// for the alias-collapse note.
@@ -214,6 +225,17 @@ impl ReclaimGrant {
         self.partition_key.parse()
     }
 }
+
+/// Transitional alias for [`ResumeGrant`].
+///
+/// Retained for compile-time compatibility across the RFC-024 PR
+/// series. A follow-up PR rewrites downstream call sites to
+/// `ResumeGrant` and removes this alias; that same PR introduces a
+/// distinct new `ReclaimGrant` type for the lease-reclaim path
+/// (`reclaim_execution` / `ff_reclaim_execution`). No `#[deprecated]`
+/// marker on this PR because workspace clippy runs with `-D warnings`
+/// and the downstream rename sweep ships separately.
+pub type ReclaimGrant = ResumeGrant;
 
 // ─── claim_execution ───
 

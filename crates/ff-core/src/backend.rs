@@ -20,7 +20,7 @@
 //! See `rfcs/RFC-012-engine-backend-trait.md` §3.3.0 for the authoritative
 //! type inventory and §4.1-§4.2 for the `Handle` / `EngineError` shapes.
 
-use crate::contracts::ReclaimGrant;
+use crate::contracts::ResumeGrant;
 use crate::types::{TimestampMs, WaitpointToken, WorkerId, WorkerInstanceId};
 
 // DX (HHH v0.3.4 re-smoke): `Namespace` lives in `ff_core::types` but
@@ -102,11 +102,18 @@ impl BackendTag {
 pub enum HandleKind {
     /// Fresh claim — returned by `claim` / `claim_from_grant`.
     Fresh,
-    /// Resumed from reclaim — returned by `claim_from_reclaim`.
+    /// Resumed from resume grant — returned by `claim_from_reclaim`
+    /// (renames to `claim_from_resume_grant` per RFC-024).
     Resumed,
     /// Suspended — returned by `suspend`. Terminal for the lease;
     /// resumption mints a new Handle via `claim_from_reclaim`.
     Suspended,
+    /// Reclaimed from a lease-reclaim grant — returned by the new
+    /// `reclaim_execution` trait method (RFC-024). Distinct from
+    /// [`HandleKind::Resumed`] (suspend/resume path) and
+    /// [`HandleKind::Fresh`] (first claim). The backing lifecycle
+    /// creates a new attempt row and bumps the reclaim counter.
+    Reclaimed,
 }
 
 /// Backend-private opaque payload carried inside a [`Handle`].
@@ -830,19 +837,28 @@ impl UsageDimensions {
     }
 }
 
-// ── §3.3.0 Reclaim / lease types ────────────────────────────────────────
+// ── §3.3.0 Resume / lease types ────────────────────────────────────────
 
 /// Opaque cookie returned by the reclaim scanner; consumed by
-/// `claim_from_reclaim` to mint a resumed Handle.
+/// `claim_from_reclaim` (renames to `claim_from_resume_grant` per
+/// RFC-024) to mint a resumed Handle.
 ///
-/// Wraps [`ReclaimGrant`] today (the scanner's existing product).
-/// Kept as a newtype so trait signatures name the reclaim-bound role
+/// Wraps [`ResumeGrant`] today (the scanner's existing product).
+/// Kept as a newtype so trait signatures name the resume-bound role
 /// explicitly and so the wrapped shape can evolve without breaking the
 /// trait.
+///
+/// **Naming history (RFC-024).** This type was historically called
+/// `ReclaimToken`. Its semantic is resume-after-suspend (it wraps a
+/// `ResumeGrant` and feeds `ff_claim_resumed_execution`), so
+/// RFC-024 Rev 2 renames it. A transitional compatibility alias
+/// `ReclaimToken = ResumeToken` is retained for one release to ease
+/// consumer migration (no `#[deprecated]` marker — see the alias
+/// doc below for the rationale).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ReclaimToken {
-    pub grant: ReclaimGrant,
+pub struct ResumeToken {
+    pub grant: ResumeGrant,
     /// Worker identity that will claim the resumed execution.
     /// Wave 2 additive extension — mirrors the `ClaimPolicy`
     /// shape since `claim_from_reclaim` does not take a `ClaimPolicy`.
@@ -853,9 +869,9 @@ pub struct ReclaimToken {
     pub lease_ttl_ms: u32,
 }
 
-impl ReclaimToken {
+impl ResumeToken {
     pub fn new(
-        grant: ReclaimGrant,
+        grant: ResumeGrant,
         worker_id: WorkerId,
         worker_instance_id: WorkerInstanceId,
         lease_ttl_ms: u32,
@@ -868,6 +884,15 @@ impl ReclaimToken {
         }
     }
 }
+
+/// Transitional alias for [`ResumeToken`].
+///
+/// Retained for compile-time compatibility across the RFC-024 PR
+/// series. A follow-up PR rewrites downstream call sites to
+/// `ResumeToken` and removes this alias. No `#[deprecated]` marker
+/// here because workspace clippy runs with `-D warnings` and the
+/// downstream rename sweep ships separately.
+pub type ReclaimToken = ResumeToken;
 
 /// Result of a successful `renew` call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1602,7 +1627,7 @@ mod tests {
 
     #[test]
     fn reclaim_token_wraps_grant() {
-        let grant = ReclaimGrant {
+        let grant = ResumeGrant {
             execution_id: ExecutionId::solo(&LaneId::new("default"), &Default::default()),
             partition_key: crate::partition::PartitionKey::from(&Partition {
                 family: PartitionFamily::Flow,
@@ -1612,7 +1637,7 @@ mod tests {
             expires_at_ms: 123,
             lane_id: LaneId::new("default"),
         };
-        let t = ReclaimToken::new(
+        let t = ResumeToken::new(
             grant.clone(),
             WorkerId::new("w"),
             WorkerInstanceId::new("w-1"),
