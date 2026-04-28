@@ -35,6 +35,7 @@ mod lease_event_subscribe;
 mod operator;
 mod outbox_cursor;
 mod reads;
+mod reclaim;
 mod reconcilers;
 mod scanner_supervisor;
 mod signal_delivery_subscribe;

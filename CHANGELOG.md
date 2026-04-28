@@ -166,6 +166,43 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     TTL-expired grant, cap-exceeded at reclaim, scheduler
     write-through verification).
 
+- **RFC-024 PR-E — SQLite `issue_reclaim_grant` + `reclaim_execution`
+  impls + migration 0017 (advances closure of #371).** SQLite wiring
+  for the RFC-024 lease-reclaim path — the PR-B+C trait defaults are
+  replaced with real bodies on the SQLite backend. Parallel to PR-D
+  (Postgres); different backend crate, disjoint.
+  - `crates/ff-backend-sqlite/migrations/0017_claim_grant_table.sql`
+    — new `ff_claim_grant` table (SQLite-dialect port of PR-D's
+    Postgres migration; BLOB for raw bytes, TEXT JSON for
+    capabilities, no partitioning per RFC-023 §4.1 N=1 supervisor).
+    Additive column `ff_exec_core.lease_reclaim_count INTEGER NOT NULL
+    DEFAULT 0`. No JSON backfill: SQLite never shipped the PG scheduler
+    `claim_grant` JSON stash (RFC-023 §5 `claim_for_worker` non-goal).
+  - `crates/ff-backend-sqlite/src/queries/claim_grant.rs` — new
+    dialect-forked SQL strings (INSERT / SELECT / DELETE / UPDATE)
+    mirroring the PG reference one-for-one.
+  - `crates/ff-backend-sqlite/src/reclaim.rs` — new module carrying
+    `issue_reclaim_grant_impl` + `reclaim_execution_impl`. Both run
+    inside a single `BEGIN IMMEDIATE` txn (RFC-023 §4.3 RESERVED
+    write-lock substitute for PG `FOR UPDATE`). `reclaim_execution_impl`
+    marks the prior attempt `interrupted_reclaimed`, inserts a fresh
+    `ff_attempt` row (new attempt_index), bumps `lease_reclaim_count`,
+    consumes the grant row, emits an RFC-019 `reclaimed` lease event
+    via the post-commit `PubSub::lease_history` broadcast, and mints
+    a `HandleKind::Reclaimed` handle. Cap exceeded branch transitions
+    the execution to `terminal_failed` matching the Valkey Lua at
+    `flowfabric.lua:3049-3080`.
+  - `crates/ff-backend-sqlite/src/backend.rs` — `EngineBackend::issue_reclaim_grant`
+    + `EngineBackend::reclaim_execution` trait methods overridden
+    (wrapped in `retry_serializable`).
+  - `crates/ff-backend-sqlite/tests/rfc024_reclaim.rs` — 10 new
+    integration tests covering happy path, wrong-phase rejection,
+    `lease_revoked` admission, new-attempt semantics,
+    prior-attempt-interrupted marker, worker-id mismatch,
+    grant-not-found, grant-TTL-expired, cap-exceeded terminal
+    transition, and `HandleKind::Reclaimed` handle kind.
+  - Default max_reclaim_count: 1000 on the Rust surface (per RFC-024
+    §4.6); per-call override via `ReclaimExecutionArgs.max_reclaim_count`.
 - **RFC-024 PR-B+C — trait method renames + new `ReclaimGrant` type +
   non_exhaustive constructors (closes partial of #371).** Folded PR-B
   and PR-C of the RFC-024 series because the new trait method
