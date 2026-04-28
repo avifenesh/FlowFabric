@@ -367,19 +367,38 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Per-backend shape:
     ///
     /// * **Valkey** — `HGET {exec}:core current_attempt_index` on the
-    ///   execution's partition. Single command. A pre-claim execution
-    ///   (`exec_core` present but `current_attempt_index` absent or
-    ///   empty-string) reads back as `0` to match the pre-PR-3 inline
-    ///   SDK semantic — the downstream FCALL then surfaces the proper
-    ///   `NotAResumedExecution` / `ExecutionNotLeaseable` error.
+    ///   execution's partition. Single command. Both the
+    ///   **missing-field** case (`exec_core` present but
+    ///   `current_attempt_index` absent or empty-string, i.e. pre-claim
+    ///   state) **and** the **missing-row** case (no `exec_core` hash
+    ///   at all) read back as `AttemptIndex(0)`. This preserves the
+    ///   pre-PR-3 inline-`HGET` semantic and is safe because Valkey's
+    ///   happy path requires `exec_core` to exist before this method
+    ///   is reached — the SDK only calls `read_current_attempt_index`
+    ///   post-grant, and grant issuance is gated on `exec_core`
+    ///   presence. A genuinely absent row would surface as the proper
+    ///   business-logic error (`NotAResumedExecution` /
+    ///   `ExecutionNotLeaseable`) on the downstream FCALL.
     /// * **Postgres** — `SELECT attempt_index FROM ff_exec_core
-    ///   WHERE partition_key = $1 AND execution_id = $2`; the column
-    ///   is `NOT NULL DEFAULT 0` so a pre-claim row naturally reads
-    ///   back as `0`. Missing row surfaces as `InvalidInput`.
+    ///   WHERE partition_key = $1 AND execution_id = $2`. The column
+    ///   is `NOT NULL DEFAULT 0` so a pre-claim row reads back as `0`
+    ///   (matching Valkey's missing-field case). **Missing row**
+    ///   surfaces as [`EngineError::Validation { kind:
+    ///   ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+    ///   — diverges from Valkey's missing-row `→ 0` mapping.
     /// * **SQLite** — `SELECT attempt_index FROM ff_exec_core
-    ///   WHERE partition_key = ? AND execution_id = ?`; same semantics
-    ///   as PG (column is `NOT NULL DEFAULT 0`; missing row surfaces
-    ///   as `InvalidInput`).
+    ///   WHERE partition_key = ? AND execution_id = ?`; identical
+    ///   semantics to Postgres (missing-row → `InvalidInput`).
+    ///
+    /// **Cross-backend asymmetry on missing row is intentional.** The
+    /// SDK happy path never observes it (grant issuance on Valkey
+    /// requires `exec_core`, and PG/SQLite currently return
+    /// `Unavailable` from `claim_from_grant` per
+    /// `project_claim_from_grant_pg_sqlite_gap.md`). Consumers writing
+    /// backend-agnostic tooling against this method directly must
+    /// treat the missing-row case as backend-dependent — match on
+    /// `InvalidInput` for PG/SQLite, and treat an unexpected `0` as
+    /// the Valkey equivalent signal.
     ///
     /// The default impl returns [`EngineError::Unavailable`] so the
     /// trait addition is non-breaking for out-of-tree backends (same
