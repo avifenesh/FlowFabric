@@ -1785,12 +1785,12 @@ mod claim_grant_dto_tests {
         let fid = FlowId::new();
         let eid = ExecutionId::for_flow(&fid, &config);
         let p = Partition { family, index: 7 };
-        ClaimGrant {
-            execution_id: eid,
-            partition_key: PartitionKey::from(&p),
-            grant_key: "ff:exec:{fp:7}:deadbeef:claim_grant".to_owned(),
-            expires_at_ms: 1_700_000_000_000,
-        }
+        ClaimGrant::new(
+            eid,
+            PartitionKey::from(&p),
+            "ff:exec:{fp:7}:deadbeef:claim_grant".to_owned(),
+            1_700_000_000_000,
+        )
     }
 
     #[test]

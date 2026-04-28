@@ -5058,17 +5058,17 @@ async fn test_claim_from_grant_rejects_at_capacity() {
     // moved into the saturated call. The grant values are
     // unchanged; we just rebuild the Rust wrapper around the same
     // Valkey key.
-    let rebuilt_g2 = ff_core::contracts::ClaimGrant {
-        execution_id: eid_b.clone(),
-        partition_key: ff_core::partition::PartitionKey::from(
+    // expires_at_ms is advisory on the consumer side; Lua enforces the
+    // real expiry via its own TIME read, so copying any value from the
+    // pre-rejection grant is fine.
+    let rebuilt_g2 = ff_core::contracts::ClaimGrant::new(
+        eid_b.clone(),
+        ff_core::partition::PartitionKey::from(
             &ff_core::partition::execution_partition(&eid_b, &test_config()),
         ),
-        grant_key: g2_key.clone(),
-        // expires_at_ms is advisory on the consumer side; Lua
-        // enforces the real expiry via its own TIME read, so
-        // copying any value from the pre-rejection grant is fine.
-        expires_at_ms: u64::MAX,
-    };
+        g2_key.clone(),
+        u64::MAX,
+    );
 
     let task2 = second_worker
         .claim_from_grant(lane_id.clone(), rebuilt_g2)
@@ -8826,7 +8826,7 @@ async fn test_capable_worker_unblocks_on_get_error_failopen() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// FlowFabricWorker::claim_from_reclaim_grant (cairn-fabric P1B)
+// FlowFabricWorker::claim_from_resume_grant (cairn-fabric P1B)
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Write the test partition config into Valkey so the SDK's worker
@@ -8873,7 +8873,7 @@ async fn build_reclaim_test_worker(
 /// Drive an execution through create → claim → suspend → deliver-signal,
 /// leaving it in `attempt_interrupted` with the suspended/runnable
 /// transition already completed. Returns the eid plus the `ReclaimGrant`
-/// a caller can pass to `claim_from_reclaim_grant`.
+/// a caller can pass to `claim_from_resume_grant`.
 ///
 /// `grant_ttl_ms` is the TTL for the claim-grant the resumed-path
 /// consumer reads. Short TTL = fast expiry test; long TTL = happy path.
@@ -8883,7 +8883,7 @@ async fn suspend_resume_setup_with_grant(
     grant_ttl_ms: u64,
     grant_worker_id: &str,
     grant_worker_instance_id: &str,
-) -> ff_core::contracts::ReclaimGrant {
+) -> ff_core::contracts::ResumeGrant {
     // 1. create + claim the initial attempt
     fcall_create_execution(tc, eid, NS, LANE, "reclaim_grant_test", 0).await;
     fcall_issue_claim_grant(tc, eid, LANE, WORKER, WORKER_INST).await;
@@ -8951,23 +8951,23 @@ async fn suspend_resume_setup_with_grant(
         .and_then(|s| s.parse().ok())
         .expect("grant_expires_at should be numeric");
 
-    ff_core::contracts::ReclaimGrant {
-        execution_id: eid.clone(),
-        partition_key: ff_core::partition::PartitionKey::from(&partition),
+    ff_core::contracts::ResumeGrant::new(
+        eid.clone(),
+        ff_core::partition::PartitionKey::from(&partition),
         grant_key,
         expires_at_ms,
         lane_id,
-    }
+    )
 }
 
-/// Happy path + control: `claim_from_reclaim_grant` resumes the
+/// Happy path + control: `claim_from_resume_grant` resumes the
 /// suspended execution cleanly. Paired with the expiry test — both use
 /// the same setup; this one consumes the grant immediately to prove
 /// the flow works, the other waits out the TTL to prove the expiry
 /// check fires.
 #[tokio::test]
 #[serial_test::serial]
-async fn test_claim_from_reclaim_grant_happy_path() {
+async fn test_claim_from_resume_grant_happy_path() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
@@ -8981,7 +8981,7 @@ async fn test_claim_from_reclaim_grant_happy_path() {
 
     let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
     let claimed = worker
-        .claim_from_reclaim_grant(grant)
+        .claim_from_resume_grant(grant)
         .await
         .expect("happy path should succeed");
 
@@ -9009,7 +9009,7 @@ async fn test_claim_from_reclaim_grant_happy_path() {
 /// real TTL check.
 #[tokio::test]
 #[serial_test::serial]
-async fn test_claim_from_reclaim_grant_immediate_control() {
+async fn test_claim_from_resume_grant_immediate_control() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
@@ -9023,7 +9023,7 @@ async fn test_claim_from_reclaim_grant_immediate_control() {
 
     let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
     let claimed = worker
-        .claim_from_reclaim_grant(grant)
+        .claim_from_resume_grant(grant)
         .await
         .expect("control: short-TTL grant claimed immediately should still succeed");
 
@@ -9035,7 +9035,7 @@ async fn test_claim_from_reclaim_grant_immediate_control() {
 /// "short TTL always fails" flakiness.
 #[tokio::test]
 #[serial_test::serial]
-async fn test_claim_from_reclaim_grant_expired() {
+async fn test_claim_from_resume_grant_expired() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
@@ -9051,7 +9051,7 @@ async fn test_claim_from_reclaim_grant_expired() {
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
-    match worker.claim_from_reclaim_grant(grant).await {
+    match worker.claim_from_resume_grant(grant).await {
         // Either error is acceptable:
         //   * `ClaimGrantExpired` fires when the FCALL observes the
         //     grant key still present but `grant_expires_at < now_ms`
@@ -9071,11 +9071,11 @@ async fn test_claim_from_reclaim_grant_expired() {
     }
 }
 
-/// Grant issued to worker A → worker B calls `claim_from_reclaim_grant`
+/// Grant issued to worker A → worker B calls `claim_from_resume_grant`
 /// → `ScriptError::InvalidClaimGrant`.
 #[tokio::test]
 #[serial_test::serial]
-async fn test_claim_from_reclaim_grant_wrong_worker() {
+async fn test_claim_from_resume_grant_wrong_worker() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
@@ -9088,7 +9088,7 @@ async fn test_claim_from_reclaim_grant_wrong_worker() {
 
     // Build a FlowFabricWorker with a DIFFERENT worker_id.
     let worker = build_reclaim_test_worker("worker-b", "worker-b-inst").await;
-    match worker.claim_from_reclaim_grant(grant).await {
+    match worker.claim_from_resume_grant(grant).await {
         Err(ff_sdk::SdkError::Engine(ref _b))
             if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::InvalidClaimGrant)) =>
         {}
@@ -9103,7 +9103,7 @@ async fn test_claim_from_reclaim_grant_wrong_worker() {
 /// path instead of the normal claim path.
 #[tokio::test]
 #[serial_test::serial]
-async fn test_claim_from_reclaim_grant_not_resumed() {
+async fn test_claim_from_resume_grant_not_resumed() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
@@ -9123,16 +9123,16 @@ async fn test_claim_from_reclaim_grant_not_resumed() {
     let expires_at_str: Option<String> = tc.hget(&grant_key, "grant_expires_at").await;
     let expires_at_ms: u64 = expires_at_str.as_deref().and_then(|s| s.parse().ok()).unwrap();
 
-    let grant = ff_core::contracts::ReclaimGrant {
-        execution_id: eid.clone(),
-        partition_key: ff_core::partition::PartitionKey::from(&partition),
+    let grant = ff_core::contracts::ResumeGrant::new(
+        eid.clone(),
+        ff_core::partition::PartitionKey::from(&partition),
         grant_key,
         expires_at_ms,
-        lane_id: LaneId::new(LANE),
-    };
+        LaneId::new(LANE),
+    );
 
     let worker = build_reclaim_test_worker(WORKER, WORKER_INST).await;
-    match worker.claim_from_reclaim_grant(grant).await {
+    match worker.claim_from_resume_grant(grant).await {
         Err(ff_sdk::SdkError::Engine(ref _b))
             if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::NotAResumedExecution)) =>
         {}
@@ -9153,7 +9153,7 @@ async fn test_claim_from_reclaim_grant_not_resumed() {
 /// fails with `InvalidClaimGrant`.
 #[tokio::test]
 #[serial_test::serial]
-async fn test_claim_from_reclaim_grant_double_consume() {
+async fn test_claim_from_resume_grant_double_consume() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
@@ -9167,7 +9167,7 @@ async fn test_claim_from_reclaim_grant_double_consume() {
 
     // First consumption succeeds.
     let claimed = worker
-        .claim_from_reclaim_grant(grant.clone())
+        .claim_from_resume_grant(grant.clone())
         .await
         .expect("first consume should succeed");
 
@@ -9180,7 +9180,7 @@ async fn test_claim_from_reclaim_grant_double_consume() {
     // `ExecutionNotLeaseable`. If an attacker/race ordered calls
     // differently we'd also see `InvalidClaimGrant` — accept either
     // as proof the second consume was rejected.
-    match worker.claim_from_reclaim_grant(grant).await {
+    match worker.claim_from_resume_grant(grant).await {
         Err(ff_sdk::SdkError::Engine(ref _b))
             if matches!(**_b, ff_sdk::EngineError::Contention(ff_sdk::ContentionKind::ExecutionNotLeaseable)) =>
         {}
@@ -9196,7 +9196,7 @@ async fn test_claim_from_reclaim_grant_double_consume() {
     claimed.complete(None).await.unwrap();
 }
 
-/// Saturation guard for `claim_from_reclaim_grant` — mirrors
+/// Saturation guard for `claim_from_resume_grant` — mirrors
 /// `test_claim_from_grant_rejects_at_capacity`. A worker at
 /// `max_concurrent_tasks=1` with its single permit in flight must
 /// refuse a second reclaim grant with `SdkError::WorkerAtCapacity`
@@ -9204,7 +9204,7 @@ async fn test_claim_from_reclaim_grant_double_consume() {
 /// is not atomically consumed).
 ///
 /// Caught during cross-review round 2: the original
-/// `claim_from_reclaim_grant` did NOT acquire a concurrency permit,
+/// `claim_from_resume_grant` did NOT acquire a concurrency permit,
 /// which on a saturated worker silently exceeded
 /// `max_concurrent_tasks` and handed back a `ClaimedTask` without a
 /// permit to release — violating the concurrency contract the user
@@ -9212,7 +9212,7 @@ async fn test_claim_from_reclaim_grant_double_consume() {
 /// pattern exactly.
 #[tokio::test]
 #[serial_test::serial]
-async fn test_claim_from_reclaim_grant_rejects_at_capacity() {
+async fn test_claim_from_resume_grant_rejects_at_capacity() {
     let tc = TestCluster::connect().await;
     tc.cleanup().await;
     write_test_partition_config(&tc).await;
@@ -9248,13 +9248,13 @@ async fn test_claim_from_reclaim_grant_rejects_at_capacity() {
 
     // 1st reclaim takes the sole permit.
     let task_a = worker
-        .claim_from_reclaim_grant(grant_a)
+        .claim_from_resume_grant(grant_a)
         .await
         .expect("first reclaim should take the permit");
 
     // 2nd reclaim must refuse at capacity, BEFORE invoking the Lua
     // FCALL that would atomically consume the grant key.
-    match worker.claim_from_reclaim_grant(grant_b).await {
+    match worker.claim_from_resume_grant(grant_b).await {
         Err(ff_sdk::SdkError::WorkerAtCapacity) => {}
         Err(other) => panic!("expected WorkerAtCapacity, got {other:?}"),
         Ok(_) => panic!("saturated worker should not claim"),
@@ -9277,7 +9277,7 @@ async fn test_claim_from_reclaim_grant_rejects_at_capacity() {
         .expect("EXISTS on grant_key");
     assert_eq!(exists, 1,
         "reclaim grant_key must still exist after capacity reject — \
-         claim_from_reclaim_grant must not fire ff_claim_resumed_execution \
+         claim_from_resume_grant must not fire ff_claim_resumed_execution \
          when the semaphore is drained");
 
     // Cleanup so the lease from task_a doesn't linger into the next

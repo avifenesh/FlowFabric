@@ -53,7 +53,8 @@ use crate::backend::{
     PrepareOutcome, ResumeSignal, ResumeToken, SummaryDocument, TailVisibility,
 };
 use crate::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
+    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
+    IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReportUsageResult,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
 };
@@ -254,11 +255,48 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// `Ok(None)` when the grant's target execution is no longer
     /// resumable (already reclaimed, terminal, etc.).
     ///
-    /// **Naming history (RFC-024).** The method name + token name
-    /// historically said "reclaim" but the semantic has always been
-    /// resume-after-suspend. The token type is now `ResumeToken`; a
-    /// follow-up PR renames this method to `claim_from_resume_grant`.
-    async fn claim_from_reclaim(&self, token: ResumeToken) -> Result<Option<Handle>, EngineError>;
+    /// **Renamed from `claim_from_reclaim` (RFC-024 PR-B+C).** The
+    /// pre-rename name advertised "reclaim" but the semantic has
+    /// always been resume-after-suspend. The new lease-reclaim path
+    /// lives on [`Self::reclaim_execution`].
+    async fn claim_from_resume_grant(
+        &self,
+        token: ResumeToken,
+    ) -> Result<Option<Handle>, EngineError>;
+
+    /// Issue a lease-reclaim grant (RFC-024 §3.2). Admits executions
+    /// in `lease_expired_reclaimable` or `lease_revoked` state to the
+    /// reclaim path; the returned [`IssueReclaimGrantOutcome::Granted`]
+    /// carries a [`crate::contracts::ReclaimGrant`] which is then fed
+    /// to [`Self::reclaim_execution`] to mint a fresh attempt.
+    ///
+    /// Default impl returns [`EngineError::Unavailable`] — PR-D (PG),
+    /// PR-E (SQLite), and PR-F (Valkey) override with real bodies.
+    async fn issue_reclaim_grant(
+        &self,
+        _args: IssueReclaimGrantArgs,
+    ) -> Result<IssueReclaimGrantOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "issue_reclaim_grant",
+        })
+    }
+
+    /// Consume a [`crate::contracts::ReclaimGrant`] to mint a fresh
+    /// attempt for a previously lease-expired / lease-revoked
+    /// execution (RFC-024 §3.2). Creates a new attempt row, bumps the
+    /// execution's `lease_reclaim_count`, and mints a
+    /// [`crate::backend::HandleKind::Reclaimed`] handle.
+    ///
+    /// Default impl returns [`EngineError::Unavailable`] — PR-D (PG),
+    /// PR-E (SQLite), and PR-F (Valkey) override with real bodies.
+    async fn reclaim_execution(
+        &self,
+        _args: ReclaimExecutionArgs,
+    ) -> Result<ReclaimExecutionOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "reclaim_execution",
+        })
+    }
 
     // Round-5 amendment: lease-releasing peers of `suspend`.
 
@@ -532,7 +570,7 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// same attempt index.
     ///
     /// Distinct from [`Self::claim`] (fresh work) and
-    /// [`Self::claim_from_reclaim`] (grant-based ownership transfer
+    /// [`Self::claim_from_resume_grant`] (grant-based ownership transfer
     /// after a crash): the resumed-claim path re-binds an existing
     /// attempt rather than minting a new one. The backend issues a
     /// fresh `lease_id` + bumps the `lease_epoch`, preserving
@@ -1391,7 +1429,7 @@ mod tests {
         ) -> Result<Vec<ResumeSignal>, EngineError> {
             unreachable!()
         }
-        async fn claim_from_reclaim(
+        async fn claim_from_resume_grant(
             &self,
             _token: ResumeToken,
         ) -> Result<Option<Handle>, EngineError> {

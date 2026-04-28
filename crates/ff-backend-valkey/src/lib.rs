@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, BackendConnection, CancelFlowPolicy, CancelFlowWait,
     CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason, Frame, Handle,
-    HandleKind, LeaseRenewal, PatchKind, PendingWaitpoint, ReclaimToken, ResumeSignal,
+    HandleKind, LeaseRenewal, PatchKind, PendingWaitpoint, ResumeSignal, ResumeToken,
     StreamMode, SummaryDocument, TailVisibility, UsageDimensions, WaitpointHmac,
 };
 use ff_core::contracts::decode::{
@@ -3624,7 +3624,7 @@ async fn suspend_impl(
             // execution identity. The new handle has the same fence
             // triple as the caller's pre-suspend handle — its purpose
             // is to carry a `HandleKind::Suspended` tag for
-            // `observe_signals` / `claim_from_reclaim` routing.
+            // `observe_signals` / `claim_from_resume_grant` routing.
             let suspended_handle = handle_codec::encode_handle(f, HandleKind::Suspended);
             Ok(SuspendOutcome::Suspended {
                 details,
@@ -3914,11 +3914,11 @@ async fn claim_impl(
     Ok(None)
 }
 
-/// Resume-claim implementation — consumes a `ReclaimToken` and routes
+/// Resume-claim implementation — consumes a `ResumeToken` and routes
 /// through `ff_claim_resumed_execution`. Worker identity + lease TTL
 /// ride on the token (Wave 2 additive extension).
 #[tracing::instrument(
-    name = "ff.claim_from_reclaim",
+    name = "ff.claim_from_resume_grant",
     skip_all,
     fields(
         backend = "valkey",
@@ -3926,10 +3926,10 @@ async fn claim_impl(
         worker_instance_id = %token.worker_instance_id,
     )
 )]
-async fn claim_from_reclaim_impl(
+async fn claim_from_resume_grant_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
-    token: ReclaimToken,
+    token: ResumeToken,
 ) -> Result<Option<Handle>, EngineError> {
     let execution_id = token.grant.execution_id.clone();
     let lane_id = token.grant.lane_id.clone();
@@ -4320,16 +4320,16 @@ impl EngineBackend for ValkeyBackend {
             })
     }
 
-    async fn claim_from_reclaim(
+    async fn claim_from_resume_grant(
         &self,
-        token: ReclaimToken,
+        token: ResumeToken,
     ) -> Result<Option<Handle>, EngineError> {
-        claim_from_reclaim_impl(&self.client, &self.partition_config, token)
+        claim_from_resume_grant_impl(&self.client, &self.partition_config, token)
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(
                     e,
-                    "claim_from_reclaim: FCALL ff_claim_resumed_execution",
+                    "claim_from_resume_grant: FCALL ff_claim_resumed_execution",
                 )
             })
     }

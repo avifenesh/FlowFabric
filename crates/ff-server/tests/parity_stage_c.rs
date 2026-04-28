@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility, UsageDimensions,
+    ResumeToken, ResumeSignal, SummaryDocument, TailVisibility, UsageDimensions,
 };
 use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
@@ -161,11 +161,11 @@ impl EngineBackend for MockBackend {
     ) -> Result<Vec<ResumeSignal>, EngineError> {
         Err(unavailable("mock::observe_signals"))
     }
-    async fn claim_from_reclaim(
+    async fn claim_from_resume_grant(
         &self,
-        _token: ReclaimToken,
+        _token: ResumeToken,
     ) -> Result<Option<Handle>, EngineError> {
-        Err(unavailable("mock::claim_from_reclaim"))
+        Err(unavailable("mock::claim_from_resume_grant"))
     }
     async fn delay(
         &self,
@@ -981,12 +981,12 @@ async fn claim_for_worker_granted_returns_grant_shape() {
     let partition = PartitionConfig::default();
     let eid = ExecutionId::for_flow(&FlowId::new(), &partition);
     let part = ff_core::partition::execution_partition(&eid, &partition);
-    let grant = ClaimGrant {
-        execution_id: eid.clone(),
-        partition_key: PartitionKey::from(&part),
-        grant_key: "ff:exec:{p:0}:xxx:claim_grant".into(),
-        expires_at_ms: 30_000,
-    };
+    let grant = ClaimGrant::new(
+        eid.clone(),
+        PartitionKey::from(&part),
+        "ff:exec:{p:0}:xxx:claim_grant".into(),
+        30_000,
+    );
     {
         let mut g = mock.scripted.lock().unwrap();
         g.claim_for_worker = Some(Ok(ClaimForWorkerOutcome::granted(grant.clone())));

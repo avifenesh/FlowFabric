@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy, FailOutcome,
-    FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint, ReclaimToken,
+    FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint, ResumeToken,
     ResumeSignal,
 };
 use ff_core::contracts::{
@@ -230,11 +230,11 @@ impl<H: LayerHooks> EngineBackend for HookedBackend<H> {
         )
     }
 
-    async fn claim_from_reclaim(&self, token: ReclaimToken) -> Result<Option<Handle>, EngineError> {
+    async fn claim_from_resume_grant(&self, token: ResumeToken) -> Result<Option<Handle>, EngineError> {
         with_hooks!(
             self,
-            "claim_from_reclaim",
-            self.inner.claim_from_reclaim(token).await
+            "claim_from_resume_grant",
+            self.inner.claim_from_resume_grant(token).await
         )
     }
 

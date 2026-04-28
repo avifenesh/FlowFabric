@@ -1,6 +1,6 @@
 //! Integration coverage for
 //! [`ff_core::engine_backend::EngineBackend::claim`] and
-//! [`ff_core::engine_backend::EngineBackend::claim_from_reclaim`] on
+//! [`ff_core::engine_backend::EngineBackend::claim_from_resume_grant`] on
 //! the Valkey-backed impl (v0.7 Wave 2).
 //!
 //! Covers:
@@ -11,7 +11,7 @@
 //!     worker's CapabilitySet doesn't cover required_capabilities, so
 //!     `claim` returns `Ok(None)`.
 //!   * Empty eligible set — nothing to claim, `Ok(None)`.
-//!   * claim_from_reclaim happy path — consumes a `ReclaimToken`
+//!   * claim_from_resume_grant happy path — consumes a `ResumeToken`
 //!     (Wave 2 extended shape with worker identity) and mints a
 //!     `HandleKind::Resumed` handle with a bumped lease_epoch.
 //!
@@ -23,9 +23,9 @@ use std::sync::Arc;
 use ferriskey::Value;
 use ff_backend_valkey::ValkeyBackend;
 use ff_core::backend::{
-    BackendTag, CapabilitySet, ClaimPolicy, HandleKind, ReclaimToken,
+    BackendTag, CapabilitySet, ClaimPolicy, HandleKind, ResumeToken,
 };
-use ff_core::contracts::{DeliverSignalArgs, ReclaimGrant};
+use ff_core::contracts::{DeliverSignalArgs, ResumeGrant};
 use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{execution_partition, PartitionConfig, PartitionKey};
@@ -203,10 +203,10 @@ async fn claim_capability_mismatch_returns_none() {
     assert!(out.is_none(), "expected Ok(None), got {out:?}");
 }
 
-// ───────────────────────── claim_from_reclaim ─────────────────────────
+// ───────────────────────── claim_from_resume_grant ─────────────────────────
 
 /// Seed an execution, claim it, suspend it, deliver a resuming signal,
-/// and leave the exec ready for `claim_from_reclaim`. Returns
+/// and leave the exec ready for `claim_from_resume_grant`. Returns
 /// `(exec_id, lease_epoch_before_reclaim)`.
 async fn seed_resumable(tc: &TestCluster, eid: &ExecutionId) -> u64 {
     let partition = execution_partition(eid, &config());
@@ -379,22 +379,22 @@ async fn seed_resumable(tc: &TestCluster, eid: &ExecutionId) -> u64 {
         .await
         .expect("deliver_signal should resume");
 
-    // A fresh grant is required before claim_from_reclaim consumes it.
+    // A fresh grant is required before claim_from_resume_grant consumes it.
     issue_grant(tc, eid, "").await;
 
     epoch_before
 }
 
-fn synthetic_reclaim_grant(eid: &ExecutionId) -> ReclaimGrant {
+fn synthetic_reclaim_grant(eid: &ExecutionId) -> ResumeGrant {
     let partition = execution_partition(eid, &config());
     let ctx = ExecKeyContext::new(&partition, eid);
-    ReclaimGrant {
-        execution_id: eid.clone(),
-        partition_key: PartitionKey::from(&partition),
-        grant_key: ctx.claim_grant(),
-        expires_at_ms: 0, // unused by the Valkey resume path
-        lane_id: LaneId::new(LANE),
-    }
+    ResumeGrant::new(
+        eid.clone(),
+        PartitionKey::from(&partition),
+        ctx.claim_grant(),
+        0, // unused by the Valkey resume path
+        LaneId::new(LANE),
+    )
 }
 
 #[tokio::test]
@@ -407,7 +407,7 @@ async fn claim_from_reclaim_happy_path_bumps_epoch() {
     let epoch_before = seed_resumable(&tc, &eid).await;
 
     let grant = synthetic_reclaim_grant(&eid);
-    let token = ReclaimToken::new(
+    let token = ResumeToken::new(
         grant,
         WorkerId::new(WORKER),
         WorkerInstanceId::new(WORKER_INST),
@@ -416,10 +416,10 @@ async fn claim_from_reclaim_happy_path_bumps_epoch() {
 
     let backend = build_backend(&tc).await;
     let handle = backend
-        .claim_from_reclaim(token)
+        .claim_from_resume_grant(token)
         .await
-        .expect("claim_from_reclaim should succeed")
-        .expect("claim_from_reclaim should return Some on resumed exec");
+        .expect("claim_from_resume_grant should succeed")
+        .expect("claim_from_resume_grant should return Some on resumed exec");
 
     assert_eq!(handle.backend, BackendTag::Valkey);
     assert_eq!(handle.kind, HandleKind::Resumed);
@@ -456,7 +456,7 @@ async fn claim_from_reclaim_double_consume_surfaces_typed_error() {
     let _ = seed_resumable(&tc, &eid).await;
 
     let grant = synthetic_reclaim_grant(&eid);
-    let token = ReclaimToken::new(
+    let token = ResumeToken::new(
         grant,
         WorkerId::new(WORKER),
         WorkerInstanceId::new(WORKER_INST),
@@ -465,19 +465,19 @@ async fn claim_from_reclaim_double_consume_surfaces_typed_error() {
 
     let backend = build_backend(&tc).await;
     let _first = backend
-        .claim_from_reclaim(token.clone())
+        .claim_from_resume_grant(token.clone())
         .await
-        .expect("first claim_from_reclaim should succeed")
-        .expect("first claim_from_reclaim should return Some");
+        .expect("first claim_from_resume_grant should succeed")
+        .expect("first claim_from_resume_grant should return Some");
 
     // Second consume on the same grant: the grant key was consumed by
     // the first FCALL and the lease is now held by the first claim, so
     // the FCALL surfaces a typed ScriptError (invalid_claim_grant /
     // claim_grant_consumed / lease_conflict depending on wire state).
     let err = backend
-        .claim_from_reclaim(token)
+        .claim_from_resume_grant(token)
         .await
-        .expect_err("second claim_from_reclaim should fail");
+        .expect_err("second claim_from_resume_grant should fail");
     let s = err.to_string();
     assert!(
         s.contains("invalid_claim_grant")

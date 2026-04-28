@@ -6,7 +6,7 @@
 //!     attempt interrupted + execution re-eligible. Same with retries
 //!     exhausted → terminal + completion event emitted.
 //!   * `lease_expiry` — orphaned lease → reclaim becomes redeemable
-//!     via `claim_from_reclaim`.
+//!     via `claim_from_resume_grant`.
 //!   * `suspension_timeout` — `Fail` behavior → terminal; `Signal`
 //!     behavior → synthetic timeout entry in member_map + timeout
 //!     cleared so the scanner doesn't re-fire.

@@ -1432,10 +1432,15 @@ impl FlowFabricWorker {
         self.claim_from_grant(lane.clone(), grant).await.map(Some)
     }
 
-    /// Consume a [`ReclaimGrant`] and transition the granted
+    /// Consume a [`ResumeGrant`] and transition the granted
     /// `attempt_interrupted` execution into a `started` state on this
     /// worker. Symmetric partner to [`claim_from_grant`] for the
     /// resume path.
+    ///
+    /// **Renamed from `claim_from_reclaim_grant` (RFC-024 PR-B+C).**
+    /// The new `claim_from_reclaim_grant` method lands with PR-G and
+    /// dispatches to [`EngineBackend::reclaim_execution`] for the
+    /// lease-reclaim path (distinct semantic, distinct grant type).
     ///
     /// The grant must have been issued to THIS worker (matching
     /// `worker_id` at grant time). A mismatch returns
@@ -1474,12 +1479,12 @@ impl FlowFabricWorker {
     /// * [`SdkError::Backend`] / [`SdkError::BackendContext`] —
     ///   transport.
     ///
-    /// [`ReclaimGrant`]: ff_core::contracts::ReclaimGrant
+    /// [`ResumeGrant`]: ff_core::contracts::ResumeGrant
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
     #[cfg(feature = "valkey-default")]
-    pub async fn claim_from_reclaim_grant(
+    pub async fn claim_from_resume_grant(
         &self,
-        grant: ff_core::contracts::ReclaimGrant,
+        grant: ff_core::contracts::ResumeGrant,
     ) -> Result<ClaimedTask, SdkError> {
         // Semaphore check FIRST — same load-bearing ordering as
         // `claim_from_grant`. If the worker is saturated, surface
@@ -1496,7 +1501,7 @@ impl FlowFabricWorker {
         // Grant carries partition + lane_id so no round-trip is needed
         // to resolve them before the FCALL.
         let partition = grant.partition().map_err(|e| SdkError::Config {
-            context: "claim_from_reclaim_grant".to_owned(),
+            context: "claim_from_resume_grant".to_owned(),
             field: Some("partition_key".to_owned()),
             message: e.to_string(),
         })?;
@@ -1517,9 +1522,9 @@ impl FlowFabricWorker {
     /// returns a [`ClaimedTask`] bound to the resumed attempt.
     ///
     /// The method stays private; external callers use
-    /// [`claim_from_reclaim_grant`].
+    /// [`claim_from_resume_grant`].
     ///
-    /// [`claim_from_reclaim_grant`]: FlowFabricWorker::claim_from_reclaim_grant
+    /// [`claim_from_resume_grant`]: FlowFabricWorker::claim_from_resume_grant
     #[cfg(feature = "valkey-default")]
     async fn claim_resumed_execution(
         &self,

@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, BackendTag, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, HandleKind, HandleOpaque,
-    LeaseRenewal, PendingWaitpoint, ReclaimToken, ResumeSignal, UsageDimensions, WaitpointHmac,
+    LeaseRenewal, PendingWaitpoint, ResumeToken, ResumeSignal, UsageDimensions, WaitpointHmac,
 };
 use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
@@ -187,11 +187,11 @@ impl EngineBackend for PassthroughBackend {
         Ok(Vec::new())
     }
 
-    async fn claim_from_reclaim(
+    async fn claim_from_resume_grant(
         &self,
-        _token: ReclaimToken,
+        _token: ResumeToken,
     ) -> Result<Option<Handle>, EngineError> {
-        self.record("claim_from_reclaim")?;
+        self.record("claim_from_resume_grant")?;
         Ok(None)
     }
 
