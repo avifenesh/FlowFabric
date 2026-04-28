@@ -23,6 +23,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `ff-backend-sqlite`: `backend.rs` `:memory:` URI rewrite comment
+  corrected to match the code (`file::memory:?cache=shared` — no
+  `uri=true` query param; sqlx infers URI mode from the `file:`
+  prefix). Doc-only.
+- `ff-backend-sqlite`: `tests/hot_path.rs` comment on
+  `claim_happy_path_mints_handle_and_transitions_state` clarified —
+  removed the inaccurate "column remained at `'waiting'`" literal
+  (the seed row uses `'pending'`); now describes the general bug
+  (claim path did not update `public_state` at all) without naming
+  a specific pre-claim literal. Doc-only.
+- `scripts/smoke-sqlite.sh`: guard leg now distinguishes a clean
+  refusal from a crash/link-error / empty-output case by asserting
+  (1) non-zero exit, (2) non-empty output, (3) refusal message
+  present — each as an independent check with its own failure
+  message. Previously a `cargo run` that produced no output could
+  in principle false-pass the inverted-grep assertion.
+
 - `ff-backend-postgres`: `ff_attempt.outcome` is now cleared on the
   exec-cancel paths that previously left it stale — `cancel_flow`
   member loop (`src/flow.rs`) and `exec_core::cancel` (the
