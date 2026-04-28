@@ -451,12 +451,15 @@ gate.
 
 ### RFC-024 + agnostic-SDK trait surface at v0.12.0
 
-v0.12 adds ten trait methods to `EngineBackend` covering RFC-024
-lease-reclaim and the agnostic-SDK PR-1..PR-5.5 series (trait-routed
-read primitives + scanner primitives + grant-consumer dispatch). Row
-values reflect actual bodies on `main` at tag-prep time — per-backend
-`grep 'fn <method>' crates/ff-backend-*/src/**` against the trait
-defaults in `crates/ff-core/src/engine_backend.rs`.
+The ten `EngineBackend` trait methods below are the v0.12 trait
+surface relevant to this release — nine are new in v0.12 (RFC-024
+lease-reclaim + the agnostic-SDK PR-1..PR-5.5 trait-routed read
+primitives, scanner primitives, and grant-consumer dispatch);
+`deliver_signal` predates v0.12 on the trait and is included here
+because the SDK caller is no longer `valkey-default`-gated in v0.12.
+Row values reflect actual bodies on `main` at tag-prep time —
+per-backend `grep 'fn <method>' crates/ff-backend-*/src/**` against
+the trait defaults in `crates/ff-core/src/engine_backend.rs`.
 
 | Method | Valkey | Postgres | SQLite | Notes |
 |---|---|---|---|---|
@@ -465,7 +468,7 @@ defaults in `crates/ff-core/src/engine_backend.rs`.
 | `read_execution_context` | `impl` | `impl` | `impl` | **Agnostic-SDK PR-1** (#411). Point-read of `ExecutionContext` for the SDK worker's resume path. Missing row surfaces as `Validation { kind: InvalidInput }` on all three — SDK only invokes post-claim so a missing row is a loud invariant violation. |
 | `read_current_attempt_index` | `impl` | `impl` | `impl` | **Agnostic-SDK PR-3.** Documented asymmetry (rustdoc on `EngineBackend::read_current_attempt_index`): Valkey returns `AttemptIndex(0)` when `exec_core` is present but `current_attempt_index` is absent/empty (pre-PR-3 inline parity); PG/SQLite use `NOT NULL DEFAULT 0` so a pre-claim row reads `0` naturally, but a missing row surfaces as `Validation { kind: InvalidInput }`. The downstream `claim_resumed_execution` FCALL / SQL surfaces the proper `NotAResumedExecution` / `ExecutionNotLeaseable` reject. |
 | `read_total_attempt_count` | `impl` | `impl` | `impl` | **Agnostic-SDK PR-5.5** (#419). Valkey HGET on `{exec}:core` (monotonic total-claims counter, distinct from `current_attempt_index`); PG reads `raw_fields` JSONB extract via `exec_core::read_total_attempt_count_impl`; SQLite reads via `json_extract` in `crates/ff-backend-sqlite/src/reads.rs`. |
-| `claim_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | **Agnostic-SDK PR-4** (#417). Trait-routed grant-consumer for the SDK `claim_from_grant` path. Valkey fires one `ff_claim_execution` FCALL; PG/SQLite inherit the `Err(Unavailable { op: "claim_execution" })` default. PG grants flow today through `PostgresScheduler::claim_for_worker` (sibling struct, not a trait method); SQLite has no grant-consumer path. Full trait-level grant-consumer parity is v0.13 RFC-scope — see [`project_claim_from_grant_pg_sqlite_gap`](../claude-memory/project_claim_from_grant_pg_sqlite_gap.md) for motivation. |
+| `claim_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | **Agnostic-SDK PR-4** (#417). Trait-routed grant-consumer for the SDK `claim_from_grant` path. Valkey fires one `ff_claim_execution` FCALL; PG/SQLite inherit the `Err(Unavailable { op: "claim_execution" })` default. PG's grant-consumer flow today routes through `PostgresScheduler::claim_for_worker` — a separate scheduler-side entry point distinct from this trait method; SQLite has no grant-consumer path. Full trait-level grant-consumer parity for PG + SQLite is v0.13 RFC-scope; see [`CONSUMER_MIGRATION_0.12.md`](CONSUMER_MIGRATION_0.12.md) §Known limitations. |
 | `scan_eligible_executions` | `impl` | `Unavailable` (default) | `Unavailable` (default) | **Agnostic-SDK PR-5** (#418). Scanner-bypass primitive — lane-eligible ZSET peek. Valkey-only by design; PG/SQLite consumers use the scheduler-routed `claim_for_worker` path which handles eligibility server-side. Exposed behind the `direct-valkey-claim` bench-only feature; not a general consumer surface. |
 | `issue_claim_grant` | `impl` | `Unavailable` (default) | `Unavailable` (default) | **Agnostic-SDK PR-5.** Scheduler-bypass claim-grant write. Pairs with `scan_eligible_executions`; same Valkey-only scope and `direct-valkey-claim` feature gating. PG/SQLite consumers use `claim_for_worker`. |
 | `block_route` | `impl` | `Unavailable` (default) | `Unavailable` (default) | **Agnostic-SDK PR-5.** Moves an execution from lane-eligible ZSET to `blocked_route` ZSET after a capability-mismatch reject. Valkey-only; PG/SQLite admission rejects are handled server-side inside the scheduler-routed `claim_for_worker` path. |

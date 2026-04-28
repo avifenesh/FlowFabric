@@ -469,15 +469,15 @@ per-backend shape.
 
 Published v0.11 → v0.12 bench deltas (Valkey claim/complete p50/p99,
 PG rev-7 cancel p99, SQLite baseline) are **not** captured in-repo at
-tag time. GitHub Actions runners produce noisy numbers (shared
-tenants, variable CPU steal, I/O contention) and are unsuitable for
-bench baselining per post-v0.12-PR-5.5 retrospective (memory:
-`feedback_valkey_cli_not_redis_cli` §"Separate but related").
+tag time. GitHub Actions runners produce numbers too noisy to baseline
+against (shared tenants, variable CPU steal, I/O contention), so they
+are not used as the source of truth for release-to-release perf
+comparisons.
 
 Fresh baselines run on dedicated hosts post-tag will land in a
 follow-up PR against the bench harness README. If you need pre-tag
-perf signal for a PG / Valkey deployment decision, reach out on the
-repo — we can point at the most recent dedicated-host run.
+perf signal for a PG / Valkey deployment decision, open an issue on
+the repo — we can point at the most recent dedicated-host run.
 
 ## Non-changes
 
