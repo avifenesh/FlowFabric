@@ -57,6 +57,76 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-024 PR-B+C — trait method renames + new `ReclaimGrant` type +
+  non_exhaustive constructors (closes partial of #371).** Folded PR-B
+  and PR-C of the RFC-024 series because the new trait method
+  signatures reference types introduced in PR-C; shipping them
+  separately would land trait methods referencing undefined types.
+  Scope spans `ff-core`, all three backends (Valkey, Postgres,
+  SQLite), `ff-sdk`, `ff-scheduler`, `ff-server`, and `ff-test`.
+  Backend impl bodies for the new methods are still
+  `EngineError::Unavailable` — PR-D (PG), PR-E (SQLite), PR-F
+  (Valkey) wire the real bodies.
+  - `crates/ff-core/src/contracts/mod.rs` — new distinct `ReclaimGrant`
+    type (lease-reclaim path, routes to `ff_reclaim_execution` /
+    PG+SQLite `reclaim_execution`). Distinct from the PR-A-renamed
+    `ResumeGrant`. `#[non_exhaustive]` with explicit `::new()`
+    constructor per `feedback_non_exhaustive_needs_constructor`.
+  - `crates/ff-core/src/contracts/mod.rs` — new
+    `IssueReclaimGrantOutcome` enum (`Granted(ReclaimGrant)` /
+    `NotReclaimable` / `ReclaimCapExceeded`) and new
+    `ReclaimExecutionOutcome` enum (`Claimed(Handle)` /
+    `NotReclaimable` / `ReclaimCapExceeded` / `GrantNotFound`). Both
+    `#[non_exhaustive]`; variants ARE the construction surface.
+  - `crates/ff-core/src/engine_backend.rs` — two new trait methods:
+    `issue_reclaim_grant(args) -> IssueReclaimGrantOutcome` and
+    `reclaim_execution(args) -> ReclaimExecutionOutcome`. Default
+    impls return `EngineError::Unavailable` so pre-RFC out-of-tree
+    backends keep compiling.
+
+### Changed
+
+- **RFC-024 PR-B+C — trait method rename + transitional aliases
+  dropped.** Compile-break wave that lands in the same PR as the new
+  surface above.
+  - `EngineBackend::claim_from_reclaim` → `claim_from_resume_grant`
+    across all three in-tree backends (Valkey, Postgres, SQLite) and
+    the SDK layer forwarders (`ff-sdk/src/layer/hooks.rs`,
+    `layer/test_support.rs`). Body unchanged; the method has always
+    driven `ff_claim_resumed_execution` / the PG+SQLite epoch-bump
+    reconciler — the old name advertised "reclaim" but delivered
+    resume.
+  - `FlowFabricWorker::claim_from_reclaim_grant` →
+    `claim_from_resume_grant` on the ff-sdk consumer surface. The
+    method retains its semantic (feeds the resume-grant path); the
+    new `claim_from_reclaim_grant` SDK method (distinct semantic,
+    feeds `reclaim_execution`) lands with PR-G.
+  - `ClaimGrant`, `ResumeGrant`, `IssueReclaimGrantArgs`, and
+    `ReclaimExecutionArgs` gain `#[non_exhaustive]` + explicit
+    `::new()` constructors per
+    `feedback_non_exhaustive_needs_constructor`. Struct-literal
+    construction from downstream crates migrates to the
+    constructors; in-crate tests unaffected.
+  - `IssueReclaimGrantArgs` gains a `worker_capabilities:
+    BTreeSet<String>` field (parity with `IssueClaimGrantArgs`; the
+    Lua `ff_issue_reclaim_grant` already reads ARGV[9]). Populated
+    by the SDK admin path in PR-G; `#[serde(default)]` preserves
+    wire compat.
+  - `ReclaimExecutionArgs::max_reclaim_count` flips from `u32` to
+    `Option<u32>` per RFC-024 §3.2. `None` ⇒ backend applies the
+    Rust-surface default of 1000 (RFC-024 §4.6); explicit `Some(n)`
+    preserves the per-call override. The Lua fallback remains 100
+    for pre-RFC ARGV-omitted callers; the two-default coexistence
+    is explicit by design.
+  - `crates/ff-core/src/contracts/mod.rs` — PR-A's transitional
+    `pub type ReclaimGrant = ResumeGrant` alias dropped. Call sites
+    semantically using a resume grant migrate to `ResumeGrant`; the
+    (distinct) new `ReclaimGrant` type in the `### Added` section
+    above covers the lease-reclaim path.
+  - `crates/ff-core/src/backend.rs` — PR-A's transitional
+    `pub type ReclaimToken = ResumeToken` alias dropped; all call
+    sites migrate to `ResumeToken`.
+
 - **RFC-024 PR-A — `ff-core` resume-path rename + `HandleKind::Reclaimed` variant.**
   First impl PR of the RFC-024 series (the series as a whole wires
   `ff_reclaim_execution` + `ff_issue_reclaim_grant` to the consumer

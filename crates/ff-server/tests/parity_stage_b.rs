@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility, UsageDimensions,
+    ResumeToken, ResumeSignal, SummaryDocument, TailVisibility, UsageDimensions,
 };
 use ff_core::contracts::{
     CancelFlowResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, DeliverSignalArgs,
@@ -140,11 +140,11 @@ impl EngineBackend for MockBackend {
     ) -> Result<Vec<ResumeSignal>, EngineError> {
         Err(unavailable("mock::observe_signals"))
     }
-    async fn claim_from_reclaim(
+    async fn claim_from_resume_grant(
         &self,
-        _token: ReclaimToken,
+        _token: ResumeToken,
     ) -> Result<Option<Handle>, EngineError> {
-        Err(unavailable("mock::claim_from_reclaim"))
+        Err(unavailable("mock::claim_from_resume_grant"))
     }
     async fn delay(
         &self,
@@ -400,11 +400,11 @@ impl EngineBackend for DefaultsBackend {
     ) -> Result<Vec<ResumeSignal>, EngineError> {
         Err(unavailable("defaults::observe_signals"))
     }
-    async fn claim_from_reclaim(
+    async fn claim_from_resume_grant(
         &self,
-        _token: ReclaimToken,
+        _token: ResumeToken,
     ) -> Result<Option<Handle>, EngineError> {
-        Err(unavailable("defaults::claim_from_reclaim"))
+        Err(unavailable("defaults::claim_from_resume_grant"))
     }
     async fn delay(
         &self,

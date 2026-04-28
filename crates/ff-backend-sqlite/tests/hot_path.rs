@@ -16,9 +16,9 @@
 use ff_backend_sqlite::SqliteBackend;
 use ff_core::backend::{
     BackendTag, CapabilitySet, ClaimPolicy, FailureClass, FailureReason, Frame, FrameKind, Handle,
-    HandleKind, PatchKind, ReclaimToken, StreamMode,
+    HandleKind, PatchKind, ResumeToken, StreamMode,
 };
-use ff_core::contracts::ReclaimGrant;
+use ff_core::contracts::ResumeGrant;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{ContentionKind, EngineError, ValidationKind};
 use ff_core::handle_codec::{HandlePayload, encode as encode_opaque};
@@ -834,7 +834,7 @@ async fn append_frame_fence_mismatch_returns_contention() {
     );
 }
 
-// ── Phase 2a.3 — claim_from_reclaim ────────────────────────────────────
+// ── Phase 2a.3 — claim_from_resume_grant ────────────────────────────────────
 
 /// Set the current attempt's lease to expired (now - 1s) to simulate a
 /// stale lease eligible for reclaim.
@@ -856,19 +856,19 @@ async fn expire_current_lease(backend: &SqliteBackend, exec_uuid: Uuid, attempt_
     .expect("expire lease");
 }
 
-fn make_reclaim_token(exec_id: ExecutionId) -> ReclaimToken {
+fn make_reclaim_token(exec_id: ExecutionId) -> ResumeToken {
     let partition = Partition {
         family: PartitionFamily::Execution,
         index: 0,
     };
-    let grant = ReclaimGrant {
-        execution_id: exec_id,
-        partition_key: PartitionKey::from(&partition),
-        grant_key: "sqlite:test-grant".into(),
-        expires_at_ms: u64::MAX,
-        lane_id: LaneId::new("default"),
-    };
-    ReclaimToken::new(
+    let grant = ResumeGrant::new(
+        exec_id,
+        PartitionKey::from(&partition),
+        "sqlite:test-grant".into(),
+        u64::MAX,
+        LaneId::new("default"),
+    );
+    ResumeToken::new(
         grant,
         WorkerId::new("reclaim-worker"),
         WorkerInstanceId::new("reclaim-worker-instance"),
@@ -894,9 +894,9 @@ async fn claim_from_reclaim_expired_lease_mints_resumed_handle() {
 
     let token = make_reclaim_token(eid);
     let h = backend
-        .claim_from_reclaim(token)
+        .claim_from_resume_grant(token)
         .await
-        .expect("claim_from_reclaim")
+        .expect("claim_from_resume_grant")
         .expect("Some(handle)");
     assert_eq!(h.backend, BackendTag::Sqlite);
     assert_eq!(h.kind, HandleKind::Resumed);
@@ -941,9 +941,9 @@ async fn claim_from_reclaim_live_lease_returns_none() {
     // Do not expire — lease is still live. Reclaim must return None.
     let token = make_reclaim_token(eid);
     let res = backend
-        .claim_from_reclaim(token)
+        .claim_from_resume_grant(token)
         .await
-        .expect("claim_from_reclaim");
+        .expect("claim_from_resume_grant");
     assert!(res.is_none(), "live lease must block reclaim");
 }
 

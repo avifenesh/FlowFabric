@@ -380,12 +380,12 @@ impl ClaimForWorkerResponse {
                 retryable: Some(false),
                 raw_body: String::new(),
             })?;
-        Ok(ff_core::contracts::ClaimGrant {
+        Ok(ff_core::contracts::ClaimGrant::new(
             execution_id,
-            partition_key: self.partition_key,
-            grant_key: self.grant_key,
-            expires_at_ms: self.expires_at_ms,
-        })
+            self.partition_key,
+            self.grant_key,
+            self.expires_at_ms,
+        ))
     }
 }
 
