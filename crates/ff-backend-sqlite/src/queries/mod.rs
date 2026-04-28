@@ -11,6 +11,7 @@
 
 pub mod attempt;
 pub mod budget;
+pub mod claim_grant;
 pub mod dispatch;
 pub mod exec_core;
 pub mod flow;

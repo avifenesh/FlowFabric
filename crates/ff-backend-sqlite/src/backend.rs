@@ -27,7 +27,8 @@ use ff_core::capability::{BackendIdentity, Capabilities, Supports, Version};
 use ff_core::caps::{CapabilityRequirement, matches as caps_matches};
 use ff_core::contracts::{
     BudgetStatus, CancelFlowResult, CreateBudgetArgs, CreateBudgetResult, CreateQuotaPolicyArgs,
-    CreateQuotaPolicyResult, ExecutionSnapshot, FlowSnapshot, ReportUsageAdminArgs,
+    CreateQuotaPolicyResult, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
+    IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReportUsageAdminArgs,
     ReportUsageResult, ResetBudgetArgs, ResetBudgetResult, RotateWaitpointHmacSecretAllArgs,
     RotateWaitpointHmacSecretAllResult, SeedOutcome, SeedWaitpointHmacSecretArgs, SuspendArgs,
     SuspendOutcome,
@@ -2686,6 +2687,23 @@ impl EngineBackend for SqliteBackend {
         let pool = &self.inner.pool;
         let pubsub = &self.inner.pubsub;
         retry_serializable(|| claim_from_reclaim_impl(pool, pubsub, &token)).await
+    }
+
+    async fn issue_reclaim_grant(
+        &self,
+        args: IssueReclaimGrantArgs,
+    ) -> Result<IssueReclaimGrantOutcome, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| crate::reclaim::issue_reclaim_grant_impl(pool, &args)).await
+    }
+
+    async fn reclaim_execution(
+        &self,
+        args: ReclaimExecutionArgs,
+    ) -> Result<ReclaimExecutionOutcome, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::reclaim::reclaim_execution_impl(pool, pubsub, &args)).await
     }
 
     async fn delay(&self, _handle: &Handle, _delay_until: TimestampMs) -> Result<(), EngineError> {
