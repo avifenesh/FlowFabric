@@ -98,6 +98,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`benches/comparisons/apalis` — scenario 1 + 4 harnesses refreshed
+  per apalis maintainer @geofmureithi's tuning recommendations on
+  issue #51.** `RedisConfig` now sets `poll_interval=5ms` +
+  `buffer_size=100` (was default 100ms×10 = ~100 ops/s theoretical
+  cap). The scenarios spawn N=16 independent `WorkerBuilder`
+  instances with `.parallelize(tokio::spawn)` rather than a single
+  builder with `.concurrency(16)` — per the maintainer,
+  `.concurrency` governs in-worker task parallelism, not worker
+  count. Refreshed numbers: scenario 1 goes 98 → 1 419 ops/s
+  (14.5×), scenario 4 goes 9.34 → 10.2 flows/s. `SharedRedisStorage`
+  pubsub declined (drops on failure; benches measure durable
+  at-least-once). See `benches/results/COMPARISON.md`.
+
 - `ff-backend-sqlite::report_usage` — extended to maintain the 0013
   breach-counter columns (`breach_count`, `soft_breach_count`,
   `last_breach_at_ms`, `last_breach_dim`) incrementally in the same

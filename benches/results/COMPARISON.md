@@ -7,6 +7,17 @@ latency in milliseconds on the second.
 Prior FF(Valkey) + apalis + baseline numbers: HEAD `4aac1c8` (workspace
 v0.5.0 bump). Host class: AMD EPYC 9R14 × 16, Valkey 7.2.4.
 
+**2026-04-28 apalis refresh (HEAD `66ab76b`, workspace v0.11.0).** Per
+apalis maintainer @geofmureithi's tuning guidance on issue #51 the
+apalis harness now uses `RedisConfig { poll_interval: 5ms,
+buffer_size: 100 }`, spawns N=16 independent `WorkerBuilder` instances
+(not `.concurrency(16)`), and layers `.parallelize(tokio::spawn)`.
+Same-day baseline re-run: 14 654 ops/s (prior 14 462 — within noise).
+Same-day FF(Valkey) re-runs: scenario 1 = 3 036 ops/s (prior 2 966 —
++2% within criterion 10-sample noise), scenario 4 = 17.46 flows/s
+(prior 17.01 — within noise). Host is steady vs v0.5.0 measurement
+epoch.
+
 Postgres (new): HEAD `a1c2322` (workspace v0.6.1, Wave 7c on v0.7
 track). Host class: AMD EPYC 9R14 × 16, PostgreSQL 16 with
 `max_locks_per_transaction = 512` (default 64 is insufficient — see
@@ -27,10 +38,10 @@ full discussion.
 
 | system         | throughput (ops/s) | p50 / p95 / p99 (ms)      |
 | -------------- | ------------------ | ------------------------- |
-| FF(Valkey)     | **2 966**          | 0.39 / 0.70 / 0.84        |
+| FF(Valkey)     | **3 036**          | — (criterion agg)         |
 | FF(Postgres)   | **510**            | 24.60 / 39.41 / 44.10     |
-| apalis         | 98                 | — (not captured)          |
-| baseline       | 14 462             | 0.28 / 0.36 / 0.48        |
+| apalis         | **1 419**          | — (noop, sub-µs)          |
+| baseline       | 14 654             | — (sampled post-refresh)  |
 | faktory        | _Phase C_          | _Phase C_                 |
 
 *FF(Postgres) 16 workers, 10 k tasks, direct EngineBackend::claim +
@@ -84,9 +95,9 @@ v0.7 Phase 1 re-run will align the configs.*
 
 | system         | throughput (flows/s) | p50 / p99 total (ms per flow) |
 | -------------- | -------------------- | ----------------------------- |
-| FF(Valkey)     | **17.01**            | 474.74 / 5 816.08             |
+| FF(Valkey)     | **17.46**            | 412.88 / 5 446.69             |
 | FF(Postgres)   | **48.2**             | 760 / 882 (approx, per-flow)  |
-| apalis         | 9.34                 | — (not surfaced)              |
+| apalis         | **10.2**             | — (not surfaced)              |
 | faktory        | _no DAG primitive_   | —                             |
 | baseline       | _no primitive_       | —                             |
 
