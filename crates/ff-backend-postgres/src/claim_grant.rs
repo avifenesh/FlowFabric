@@ -602,7 +602,11 @@ async fn reclaim_execution_once(
     // fencing remains monotonic across successive reclaims (matches
     // Valkey Lua `flowfabric.lua:3106` + SQLite `reclaim.rs`).
     let new_attempt_index = cur_attempt_index + 1;
-    let new_lease_epoch: i64 = prior_lease_epoch.saturating_add(1);
+    // Defensive clamp: `ff_attempt.lease_epoch` is `bigint` with no
+    // CHECK constraint, so a malformed row could surface a negative
+    // value. Clamp before bump so the DB-persisted epoch matches the
+    // handle's non-negative u64 value (no DB/handle divergence).
+    let new_lease_epoch: i64 = prior_lease_epoch.max(0).saturating_add(1);
     let lease_ttl_ms = i64::try_from(args.lease_ttl_ms).unwrap_or(i64::MAX);
     let new_lease_expires = now.saturating_add(lease_ttl_ms);
     sqlx::query(
