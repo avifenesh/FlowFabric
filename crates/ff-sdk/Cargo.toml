@@ -102,7 +102,7 @@ ferriskey = { workspace = true, optional = true }
 # RFC-023 Phase 1a: optional SQLite backend edge, activated by the
 # `sqlite` feature above. Off by default so Valkey consumers pay no
 # sqlx compile cost.
-ff-backend-sqlite = { workspace = true, optional = true }
+ff-backend-sqlite = { version = "0.11.0", path = "../ff-backend-sqlite", optional = true, default-features = false, features = ["core"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
