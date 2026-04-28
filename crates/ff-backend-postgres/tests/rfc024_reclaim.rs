@@ -271,11 +271,13 @@ async fn reclaim_execution_happy_path_new_attempt_minted() {
     .bind(part).bind(exec_uuid).fetch_one(&pool).await.unwrap();
     assert_eq!(prior.as_deref(), Some("interrupted_reclaimed"));
 
+    // Bug B parity: new attempt's lease_epoch = prior + 1. `seed_exec`
+    // writes the prior attempt with lease_epoch=1, so reclaim mints 2.
     let new_epoch: i64 = sqlx::query_scalar(
         "SELECT lease_epoch FROM ff_attempt WHERE partition_key=$1 AND execution_id=$2 AND attempt_index=1",
     )
     .bind(part).bind(exec_uuid).fetch_one(&pool).await.unwrap();
-    assert_eq!(new_epoch, 1);
+    assert_eq!(new_epoch, 2);
 
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM ff_claim_grant WHERE partition_key=$1 AND execution_id=$2 AND kind='reclaim'",
@@ -558,6 +560,135 @@ async fn reclaim_execution_negative_reclaim_count_does_not_wrap() {
     .await
     .unwrap();
     assert_eq!(new_count, 1, "clamped (-1).max(0)+1 must be 1, got {new_count}");
+}
+
+/// Bug A parity: cap-exceeded emits BOTH a completion_event
+/// (outcome='failed') and a lease_event (event_type='revoked'). Per
+/// RFC-024 §4.2.7 / RFC-019 outbox matrix, every terminal transition
+/// fires both. Mirrors SQLite
+/// `reclaim_cap_exceeded_clears_prior_attempt_and_emits_events`.
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_cap_exceeded_emits_completion_and_lease_revoked() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-cap-outbox-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ff_exec_core SET lease_reclaim_count = 5 WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let outcome = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", Some(5)))
+        .await
+        .expect("ok");
+    assert!(
+        matches!(outcome, ReclaimExecutionOutcome::ReclaimCapExceeded { .. }),
+        "expected cap-exceeded, got {outcome:?}"
+    );
+
+    let comp_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ff_completion_event \
+         WHERE partition_key=$1 AND execution_id=$2 AND outcome='failed'",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        comp_count, 1,
+        "terminal_failed must emit completion_event(outcome='failed')"
+    );
+
+    let lease_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ff_lease_event \
+         WHERE partition_key=$1 AND execution_id=$2 AND event_type='revoked'",
+    )
+    .bind(i32::from(part))
+    .bind(exec_uuid.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lease_count, 1,
+        "terminal_failed must emit lease_event(event_type='revoked')"
+    );
+}
+
+/// Bug B parity: lease_epoch is derived from prior attempt's epoch
+/// (prior+1) and monotonically increases across successive reclaims.
+/// Mirrors SQLite `reclaim_execution_lease_epoch_monotonic_across_reclaims`
+/// + Valkey Lua `flowfabric.lua:3106`.
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_lease_epoch_monotonic_across_reclaims() {
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-epoch-mono-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    let _ = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", None))
+        .await
+        .expect("reclaim-1");
+
+    let epoch_1: i64 = sqlx::query_scalar(
+        "SELECT lease_epoch FROM ff_attempt WHERE partition_key=$1 AND execution_id=$2 AND attempt_index=1",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(epoch_1 >= 1, "first reclaim epoch must be >=1, got {epoch_1}");
+
+    sqlx::query(
+        "UPDATE ff_exec_core SET ownership_state='lease_expired_reclaimable' \
+         WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    let _ = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", None))
+        .await
+        .expect("reclaim-2");
+
+    let epoch_2: i64 = sqlx::query_scalar(
+        "SELECT lease_epoch FROM ff_attempt WHERE partition_key=$1 AND execution_id=$2 AND attempt_index=2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        epoch_2 > epoch_1,
+        "second-reclaim epoch ({epoch_2}) must exceed first ({epoch_1})"
+    );
 }
 
 #[test]
