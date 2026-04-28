@@ -66,12 +66,21 @@ pub enum CreateExecutionResult {
 /// `#[non_exhaustive]` + `::new` per
 /// `feedback_non_exhaustive_needs_constructor`: future fields may be
 /// added in minor releases; consumers MUST construct via
-/// [`Self::new`] and mutate optional fields via the public setters
-/// (no `..Default::default()` since the struct is non-exhaustive).
+/// [`Self::new`] and populate optional fields (`capability_hash`,
+/// `route_snapshot_json`, `admission_summary`) by direct field
+/// assignment on the returned value. Struct-literal construction is
+/// blocked by `#[non_exhaustive]`; `..Default::default()` is not
+/// available for the same reason.
 ///
 /// Carries the execution's [`crate::partition::Partition`] so the
 /// Valkey backend can derive `exec_core` / `claim_grant` / the lane's
 /// `eligible_zset` KEYS without a second round-trip.
+///
+/// Does NOT derive `Serialize` / `Deserialize` — this is a
+/// trait-boundary args struct, not a wire-format type; the
+/// `#[non_exhaustive]` marker already blocks cross-crate struct-
+/// literal construction, which matters more than JSON round-trip
+/// for a scanner hot-path primitive.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct IssueClaimGrantArgs {

@@ -92,8 +92,11 @@ pub struct FlowFabricWorker {
     partition_config: PartitionConfig,
     /// 8-hex FNV-1a digest of the sorted capabilities CSV. Used in
     /// per-mismatch logs so the 4KB CSV never echoes on every reject
-    /// during an incident. Full CSV logged once at connect-time WARN for
-    /// cross-reference. Mirrors `ff-scheduler::claim::worker_caps_digest`.
+    /// during an incident. For [`Self::connect`]-built workers, the
+    /// full CSV is additionally logged once at connect-time WARN via
+    /// `valkey_preamble::run` for cross-reference; [`Self::connect_with`]-
+    /// built workers compute the hash without the companion CSV log.
+    /// Mirrors `ff-scheduler::claim::worker_caps_digest`.
     #[cfg(feature = "direct-valkey-claim")]
     worker_capabilities_hash: String,
     #[cfg(feature = "direct-valkey-claim")]
@@ -590,6 +593,17 @@ impl FlowFabricWorker {
         let chunk = PARTITION_SCAN_CHUNK.min(num_partitions);
         let start = self.scan_cursor.fetch_add(chunk, Ordering::Relaxed) % num_partitions;
 
+        // Hoist the sorted/deduped capability set out of the loop — the
+        // per-partition iteration reused a fresh BTreeSet on every
+        // step pre-fix, adding O(n log n) alloc/sort to the scanner
+        // hot path on every tick. Computed once per `claim_next` call.
+        let worker_capabilities: std::collections::BTreeSet<String> = self
+            .config
+            .capabilities
+            .iter()
+            .cloned()
+            .collect();
+
         for step in 0..chunk {
             let partition_idx = ((start + step) % num_partitions) as u16;
             let partition = ff_core::partition::Partition {
@@ -619,11 +633,7 @@ impl FlowFabricWorker {
                 self.config.worker_id.clone(),
                 self.config.worker_instance_id.clone(),
                 partition,
-                self.config
-                    .capabilities
-                    .iter()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>(),
+                worker_capabilities.clone(),
                 5_000, // grant_ttl_ms
                 now,
             );
@@ -669,7 +679,7 @@ impl FlowFabricWorker {
                         partition,
                         "waiting_for_capable_worker".to_owned(),
                         "no connected worker satisfies required_capabilities".to_owned(),
-                        TimestampMs::now(),
+                        now,
                     );
                     match self.backend.block_route(block_args).await {
                         Ok(ff_core::contracts::BlockRouteOutcome::Blocked { .. }) => {}

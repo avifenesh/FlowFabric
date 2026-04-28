@@ -4539,8 +4539,14 @@ async fn issue_claim_grant_impl(
 
     // Parse grant result: {1, "OK", ...} (same shape the SDK
     // inline helper parsed via `parse_success_result`).
-    let parsed = ff_script::result::FcallResult::parse(&raw).map_err(transport_script)?;
-    let _ = parsed.into_success().map_err(transport_script)?;
+    //
+    // Lua rejects (`CapabilityMismatch`, `already_granted`, ...) must
+    // flow through `From<ScriptError> for EngineError` so typed
+    // variants (`EngineError::Validation { CapabilityMismatch, .. }`)
+    // reach `FlowFabricWorker::claim_next`'s block-on-mismatch arm.
+    // Only raw ferriskey transport faults use `transport_script`.
+    let parsed = ff_script::result::FcallResult::parse(&raw).map_err(EngineError::from)?;
+    let _ = parsed.into_success().map_err(EngineError::from)?;
     Ok(IssueClaimGrantOutcome::Granted {
         execution_id: args.execution_id,
     })
@@ -4583,7 +4589,11 @@ async fn block_route_impl(
     // `parse_success_result(&v, "ff_block_execution_for_admission")`
     // check with the non-transport branch promoted into the outcome
     // enum.
-    let parsed = ff_script::result::FcallResult::parse(&raw).map_err(transport_script)?;
+    // Parse-time errors are transport-level (malformed FCALL
+    // envelope). Business-logic Lua rejects surface via
+    // `into_success()` and are folded into `LuaRejected` so the
+    // caller's best-effort continue-on-reject semantic holds.
+    let parsed = ff_script::result::FcallResult::parse(&raw).map_err(EngineError::from)?;
     match parsed.into_success() {
         Ok(_) => Ok(BlockRouteOutcome::Blocked {
             execution_id: args.execution_id,

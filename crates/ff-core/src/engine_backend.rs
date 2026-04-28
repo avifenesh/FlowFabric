@@ -708,8 +708,9 @@ pub trait EngineBackend: Send + Sync + 'static {
     ///
     /// * **Valkey** — `ZRANGEBYSCORE eligible_zset -inf +inf LIMIT 0 <limit>`
     ///   on the lane's partition-scoped eligible key. Single
-    ///   command; no script round-trip. `#[tracing::instrument]` name
-    ///   matches the pre-PR inline shape so trace continuity holds.
+    ///   command; no script round-trip. Wire shape is byte-for-byte
+    ///   identical to the pre-PR SDK inline call so bench traces
+    ///   match pre-PR without new `#[tracing::instrument]` span names.
     /// * **Postgres / SQLite** — use the `Err(Unavailable)` default.
     ///   PG/SQLite consumers drive work through the scheduler-routed
     ///   [`Self::claim_for_worker`] path instead of the scanner
@@ -746,8 +747,9 @@ pub trait EngineBackend: Send + Sync + 'static {
     ///
     /// # Backend coverage
     ///
-    /// * **Valkey** — one `ff_issue_claim_grant` FCALL. Keeps pre-PR
-    ///   instrumentation shape.
+    /// * **Valkey** — one `ff_issue_claim_grant` FCALL. KEYS/ARGV
+    ///   shape is byte-for-byte identical to the pre-PR SDK inline
+    ///   call; bench traces match pre-PR.
     /// * **Postgres / SQLite** — `Err(Unavailable)` default; use
     ///   [`Self::claim_for_worker`] instead. See
     ///   [`Self::scan_eligible_executions`] for the cross-link
