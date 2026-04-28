@@ -192,9 +192,32 @@ jobs:
       - name: Run smoke gate
         run: bash scripts/smoke-v0.7.sh
 
+  smoke-sqlite:
+    # RFC-023 Phase 4 pre-publish smoke for the dev-only SQLite backend.
+    # Exercises the consumer-visible parity surface committed in
+    # RFC-023 §4.3 (see scripts/smoke-sqlite.sh header for the exact
+    # list) end-to-end against an in-memory SQLite pool. No external
+    # fixtures — everything is in-process.
+    #
+    # Per feedback_smoke_before_release.md + feedback_smoke_after_publish.md:
+    # workspace tests don't catch consumer-visible breakage on the
+    # SQLite headline; this leg runs the ff-dev example binary against
+    # the published trait shape (workspace-path deps in this context)
+    # BEFORE the tag-gated publish step. A failure here blocks publish
+    # just like the Valkey+PG smoke leg.
+    name: Pre-publish smoke-sqlite (v0.12+)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+      - name: Run smoke-sqlite gate
+        run: bash scripts/smoke-sqlite.sh
+
   publish:
     name: Publish crates
-    needs: [verify, smoke]
+    needs: [verify, smoke, smoke-sqlite]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     env:
