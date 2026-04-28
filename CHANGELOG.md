@@ -5,6 +5,22 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `examples/ff-dev/` — RFC-023 Phase 4 headline example for the
+  SQLite dev-only backend (v0.12.0 release target). ~200-line
+  consumer-facing demo that drives the `EngineBackend` trait directly
+  against an in-memory `SqliteBackend`: `create_flow` +
+  `create_execution` + `claim` + `complete` + Wave-9 admin
+  (`change_priority`, `cancel_execution`) + `read_execution_info` +
+  RFC-019 `subscribe_completion` surface. No Docker, no ambient
+  services; runs as `FF_DEV_MODE=1 cargo run --bin ff-dev`. Companion
+  `scripts/smoke-sqlite.sh` wraps the example as a release-gate smoke
+  (RFC-023 §9) and is wired into the `matrix-tests-complete` required
+  check via `.github/workflows/matrix.yml`. The example follows the
+  RFC-023 §4.7.1 cairn-canonical shape (no ff-sdk / ferriskey in the
+  dep graph) and honours the `FF_DEV_MODE=1` production guard.
+
 ### Fixed
 
 - `ff-backend-postgres`: `ff_attempt.outcome` is now cleared on the
@@ -67,9 +83,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `ff_issue_reclaim_grant` (KEYS[3] + ARGV[9] unchanged). Maps the
     Lua `execution_not_reclaimable` + `capability_mismatch` err codes
     to `IssueReclaimGrantOutcome::NotReclaimable { detail, .. }`;
-    success mints a `ReclaimGrant` carrying the caller-side
-    `expires_at_ms = now + grant_ttl_ms` upper bound + the execution's
-    lane (per RFC-024 §3.1 lane asymmetry with `ResumeGrant`).
+    success mints a `ReclaimGrant` carrying the server-authoritative
+    `expires_at_ms` (returned by Lua from `TIME + grant_ttl_ms`) +
+    the execution's lane (per RFC-024 §3.1 lane asymmetry with
+    `ResumeGrant`).
   - `ValkeyBackend::reclaim_execution` — forwards to
     `ff_reclaim_execution` with new ARGV[9] threading the caller's
     `max_reclaim_count.unwrap_or(1000)` (Rust-surface default per
@@ -77,23 +94,78 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     via `handle_codec::encode_handle(.., HandleKind::Reclaimed)`;
     Lua err codes map to typed outcomes: `invalid_claim_grant` →
     `GrantNotFound`, `execution_not_reclaimable` → `NotReclaimable`,
-    `max_retries_exhausted` → `ReclaimCapExceeded`.
+    `max_retries_exhausted` → `ReclaimCapExceeded` (with the
+    authoritative post-policy-override cap surfaced in
+    `reclaim_count`).
   - `ff-script: ff_reclaim_execution` Lua primitive gains optional
     `ARGV[9] = default_max_reclaim_count`. Resolution order is
     (1) per-execution policy override at `<core>:policy`
     (`policy.max_reclaim_count`), (2) caller-supplied ARGV[9],
     (3) legacy fallback `"100"`. Pre-RFC call sites (8-ARGV) keep
     working unchanged — the `or "100"` default preserves pre-RFC
-    behaviour exactly.
+    behaviour exactly. ARGV[9] is now asserted numeric so a
+    caller-side bug surfaces loudly instead of crashing on the
+    `>=` comparison.
   - `ff-backend-valkey: valkey_supports_base().issue_reclaim_grant = true`
     — flips the new RFC-018 capability flag (see `### Changed`) so
     snapshot consumers see the new surface available on Valkey.
   - Integration tests: `crates/ff-backend-valkey/tests/rfc024_reclaim.rs`
-    adds four `#[ignore]`-gated scenarios (happy-path /
-    grant-not-found / nonexistent-execution / granted-on-expired)
-    against a live Valkey. `tests/capabilities.rs` adds an assertion
-    that `supports.issue_reclaim_grant` is `true` on a dialed Valkey
+    adds six `#[ignore]`-gated scenarios (happy-path /
+    grant-not-found / nonexistent-execution / granted-on-expired /
+    server-authoritative `expires_at_ms` / policy-override cap
+    surfaced on `ReclaimCapExceeded`) against a live Valkey.
+    `tests/capabilities.rs` adds an assertion that
+    `supports.issue_reclaim_grant` is `true` on a dialed Valkey
     backend.
+- **RFC-024 PR-D — Postgres `issue_reclaim_grant` + `reclaim_execution`
+  real impls + migration 0017 (continues #371).** Replaces the
+  PR-B+C `EngineError::Unavailable` default with production SQL
+  bodies on the Postgres backend. Scope: `ff-backend-postgres`
+  only; SQLite (PR-E) + Valkey (PR-F) land separately.
+  - `crates/ff-backend-postgres/migrations/0017_claim_grant_table.sql`
+    — new 256-way HASH-partitioned `ff_claim_grant` table with
+    `kind IN ('claim','reclaim')` discriminator, JSONB
+    `worker_capabilities`, per-grant TTL columns + indexes on
+    `(partition_key, execution_id)` and `expires_at_ms`. Adds
+    `ff_exec_core.lease_reclaim_count INTEGER NOT NULL DEFAULT 0`
+    for the RFC-024 §4.6 1000-cap enforcement. Backfills existing
+    `raw_fields.claim_grant` JSON entries into `kind='claim'`
+    rows (grant_id = sha256(grant_key)). `backward_compatible = true`;
+    the legacy JSON column is left in place for one release per
+    RFC-024 §5 / §10 (a follow-up cleanup strips the residue
+    once rolling-deploy windows close).
+  - `crates/ff-backend-postgres/src/claim_grant.rs` — new module
+    housing the `ff_claim_grant` CRUD + the two RFC-024
+    impls. SERIALIZABLE + 3-attempt retry wrapper per the
+    Wave-9 `operator::cancel_execution_impl` pattern.
+  - `PostgresBackend::issue_reclaim_grant` — validates
+    `lifecycle_phase = 'active'` + (ownership_state in
+    `{'lease_expired_reclaimable','lease_revoked'}` OR the
+    attempt's lease has expired / is NULL) under `FOR NO KEY
+    UPDATE`; pre-checks the 1000-cap; signs a reclaim grant via
+    the existing `ff_waitpoint_hmac` keystore; inserts
+    `kind='reclaim'` row. Returns `Granted(ReclaimGrant)` /
+    `NotReclaimable` / `ReclaimCapExceeded`.
+  - `PostgresBackend::reclaim_execution` — locks the reclaim
+    grant row under `FOR UPDATE`, validates grant worker_id
+    match (RFC-024 §4.4 — `worker_instance_id` intentionally
+    informational only), validates TTL, inserts a NEW
+    `ff_attempt` row with `attempt_index = current + 1`
+    (`raw_fields.attempt_type = 'reclaim'`) matching Valkey
+    `ff_reclaim_execution` semantics, marks the prior attempt
+    `outcome = 'interrupted_reclaimed'`, bumps `exec_core.attempt_index`
+    + `lease_reclaim_count`, consumes the grant row, emits a
+    RFC-019 `reclaimed` lease event, and mints a
+    `Handle { kind: Reclaimed, lease_epoch: 1 }`. Enforces the
+    caller-supplied `max_reclaim_count` (default 1000); on
+    exceed: transitions to `terminal_failed` + consumes the
+    grant + returns `ReclaimCapExceeded`.
+  - `crates/ff-backend-postgres/tests/rfc024_reclaim.rs` — 7
+    integration scenarios (happy paths for both methods,
+    wrong-phase, cap-exceeded at issuance, worker-id mismatch,
+    TTL-expired grant, cap-exceeded at reclaim, scheduler
+    write-through verification).
+
 - **RFC-024 PR-B+C — trait method renames + new `ReclaimGrant` type +
   non_exhaustive constructors (closes partial of #371).** Folded PR-B
   and PR-C of the RFC-024 series because the new trait method
@@ -131,6 +203,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on `budget_admin` / `quota_admin`). Defaults to `false` via
   `Supports::none()`; Valkey's `valkey_supports_base()` flips it to
   `true` in this PR.
+- **RFC-024 PR-D — Postgres scheduler claim-grant storage flips
+  from JSON stash to `ff_claim_grant` table.** Pre-PR-D the
+  scheduler wrote claim grants into
+  `ff_exec_core.raw_fields.claim_grant` as a JSON object (see
+  `scheduler.rs:252` pre-PR-D). Post-PR-D, the scheduler writes a
+  `kind='claim'` row to the new `ff_claim_grant` table; the
+  `verify_grant` read path reads worker identity from the same
+  table. `raw_fields.claim_grant` is left in place for one
+  release for backfill safety.
+
 - **RFC-024 PR-B+C — trait method rename + transitional aliases
   dropped.** Compile-break wave that lands in the same PR as the new
   surface above.
