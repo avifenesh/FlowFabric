@@ -1,43 +1,61 @@
 //! non-exhaustive-lint — flag `pub` items marked `#[non_exhaustive]`
-//! that have no constructor in the same file.
+//! that have no public constructor in the same file.
 //!
 //! Motivation: `feedback_non_exhaustive_needs_constructor.md`. A public
 //! #[non_exhaustive] type without a constructor is unbuildable outside
 //! the defining crate (downstream users cannot use struct literal
-//! syntax, and without a `fn new`/`fn builder`/`impl (Try)From` they
-//! have no way to obtain a value). v0.3.2 shipped such a dead API.
+//! syntax, and without a `pub fn` returning `Self` / `Type` or a
+//! `From`/`TryFrom` impl they have no way to obtain a value). v0.3.2
+//! shipped such a dead API.
 //!
 //! Scope (per plan decision):
 //!   - A constructor in the SAME FILE as the type definition is
 //!     sufficient — re-exports are not followed, cross-file
 //!     constructors are not tolerated.
-//!   - Only `pub struct`s. Enums are intentionally skipped —
-//!     `#[non_exhaustive]` on an enum restricts `match` exhaustiveness
-//!     but does not block variant construction (`Enum::Variant` still
-//!     works downstream). Variant-level `#[non_exhaustive]` is also
-//!     out of scope.
+//!   - Only `pub` structs (anywhere in the file, including nested
+//!     modules — `syn::visit` recurses, which matches the intent:
+//!     `src/` trees routinely nest public types inside `mod`s).
+//!     Enums are intentionally skipped — `#[non_exhaustive]` on an
+//!     enum restricts `match` exhaustiveness but does not block
+//!     variant construction (`Enum::Variant` still works downstream).
+//!     Variant-level `#[non_exhaustive]` is also out of scope.
 //!   - `pub(crate)` / `pub(super)` are ignored — only `pub` items.
 //!   - Accepted constructor shapes within the same file:
-//!       * an `impl Ty { fn new(...) -> ... }` (any visibility)
-//!       * an `impl Ty { fn builder(...) -> ... }` (any visibility)
+//!       * an `impl Ty { pub fn <name>(...) -> Self }` — any public
+//!         associated function that returns `Self` (by value, not a
+//!         reference) and takes no `self` receiver. This captures
+//!         `new`, `builder`, `none`, `normal`, `with_ttl`, `empty`,
+//!         etc.
+//!       * an `impl Ty { pub fn <name>(...) -> Ty }` — same but with
+//!         the type named explicitly.
 //!       * `impl From<_> for Ty`
 //!       * `impl TryFrom<_> for Ty`
+//!       * `impl Default for Ty` (derive counted via the struct's own
+//!         `#[derive(Default)]` attr, handled below).
 //!
 //! Scan root: `crates/` — the published surface. `tools/`, `examples/`,
 //! and `benches/` are excluded.
+//!
+//! Parse failures are fatal: a `.rs` file under `crates/` that cannot
+//! be read or parsed is treated as a lint error, not silently skipped.
+//! Skipping on parse error would let a genuine violation hide behind a
+//! syntax glitch in the same file.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use syn::{Attribute, Item, ItemImpl, ItemStruct, Visibility, visit::Visit};
+use syn::{
+    Attribute, Item, ItemImpl, ItemStruct, ReturnType, Type, Visibility, visit::Visit,
+};
 use walkdir::WalkDir;
 
 fn main() -> ExitCode {
     let repo = std::env::current_dir().expect("cwd");
     let scan_root = repo.join("crates");
     let mut findings: Vec<Finding> = Vec::new();
+    let mut parse_errors: Vec<String> = Vec::new();
     for entry in WalkDir::new(&scan_root)
         .into_iter()
         .filter_map(Result::ok)
@@ -53,23 +71,49 @@ fn main() -> ExitCode {
         {
             continue;
         }
-        let Ok(src) = fs::read_to_string(path) else {
-            continue;
+        let rel = path.strip_prefix(&repo).unwrap_or(path).to_path_buf();
+        let src = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                parse_errors.push(format!("read {}: {e}", rel.display()));
+                continue;
+            }
         };
-        let Ok(file) = syn::parse_file(&src) else {
-            continue;
+        let file = match syn::parse_file(&src) {
+            Ok(f) => f,
+            Err(e) => {
+                parse_errors.push(format!("parse {}: {e}", rel.display()));
+                continue;
+            }
         };
         let mut v = FileVisitor::default();
         v.visit_file(&file);
         for (ty_name, span_line) in v.non_exhaustive_pub_types {
             if !v.constructors.get(&ty_name).copied().unwrap_or(false) {
                 findings.push(Finding {
-                    path: path.strip_prefix(&repo).unwrap_or(path).to_path_buf(),
+                    path: rel.clone(),
                     ty: ty_name,
                     line: span_line,
                 });
             }
         }
+    }
+
+    if !parse_errors.is_empty() {
+        eprintln!(
+            "non-exhaustive-lint: {} file(s) under crates/ failed to read/parse",
+            parse_errors.len()
+        );
+        eprintln!();
+        eprintln!(
+            "Skipping on parse errors would let genuine violations hide behind syntax glitches."
+        );
+        eprintln!("Fix the file or exclude it explicitly if intentional.");
+        eprintln!();
+        for e in &parse_errors {
+            eprintln!("  {e}");
+        }
+        return ExitCode::FAILURE;
     }
 
     if findings.is_empty() {
@@ -80,9 +124,10 @@ fn main() -> ExitCode {
     eprintln!("non-exhaustive-lint: {} violation(s)", findings.len());
     eprintln!();
     eprintln!("Each of the following `pub` items is marked `#[non_exhaustive]`");
-    eprintln!("but has no sibling constructor (fn new / fn builder / impl From /");
-    eprintln!("impl TryFrom) in the same file. Downstream consumers cannot build");
-    eprintln!("a value — the type is effectively dead API.");
+    eprintln!("but has no sibling public constructor (pub fn returning Self / Ty,");
+    eprintln!("#[derive(Default)], impl Default, impl From, impl TryFrom) in the");
+    eprintln!("same file. Downstream consumers cannot build a value — the type is");
+    eprintln!("effectively dead API.");
     eprintln!();
     eprintln!("See feedback_non_exhaustive_needs_constructor.md.");
     eprintln!();
@@ -106,10 +151,10 @@ fn path_contains_component(path: &Path, comp: &str) -> bool {
 
 #[derive(Default)]
 struct FileVisitor {
-    /// (type name, approximate line number) for each `pub` struct/enum
+    /// (type name, approximate line number) for each `pub` struct
     /// carrying `#[non_exhaustive]`.
     non_exhaustive_pub_types: Vec<(String, usize)>,
-    /// Type name -> true if any constructor found in-file.
+    /// Type name -> true if any accepted constructor shape found in-file.
     constructors: BTreeMap<String, bool>,
 }
 
@@ -135,7 +180,13 @@ impl FileVisitor {
         // Unit / tuple / named-field structs all require an
         // explicit constructor once #[non_exhaustive] is on — struct
         // literal syntax is blocked downstream regardless of shape.
-        self.non_exhaustive_pub_types.push((s.ident.to_string(), 0));
+        let name = s.ident.to_string();
+        // `#[derive(Default)]` on the struct itself is an acceptable
+        // constructor: downstream can call `Ty::default()`.
+        if has_derive_default(&s.attrs) {
+            self.constructors.insert(name.clone(), true);
+        }
+        self.non_exhaustive_pub_types.push((name, 0));
     }
 
     fn check_impl(&mut self, i: &ItemImpl) {
@@ -144,11 +195,12 @@ impl FileVisitor {
             return;
         };
 
-        // `impl From<...> for Target` and `impl TryFrom<...> for Target`.
+        // `impl From<...> for Target`, `impl TryFrom<...> for Target`,
+        // `impl Default for Target`.
         if let Some((_not, trait_, _for)) = &i.trait_ {
             if let Some(last) = trait_.segments.last() {
                 let name = last.ident.to_string();
-                if name == "From" || name == "TryFrom" {
+                if name == "From" || name == "TryFrom" || name == "Default" {
                     self.constructors.insert(target, true);
                     return;
                 }
@@ -157,11 +209,21 @@ impl FileVisitor {
             return;
         }
 
-        // Inherent impl — look for `fn new` / `fn builder` on the type.
+        // Inherent impl — look for any `pub fn` that takes no `self`
+        // receiver and returns `Self` or the target type by value.
+        // This captures `new`, `builder`, `none`, `normal`, `empty`,
+        // `with_ttl`, `from_parts`, etc.
         for item in &i.items {
             if let syn::ImplItem::Fn(m) = item {
-                let name = m.sig.ident.to_string();
-                if name == "new" || name == "builder" {
+                if !matches!(m.vis, Visibility::Public(_)) {
+                    continue;
+                }
+                // Skip methods — a method (has a `self` receiver) is
+                // not a consumer-side constructor.
+                if m.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Receiver(_))) {
+                    continue;
+                }
+                if fn_returns_target_by_value(&m.sig.output, &target) {
                     self.constructors.insert(target.clone(), true);
                 }
             }
@@ -177,15 +239,53 @@ fn has_non_exhaustive(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| a.path().is_ident("non_exhaustive"))
 }
 
+fn has_derive_default(attrs: &[Attribute]) -> bool {
+    for a in attrs {
+        if !a.path().is_ident("derive") {
+            continue;
+        }
+        let mut found = false;
+        let _ = a.parse_nested_meta(|meta| {
+            if meta.path.is_ident("Default") {
+                found = true;
+            }
+            Ok(())
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 fn impl_target_name(i: &ItemImpl) -> Option<String> {
     let ty = &*i.self_ty;
-    if let syn::Type::Path(tp) = ty {
+    if let Type::Path(tp) = ty {
         return tp.path.segments.last().map(|s| s.ident.to_string());
     }
     None
 }
 
-// Line numbers are printed as 0 today — `syn` spans round-trip through
-// `proc_macro2` and surfacing `LineColumn` from non-proc-macro context
-// isn't stable. The type name is grep-able; that's sufficient for the
-// CI error to point at the right file.
+/// `true` iff the function signature returns `Self` or `<target>`
+/// by value — not a reference, not `Option<Self>`, not
+/// `Result<Self, _>`. We deliberately stay strict: a consumer-side
+/// constructor must yield a value the caller can bind directly.
+///
+/// Bare-value `Self`/`Ty` is the common shape (`fn none() -> Self`,
+/// `fn new() -> Ty`); `Result<Self, E>` fallible constructors are
+/// handled via `impl TryFrom` or by pairing with an infallible
+/// constructor. If that proves too strict in practice we'll widen;
+/// today every live constructor in crates/ fits this shape.
+fn fn_returns_target_by_value(ret: &ReturnType, target: &str) -> bool {
+    let ReturnType::Type(_, ty) = ret else {
+        return false;
+    };
+    let Type::Path(tp) = &**ty else {
+        return false;
+    };
+    let Some(last) = tp.path.segments.last() else {
+        return false;
+    };
+    let name = last.ident.to_string();
+    name == "Self" || name == target
+}

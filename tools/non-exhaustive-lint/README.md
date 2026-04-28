@@ -1,8 +1,18 @@
 # non-exhaustive-lint
 
-Flags `pub` **structs** marked `#[non_exhaustive]` that have no
-constructor (`fn new`, `fn builder`, `impl From<...>`, or `impl TryFrom<...>`)
-in the same file.
+Flags `pub` **structs** marked `#[non_exhaustive]` that have no public
+constructor in the same file.
+
+Accepted constructor shapes:
+
+- An inherent `impl Ty { pub fn <name>(...) -> Self }` or
+  `impl Ty { pub fn <name>(...) -> Ty }` — any associated function
+  that is `pub`, takes no `self` receiver, and returns the type by
+  value. Captures `new`, `builder`, `none`, `normal`, `with_ttl`,
+  `empty`, `from_parts`, etc.
+- `impl From<...> for Ty`
+- `impl TryFrom<...> for Ty`
+- `impl Default for Ty`, or `#[derive(Default)]` on the struct.
 
 Enums are intentionally skipped: `#[non_exhaustive]` on an enum only
 restricts `match` exhaustiveness, it does not block variant
@@ -19,13 +29,22 @@ merge.
 
 - Scan root: `crates/`. Excludes `tools/`, `examples/`, `benches/`,
   in-crate `tests/` + `benches/` subdirs, and `build.rs`.
-- Only top-level `pub` items (not `pub(crate)` etc.).
+- Any `pub` struct, anywhere in the file including nested modules.
+  `syn::visit` recurses into `mod` blocks; that matches the intent
+  (a `src/` tree routinely nests public types inside modules).
+- Only `pub` items (not `pub(crate)` / `pub(super)`).
 - Variant-level `#[non_exhaustive]` is out of scope.
 - Constructors are only detected in the SAME file as the type
   definition; re-exports are not followed. This is the deliberate
   "sufficient" bar per the plan decision: a type with its constructor
   far away is rare in this codebase and still catches a human reviewer's
   eye.
+
+## Parse failures are fatal
+
+If a `.rs` file under `crates/` cannot be read or parsed, the lint
+exits non-zero. Silently skipping on parse errors would let a genuine
+violation hide behind a syntax glitch.
 
 ## Run locally
 
@@ -53,4 +72,5 @@ cargo run -p non-exhaustive-lint
 ```
 
 Remove the marker (add `impl DeadApi { pub fn new() -> Self { ... } }`
-or `impl From<String> for DeadApi`) and the lint passes.
+or `impl From<String> for DeadApi`, or `#[derive(Default)]`) and the
+lint passes.
