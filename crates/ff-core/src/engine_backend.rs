@@ -1092,7 +1092,11 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// rather than risking unsound behaviour.
     ///
     /// v0.13 (PR-7b) will trait-ify individual scanners onto
-    /// `EngineBackend` and retire this method.
+    /// `EngineBackend` and retire `ff-engine`'s dependence on this
+    /// downcast path. The method itself will remain on the trait
+    /// (likely deprecated) rather than be removed — removing a
+    /// public trait method is a breaking change for external
+    /// `impl EngineBackend` blocks.
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         // Placeholder so the default does not expose `Self` for
         // downcast. Backends override to return `self`.

@@ -198,9 +198,10 @@ impl Engine {
     /// is [`ff_backend_valkey::ValkeyBackend`] only; v0.13 (PR-7b)
     /// will trait-ify the scanner surface and accept any
     /// `EngineBackend` implementation. Passing a non-Valkey backend
-    /// today panics at scanner-spawn time (by design — the cairn
-    /// embedding path that motivated this signature goes through
-    /// Valkey until the trait-ification lands).
+    /// today panics immediately inside this constructor (before any
+    /// scanner tasks are spawned) — by design; the cairn embedding
+    /// path that motivated this signature goes through Valkey until
+    /// the trait-ification lands.
     pub fn start(config: EngineConfig, backend: Arc<dyn EngineBackend>) -> Self {
         // Construct a fresh metrics handle here so direct callers
         // (examples, tests) don't need to. Under the default build
@@ -242,15 +243,18 @@ impl Engine {
     ///
     /// # Backend parameter (v0.12 PR-7a)
     ///
-    /// `backend` is an `Arc<dyn EngineBackend>` so cairn and other
-    /// consumers can construct an engine around a non-Valkey backend
-    /// without touching scanner internals. The scanner supervisors
-    /// today still speak ferriskey, so this constructor downcasts
-    /// `backend.as_any()` to
-    /// [`ff_backend_valkey::ValkeyBackend`] and reaches for the
-    /// embedded `ferriskey::Client`. v0.13 (PR-7b) will trait-ify
-    /// each scanner onto `EngineBackend` and retire the downcast —
-    /// the public signature stays stable through that transition.
+    /// `backend` is an `Arc<dyn EngineBackend>` so the public
+    /// constructor signature is backend-agnostic — cairn and other
+    /// consumers can sequence their engine construction around this
+    /// shape without waiting for the scanner trait-ification. Runtime
+    /// support in v0.12 is still Valkey-only: the scanner supervisors
+    /// today speak ferriskey, so this constructor downcasts
+    /// `backend.as_any()` to [`ff_backend_valkey::ValkeyBackend`] and
+    /// reaches for the embedded `ferriskey::Client`. v0.13 (PR-7b)
+    /// will trait-ify each scanner onto `EngineBackend` and retire
+    /// the downcast — the public signature stays stable through that
+    /// transition, so consumers wiring up the v0.12 shape today
+    /// don't change their call site.
     ///
     /// # Panics
     ///
@@ -296,15 +300,18 @@ impl Engine {
         // speak ferriskey directly; until PR-7b trait-ifies them,
         // reach in for the embedded client. Only in-tree consumer is
         // ff-server which always constructs a `ValkeyBackend`.
-        let client = backend
+        let client = match backend
             .as_any()
             .downcast_ref::<ff_backend_valkey::ValkeyBackend>()
-            .expect(
-                "Engine::start_* in v0.12 requires ValkeyBackend; \
-                 non-Valkey support lands in v0.13 (PR-7b).",
-            )
-            .client()
-            .clone();
+        {
+            Some(vb) => vb.client().clone(),
+            None => panic!(
+                "Engine::start_* in v0.12 requires ValkeyBackend \
+                 (got backend_label={:?}); non-Valkey support lands \
+                 in v0.13 (PR-7b).",
+                backend.backend_label(),
+            ),
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let num_partitions = config.partition_config.num_flow_partitions;
         let router = Arc::new(PartitionRouter::new(config.partition_config));
