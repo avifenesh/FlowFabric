@@ -187,7 +187,7 @@ pub(crate) async fn read_execution_info_impl(
     let raw_fields_str: String = row.try_get("raw_fields").map_err(map_sqlx_error)?;
     let attempt_outcome_opt: Option<String> =
         row.try_get("attempt_outcome").map_err(map_sqlx_error)?;
-    let first_started_at_ms_opt: Option<i64> =
+    let started_at_ms_opt: Option<i64> =
         row.try_get("started_at_ms").map_err(map_sqlx_error)?;
 
     let raw_fields: JsonValue =
@@ -290,7 +290,7 @@ pub(crate) async fn read_execution_info_impl(
         state_vector,
         public_state,
         created_at: created_at_ms.to_string(),
-        started_at: first_started_at_ms_opt.map(|v| v.to_string()),
+        started_at: started_at_ms_opt.map(|v| v.to_string()),
         completed_at: terminal_at_ms_opt.map(|v| v.to_string()),
         current_attempt_index: attempt_index_u32,
         flow_id,

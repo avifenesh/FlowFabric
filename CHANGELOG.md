@@ -29,6 +29,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   0015 is reserved for RFC-024 (claim-grant table); if the RFC-024
   impl PR lands first the two renumber independently — 0016 stays
   additive and safe. Closes #356.
+- `ff-backend-postgres`: first-claim path now writes
+  `public_state = 'running'` on `ff_exec_core` for parity with the
+  resume-claim path (`src/suspend_ops.rs`) and the SQLite first-claim
+  write landed in PR #392. Prior to this fix the column remained at its
+  create-time `'waiting'` literal after a PG first-claim, so Spine-B
+  `read_execution_info` readers (and any direct `SELECT public_state`)
+  saw the wrong column state until the read-boundary
+  `normalise_public_state` adapter masked it. Regression coverage in
+  `crates/ff-backend-postgres/tests/wave9_followups.rs`
+  (`first_claim_writes_public_state_running`).
 
 ### Documentation
 

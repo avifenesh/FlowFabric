@@ -442,6 +442,27 @@ pub(super) async fn cancel_impl(
     .await
     .map_err(map_sqlx_error)?;
 
+    // #355: clear the current attempt's `outcome` so a later
+    // `read_execution_info` doesn't surface a stale
+    // `retry`/`interrupted` terminal-outcome on a cancelled row.
+    // Mirrors the equivalent clear on the `cancel_flow` member loop
+    // (`flow.rs`).
+    sqlx::query(
+        r#"
+        UPDATE ff_attempt
+           SET outcome = NULL
+         WHERE partition_key = $1
+           AND execution_id  = $2
+           AND attempt_index = (SELECT attempt_index FROM ff_exec_core
+                                 WHERE partition_key = $1 AND execution_id = $2)
+        "#,
+    )
+    .bind(partition_key)
+    .bind(eid_uuid)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(())
 }
@@ -507,10 +528,14 @@ pub(super) async fn resolve_execution_flow_id_impl(
 // produce Postgres-specific literals that are **not** members of the
 // public enums:
 //
-//   * `flow.rs:672-687` (cancel-member loop) writes `cancelled` to all
-//     five columns on flow-cancel.
+//   * `flow.rs:672-687` (cancel-member loop) writes `cancelled` to
+//     `lifecycle_phase`, `eligibility_state`, and `public_state` on
+//     flow-cancel.
 //   * `operator.rs:211-235` (`cancel_execution`) likewise writes
 //     `cancelled`.
+//   * `exec_core::cancel_impl` writes `cancelled` to `public_state` +
+//     `attempt_state` and the sentinel `terminal` to `lifecycle_phase`
+//     (the Handle-level single-exec cancel path).
 //   * `suspend_ops.rs:958` (resume-claim) writes bare `running` to
 //     `public_state` (canonical form is `active`).
 //   * `suspend_ops.rs:585` writes `released` to `ownership_state`
@@ -764,7 +789,7 @@ pub(super) async fn read_execution_info_impl(
     let raw_fields: JsonValue = row.try_get("raw_fields").map_err(map_sqlx_error)?;
     let attempt_outcome_opt: Option<String> =
         row.try_get("attempt_outcome").map_err(map_sqlx_error)?;
-    let first_started_at_ms_opt: Option<i64> =
+    let started_at_ms_opt: Option<i64> =
         row.try_get("started_at_ms").map_err(map_sqlx_error)?;
 
     let lifecycle_phase: LifecyclePhase = json_enum!(
@@ -846,7 +871,7 @@ pub(super) async fn read_execution_info_impl(
         state_vector,
         public_state,
         created_at: created_at_ms.to_string(),
-        started_at: first_started_at_ms_opt.map(|v| v.to_string()),
+        started_at: started_at_ms_opt.map(|v| v.to_string()),
         completed_at: terminal_at_ms_opt.map(|v| v.to_string()),
         current_attempt_index: attempt_index.max(0) as u32,
         flow_id,

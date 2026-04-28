@@ -293,3 +293,70 @@ async fn first_claim_populates_started_at_ms_set_once() {
         "set-once: reclaim/retry must not overwrite started_at_ms (#356)"
     );
 }
+
+async fn read_exec_public_state(pool: &PgPool, part: i16, exec_uuid: Uuid) -> String {
+    sqlx::query(
+        "SELECT public_state FROM ff_exec_core \
+         WHERE partition_key = $1 AND execution_id = $2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read public_state")
+    .try_get::<String, _>("public_state")
+    .expect("public_state column")
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn first_claim_writes_public_state_running() {
+    // PG parity with SQLite (PR #392) + PG resume-claim path
+    // (`suspend_ops.rs`): first-claim must flip `public_state` from
+    // the create-time `'waiting'` literal to `'running'`.
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+    let backend: Arc<dyn EngineBackend> =
+        PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
+
+    let lane = LaneId::new(format!("wave9-followup-pubstate-{}", Uuid::new_v4()).as_str());
+    let eid = ExecutionId::solo(&lane, &PartitionConfig::default());
+    let (part, exec_uuid) = split_exec(&eid);
+    let now = TimestampMs::now().0;
+
+    insert_exec_core(
+        &pool,
+        part,
+        exec_uuid,
+        None,
+        lane.as_str(),
+        "runnable",
+        "waiting",
+        0,
+        now,
+    )
+    .await;
+
+    assert_eq!(
+        read_exec_public_state(&pool, part, exec_uuid).await,
+        "waiting",
+        "pre-condition: seeded as waiting"
+    );
+
+    let _h = backend
+        .claim(
+            &lane,
+            &CapabilitySet::default(),
+            claim_policy_for("w-pubstate", 60_000),
+        )
+        .await
+        .expect("first claim ok")
+        .expect("first claim Some");
+
+    assert_eq!(
+        read_exec_public_state(&pool, part, exec_uuid).await,
+        "running",
+        "first-claim must flip ff_exec_core.public_state to 'running' for Spine-B parity"
+    );
+}

@@ -110,7 +110,7 @@ async fn read_started_at_ms(b: &Arc<SqliteBackend>, exec_uuid: Uuid) -> Option<i
 #[serial(ff_dev_mode)]
 async fn sqlite_first_claim_populates_started_at_ms_set_once() {
     let b = fresh_backend().await;
-    let lane_id = LaneId::new(format!("wave9-355-{}", uuid_like()).as_str());
+    let lane_id = LaneId::new(format!("wave9-356-{}", uuid_like()).as_str());
     let exec_id = create_runnable(&b, &lane_id).await;
     let exec_uuid = uuid_of(&exec_id);
 
@@ -162,7 +162,7 @@ async fn sqlite_first_claim_populates_started_at_ms_set_once() {
 #[serial(ff_dev_mode)]
 async fn sqlite_cancel_flow_clears_member_attempt_outcome() {
     let b = fresh_backend().await;
-    let lane_id = LaneId::new("wave9-356-cancel-flow");
+    let lane_id = LaneId::new("wave9-355-cancel-flow");
     let exec_id = create_runnable(&b, &lane_id).await;
     let exec_uuid = uuid_of(&exec_id);
 
