@@ -232,19 +232,24 @@ async fn try_claim_in_partition(
     .map_err(map_sqlx_error)?;
     let epoch_i: i64 = epoch_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
 
-    // Flip exec_core to active.
+    // Flip exec_core to active. #356: `started_at_ms` is set-once —
+    // `COALESCE(started_at_ms, $3)` preserves the original first-claim
+    // timestamp across reclaim + retry attempts, matching Valkey's
+    // dedicated set-once `exec_core["started_at"]` field.
     sqlx::query(
         r#"
         UPDATE ff_exec_core
            SET lifecycle_phase = 'active',
                ownership_state = 'leased',
                eligibility_state = 'not_applicable',
-               attempt_state = 'running_attempt'
+               attempt_state = 'running_attempt',
+               started_at_ms = COALESCE(started_at_ms, $3)
          WHERE partition_key = $1 AND execution_id = $2
         "#,
     )
     .bind(part)
     .bind(exec_uuid)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;

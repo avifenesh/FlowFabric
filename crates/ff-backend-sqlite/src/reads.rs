@@ -188,7 +188,7 @@ pub(crate) async fn read_execution_info_impl(
     let attempt_outcome_opt: Option<String> =
         row.try_get("attempt_outcome").map_err(map_sqlx_error)?;
     let first_started_at_ms_opt: Option<i64> =
-        row.try_get("first_started_at_ms").map_err(map_sqlx_error)?;
+        row.try_get("started_at_ms").map_err(map_sqlx_error)?;
 
     let raw_fields: JsonValue =
         serde_json::from_str(&raw_fields_str).map_err(|e| EngineError::Validation {

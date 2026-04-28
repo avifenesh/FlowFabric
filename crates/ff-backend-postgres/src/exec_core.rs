@@ -490,19 +490,59 @@ pub(super) async fn resolve_execution_flow_id_impl(
 //
 // All three reads project from the `ff_exec_core` row for the target
 // `(partition_key, execution_id)`; `read_execution_info` additionally
-// LATERAL-joins `ff_attempt` for the current-attempt row (outcome +
-// started_at). READ COMMITTED is sufficient — all three are
-// single-query, read-only, no CAS. Per RFC §4.1 + §7.8,
-// `get_execution_result` is current-attempt semantics (matches Valkey's
-// `GET ctx.result()` primitive; `result` column on `ff_exec_core`).
+// LATERAL-joins `ff_attempt` for the current-attempt row (outcome).
+// READ COMMITTED is sufficient — all three are single-query, read-only,
+// no CAS. Per RFC §4.1 + §7.8, `get_execution_result` is
+// current-attempt semantics (matches Valkey's `GET ctx.result()`
+// primitive; `result` column on `ff_exec_core`).
 //
-// Postgres storage strings for the 6 state-vector dimensions are a
-// superset of the in-core enum literals (`cancelled`, `blocked`,
-// `eligible`, `pending`, `released`, `running`, `pending_claim`, …).
-// These Postgres-specific literals are collapsed to the closest
-// user-facing enum variant by the normalisation helpers below before
-// JSON-deserialising; unknown tokens surface as `Corruption` errors
-// rather than silently defaulting.
+// ── Column-literal alphabet: the read-boundary adapter (#354) ────
+//
+// The Postgres `ff_exec_core` state columns — `lifecycle_phase`,
+// `ownership_state`, `eligibility_state`, `public_state`,
+// `attempt_state` — encode `(phase × eligibility × terminal-outcome)`
+// in a **richer private alphabet** than the canonical `ff_core::state`
+// enums (`LifecyclePhase`, `OwnershipState`, `EligibilityState`,
+// `PublicState`, `AttemptState`). Write sites in this crate legitimately
+// produce Postgres-specific literals that are **not** members of the
+// public enums:
+//
+//   * `flow.rs:672-687` (cancel-member loop) writes `cancelled` to all
+//     five columns on flow-cancel.
+//   * `operator.rs:211-235` (`cancel_execution`) likewise writes
+//     `cancelled`.
+//   * `suspend_ops.rs:958` (resume-claim) writes bare `running` to
+//     `public_state` (canonical form is `active`).
+//   * `suspend_ops.rs:585` writes `released` to `ownership_state`
+//     (canonical form is `unowned`).
+//   * Scheduler-transitional paths write `pending_claim` to
+//     `eligibility_state` and `attempt_state`; legacy dispatch paths
+//     write `blocked` to `lifecycle_phase`.
+//
+// **This module is the documented read-boundary adapter** (Option B
+// per owner decision on #354 / RFC-020 §4.1 Revision 8). The
+// `normalise_*` helpers below collapse each column literal to the
+// closest public-enum variant before `json_enum!` deserialises the
+// string into the enum type; unknown tokens fall through the match arm
+// unchanged and `json_enum!` surfaces them as
+// `ValidationKind::Corruption` rather than silently defaulting.
+//
+// **Invariant for new code:**
+//
+//   * New read paths against these columns MUST call through the
+//     `normalise_*` helpers before constructing a public enum.
+//   * New write paths MAY introduce new column literals (the column is
+//     the authoritative audit trail of which backend phase produced the
+//     row), but MUST update the corresponding `normalise_*` arm in the
+//     same PR so the read path stays total.
+//   * Option A — migrating write paths to canonical literals only —
+//     was considered and rejected (RFC-020 §4.1 Revision 8): it would
+//     relocate the `(phase × eligibility × terminal-outcome)` encoding
+//     from SQL columns into per-write computation without reducing
+//     mapping-layer complexity, and would lose the column-level
+//     distinction between e.g. `cancelled` (terminal-by-cancel) and
+//     `terminal` (terminal-by-success/fail/expire/skip) that the
+//     `derive_terminal_outcome` helper below depends on.
 
 // Normalisation maps: `ff_exec_core` literal → closest
 // serde-snake_case enum variant. Each arm is grounded in an actual
@@ -660,11 +700,12 @@ pub(super) async fn read_execution_info_impl(
     let partition_key: i16 = id.partition() as i16;
     let execution_id = eid_uuid(id);
 
-    // LATERAL joins: `cur` pins to the current attempt (for
-    // `outcome` — drives `TerminalOutcome`); `first` pins to the
-    // earliest attempt row on the execution (attempt_index ASC — drives
-    // `started_at`, which per `ExecutionInfo` contract is the
-    // first-claim timestamp preserved across retries — Valkey parity).
+    // LATERAL join: `cur` pins to the current attempt (for
+    // `outcome` — drives `TerminalOutcome`). Since migration 0016
+    // (#356) `ff_exec_core.started_at_ms` is a set-once column
+    // populated on first claim, so the `ExecutionInfo.started_at`
+    // field reads directly from the base row — the second LATERAL
+    // join on `ff_attempt.started_at_ms` (earliest non-NULL) is gone.
     let row = sqlx::query(
         r#"
         SELECT ec.flow_id,
@@ -679,9 +720,9 @@ pub(super) async fn read_execution_info_impl(
                ec.attempt_index,
                ec.created_at_ms,
                ec.terminal_at_ms,
+               ec.started_at_ms,
                ec.raw_fields,
-               cur.outcome       AS attempt_outcome,
-               first_att.started_at_ms AS first_started_at_ms
+               cur.outcome       AS attempt_outcome
         FROM ff_exec_core ec
         LEFT JOIN LATERAL (
             SELECT outcome
@@ -690,15 +731,6 @@ pub(super) async fn read_execution_info_impl(
               AND execution_id  = ec.execution_id
               AND attempt_index = ec.attempt_index
         ) cur ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT started_at_ms
-            FROM ff_attempt
-            WHERE partition_key = ec.partition_key
-              AND execution_id  = ec.execution_id
-              AND started_at_ms IS NOT NULL
-            ORDER BY attempt_index ASC
-            LIMIT 1
-        ) first_att ON TRUE
         WHERE ec.partition_key = $1 AND ec.execution_id = $2
         "#,
     )
@@ -733,7 +765,7 @@ pub(super) async fn read_execution_info_impl(
     let attempt_outcome_opt: Option<String> =
         row.try_get("attempt_outcome").map_err(map_sqlx_error)?;
     let first_started_at_ms_opt: Option<i64> =
-        row.try_get("first_started_at_ms").map_err(map_sqlx_error)?;
+        row.try_get("started_at_ms").map_err(map_sqlx_error)?;
 
     let lifecycle_phase: LifecyclePhase = json_enum!(
         LifecyclePhase,
