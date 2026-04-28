@@ -223,97 +223,25 @@ impl FlowFabricWorker {
 
         // Build the ferriskey client from the nested `BackendConfig`.
         // Delegates to `ff_backend_valkey::build_client` so host/port +
-        // TLS + cluster + `BackendTimeouts::request` +
-        // `BackendRetry` wiring lives in exactly one place (pre-Stage
-        // 1c this path had its own `ClientBuilder` chain that diverged
-        // from the backend's shape; RFC-012 Stage 1c tranche 1
-        // consolidates).
+        // TLS + cluster + `BackendTimeouts::request` + `BackendRetry`
+        // wiring lives in exactly one place (RFC-012 Stage 1c tranche 1).
         let client = ff_backend_valkey::build_client(&config.backend).await?;
 
-        // Verify connectivity
-        let pong: String = client
-            .cmd("PING")
-            .execute()
-            .await
-            .map_err(|e| crate::backend_context(e, "PING failed"))?;
-        if pong != "PONG" {
-            return Err(SdkError::Config {
-                context: "worker_connect".into(),
-                field: None,
-                message: format!("unexpected PING response: {pong}"),
-            });
-        }
-
-        // Guard against two worker processes sharing the same
-        // `worker_instance_id`. A duplicate instance would clobber each
-        // other's lease_current/active_index entries and double-claim work.
-        // SET NX on a liveness key with 2× lease TTL; if the key already
-        // exists another process is live. The key auto-expires if this
-        // process crashes without renewal, so a restart after a hard crash
-        // just waits at most 2× lease_ttl_ms for the ghost entry to clear.
-        //
-        // Known limitations of this minimal scheme (documented for operators):
-        //   1. **Startup-only, not runtime.** There is no heartbeat renewal
-        //      path. After `2 × lease_ttl_ms` elapses the alive key expires
-        //      naturally even while this worker is still running, and a
-        //      second process with the same `worker_instance_id` launched
-        //      later will successfully SET NX alongside the first. The check
-        //      catches misconfiguration at boot; it does not fence duplicates
-        //      that appear mid-lifetime. Production deployments should rely
-        //      on the orchestrator (Kubernetes, systemd unit with
-        //      `Restart=on-failure`, etc.) as the authoritative single-
-        //      instance enforcer; this SET NX is belt-and-suspenders.
-        //
-        //   2. **Restart delay after a crash.** If a worker crashes
-        //      ungracefully (SIGKILL, container OOM) and is restarted within
-        //      `2 × lease_ttl_ms`, the alive key is still present and the
-        //      new process exits with `SdkError::Config("duplicate
-        //      worker_instance_id ...")`. Options for operators:
-        //        - Wait `2 × lease_ttl_ms` (default 60s with the 30s TTL)
-        //          before restarting.
-        //        - Manually `DEL ff:worker:<instance_id>:alive` in Valkey to
-        //          unblock the restart.
-        //        - Use a fresh `worker_instance_id` for the restart (the
-        //          orchestrator should already do this per-Pod).
-        //
-        //   3. **No graceful cleanup on shutdown.** There is no explicit
-        //      `disconnect()` call that DELs the alive key. On clean
-        //      `SIGTERM` the key lingers until its TTL expires. A follow-up
-        //      can add `FlowFabricWorker::disconnect(self)` for callers that
-        //      want to skip the restart-delay window.
-        let alive_key = format!("ff:worker:{}:alive", config.worker_instance_id);
-        let alive_ttl_ms = (config.lease_ttl_ms.saturating_mul(2)).max(1_000);
-        let set_result: Option<String> = client
-            .cmd("SET")
-            .arg(&alive_key)
-            .arg("1")
-            .arg("NX")
-            .arg("PX")
-            .arg(alive_ttl_ms.to_string().as_str())
-            .execute()
-            .await
-            .map_err(|e| crate::backend_context(e, "SET NX worker alive key"))?;
-        if set_result.is_none() {
-            return Err(SdkError::Config {
-                context: "worker_connect".into(),
-                field: Some("worker_instance_id".into()),
-                message: format!(
-                    "duplicate worker_instance_id '{}': another process already holds {alive_key}",
-                    config.worker_instance_id
-                ),
-            });
-        }
-
-        // Read partition config from Valkey (set by ff-server on startup).
-        // Falls back to defaults if key doesn't exist (e.g. SDK-only testing).
-        let partition_config = read_partition_config(&client).await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "ff:config:partitions not found, using defaults"
-                );
-                PartitionConfig::default()
-            });
+        // v0.12 PR-6: the Valkey-specific preamble (PING, alive-key
+        // SET-NX, `ff:config:partitions` HGETALL, caps ingress +
+        // sorted-dedup CSV, caps STRING + workers-index writes) lives
+        // in `crate::valkey_preamble`. Extracted byte-for-byte from
+        // the pre-PR-6 inline body; the write order is observable
+        // from scheduler-side reads (unblock scanner:
+        // SMEMBERS ff:idx:workers → GET ff:worker:{id}:caps) so
+        // preservation is load-bearing. See `valkey_preamble::run`.
+        let crate::valkey_preamble::PreambleOutput {
+            partition_config,
+            #[cfg(feature = "direct-valkey-claim")]
+            capabilities_csv: worker_capabilities_csv,
+            #[cfg(feature = "direct-valkey-claim")]
+            capabilities_hash: worker_capabilities_hash,
+        } = crate::valkey_preamble::run(&client, &config).await?;
 
         let max_tasks = config.max_concurrent_tasks.max(1);
         let concurrency_semaphore = Arc::new(Semaphore::new(max_tasks));
@@ -331,207 +259,12 @@ impl FlowFabricWorker {
             partition_config.num_flow_partitions.max(1) as usize,
         );
 
-        // Sort + dedupe capabilities into a stable CSV. BTreeSet both sorts
-        // and deduplicates in one pass; string joining happens once here.
-        //
-        // Ingress validation mirrors Scheduler::claim_for_worker (ff-scheduler):
-        //   - `,` is the CSV delimiter; a token containing one would split
-        //     mid-parse and could let a {"gpu"} worker appear to satisfy
-        //     {"gpu,cuda"} (silent auth bypass).
-        //   - Empty strings would produce leading/adjacent commas on the
-        //     wire and inflate token count for no semantic reason.
-        //   - Non-printable / whitespace chars: `"gpu "` vs `"gpu"` or
-        //     `"gpu\n"` vs `"gpu"` produce silent mismatches that are
-        //     miserable to debug. Reject anything outside printable ASCII
-        //     excluding space (`'!'..='~'`) at ingress so a typo fails
-        //     loudly at connect instead of silently mis-routing forever.
-        // Reject at boot so operator misconfig is loud, symmetric with the
-        // scheduler path.
-        #[cfg(feature = "direct-valkey-claim")]
-        for cap in &config.capabilities {
-            if cap.is_empty() {
-                return Err(SdkError::Config {
-                    context: "worker_config".into(),
-                    field: Some("capabilities".into()),
-                    message: "capability token must not be empty".into(),
-                });
-            }
-            if cap.contains(',') {
-                return Err(SdkError::Config {
-                    context: "worker_config".into(),
-                    field: Some("capabilities".into()),
-                    message: format!(
-                        "capability token may not contain ',' (CSV delimiter): {cap:?}"
-                    ),
-                });
-            }
-            // Reject ASCII control bytes (0x00-0x1F, 0x7F) and any ASCII
-            // whitespace (space, tab, LF, CR, FF, VT). UTF-8 printable
-            // characters above 0x7F are ALLOWED so i18n caps like
-            // "东京-gpu" can be used. The CSV wire form is byte-safe for
-            // multibyte UTF-8 because `,` is always a single byte and
-            // never part of a multibyte continuation (only 0x80-0xBF are
-            // continuations, ',' is 0x2C).
-            if cap.chars().any(|c| c.is_control() || c.is_whitespace()) {
-                return Err(SdkError::Config {
-                    context: "worker_config".into(),
-                    field: Some("capabilities".into()),
-                    message: format!(
-                        "capability token must not contain whitespace or control \
-                         characters: {cap:?}"
-                    ),
-                });
-            }
-        }
-        #[cfg(feature = "direct-valkey-claim")]
-        let worker_capabilities_csv: String = {
-            let set: std::collections::BTreeSet<&str> = config
-                .capabilities
-                .iter()
-                .map(|s| s.as_str())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if set.len() > ff_core::policy::CAPS_MAX_TOKENS {
-                return Err(SdkError::Config {
-                    context: "worker_config".into(),
-                    field: Some("capabilities".into()),
-                    message: format!(
-                        "capability set exceeds CAPS_MAX_TOKENS ({}): {}",
-                        ff_core::policy::CAPS_MAX_TOKENS,
-                        set.len()
-                    ),
-                });
-            }
-            let csv = set.into_iter().collect::<Vec<_>>().join(",");
-            if csv.len() > ff_core::policy::CAPS_MAX_BYTES {
-                return Err(SdkError::Config {
-                    context: "worker_config".into(),
-                    field: Some("capabilities".into()),
-                    message: format!(
-                        "capability CSV exceeds CAPS_MAX_BYTES ({}): {}",
-                        ff_core::policy::CAPS_MAX_BYTES,
-                        csv.len()
-                    ),
-                });
-            }
-            csv
-        };
-
-        // Short stable digest of the sorted caps CSV, computed once so
-        // per-mismatch logs carry a stable identifier instead of the 4KB
-        // CSV. Shared helper — ff-scheduler uses the same one for its
-        // own per-mismatch logs, so cross-component log lines are
-        // diffable against each other.
-        #[cfg(feature = "direct-valkey-claim")]
-        let worker_capabilities_hash = ff_core::hash::fnv1a_xor8hex(&worker_capabilities_csv);
-
-        // Full CSV logged once at connect so per-mismatch logs (which
-        // carry only the 8-hex hash) can be cross-referenced by ops.
-        #[cfg(feature = "direct-valkey-claim")]
-        if !worker_capabilities_csv.is_empty() {
-            tracing::info!(
-                worker_instance_id = %config.worker_instance_id,
-                worker_caps_hash = %worker_capabilities_hash,
-                worker_caps = %worker_capabilities_csv,
-                "worker connected with capabilities (full CSV — mismatch logs use hash only)"
-            );
-        }
-
-        // Non-authoritative advertisement of caps for operator visibility
-        // (CLI introspection, dashboards). The AUTHORITATIVE source for
-        // scheduling decisions is ARGV[9] on each claim — Lua reads ONLY
-        // that, never this string. Lossy here is correctness-safe.
-        //
-        // Storage: a single STRING key holding the sorted CSV. Rationale:
-        //   * **Atomic overwrite.** `SET` is a single command — a concurrent
-        //     reader can never observe a transient empty value (the prior
-        //     DEL+SADD pair had that window).
-        //   * **Crash cleanup without refresh loop.** The alive-key SET NX
-        //     is startup-only (see §1 above); there's no periodic renew
-        //     to piggy-back on, so a TTL on caps would independently
-        //     expire mid-flight and hide a live worker's caps from ops
-        //     tools. Instead we drop the TTL: each reconnect overwrites;
-        //     a crashed worker leaves a stale CSV until a new process
-        //     with the same worker_instance_id boots (which triggers
-        //     `duplicate worker_instance_id` via alive-key guard anyway —
-        //     the orchestrator allocates a new id, and operators can DEL
-        //     the stale caps key if they care).
-        //   * **Empty caps = DEL.** A restart from {gpu} to {} clears the
-        //     advertisement rather than leaving stale data.
-        // Cluster-safe advertisement: the per-worker caps STRING lives at
-        // `ff:worker:{id}:caps` (lands on whatever slot CRC16 puts it on),
-        // and the INSTANCE ID is SADD'd to the global workers-index SET
-        // `ff:idx:workers` (single slot). The unblock scanner's cluster
-        // enumeration uses SMEMBERS on the index + per-member GET on each
-        // caps key, instead of `SCAN MATCH ff:worker:*:caps` (which in
-        // cluster mode only scans the shard the SCAN lands on and misses
-        // workers whose key hashes elsewhere). Pattern mirrors Batch A
-        // `budget_policies_index` / `flow_index` / `deps_all_edges`:
-        // operations stay atomic per command, the index is the
-        // cluster-wide enumeration surface.
-        #[cfg(feature = "direct-valkey-claim")]
-        {
-            let caps_key = ff_core::keys::worker_caps_key(&config.worker_instance_id);
-            let index_key = ff_core::keys::workers_index_key();
-            let instance_id = config.worker_instance_id.to_string();
-            if worker_capabilities_csv.is_empty() {
-                // No caps advertised. DEL the per-worker caps string AND
-                // SREM from the index so the scanner doesn't GET an empty
-                // string for a worker that never declares caps.
-                let _ = client
-                    .cmd("DEL")
-                    .arg(&caps_key)
-                    .execute::<Option<i64>>()
-                    .await;
-                if let Err(e) = client
-                    .cmd("SREM")
-                    .arg(&index_key)
-                    .arg(&instance_id)
-                    .execute::<Option<i64>>()
-                    .await
-                {
-                    tracing::warn!(error = %e, key = %index_key, instance = %instance_id,
-                        "SREM workers-index failed; continuing (non-authoritative)");
-                }
-            } else {
-                // Atomic overwrite of the caps STRING (one-command). Then
-                // SADD to the index (idempotent — re-running connect for
-                // the same id is a no-op at SADD level). The per-worker
-                // caps key is written BEFORE the index SADD so that when
-                // the scanner observes the id in the index, the caps key
-                // is guaranteed to resolve to a non-stale CSV (the reverse
-                // order would leak an index entry pointing at a stale or
-                // empty caps key during a narrow window).
-                if let Err(e) = client
-                    .cmd("SET")
-                    .arg(&caps_key)
-                    .arg(&worker_capabilities_csv)
-                    .execute::<Option<String>>()
-                    .await
-                {
-                    tracing::warn!(error = %e, key = %caps_key,
-                        "SET worker caps advertisement failed; continuing");
-                }
-                if let Err(e) = client
-                    .cmd("SADD")
-                    .arg(&index_key)
-                    .arg(&instance_id)
-                    .execute::<Option<i64>>()
-                    .await
-                {
-                    tracing::warn!(error = %e, key = %index_key, instance = %instance_id,
-                        "SADD workers-index failed; continuing");
-                }
-            }
-        }
-
-        // RFC-012 Stage 1b: wrap the dialed client in a
-        // ValkeyBackend so `ClaimedTask`'s trait forwarders have
-        // something to call. `from_client_and_partitions` reuses the
-        // already-dialed client — no second connection.
-        // Share the concrete `Arc<ValkeyBackend>` across the two
-        // trait objects — one allocation, both accessors yield
-        // identity-equivalent handles.
+        // RFC-012 Stage 1b: wrap the dialed client in a ValkeyBackend
+        // so `ClaimedTask`'s trait forwarders have something to call.
+        // `from_client_and_partitions` reuses the already-dialed client
+        // — no second connection. Share the concrete
+        // `Arc<ValkeyBackend>` across the two trait objects — one
+        // allocation, both accessors yield identity-equivalent handles.
         let valkey_backend: Arc<ff_backend_valkey::ValkeyBackend> =
             ff_backend_valkey::ValkeyBackend::from_client_and_partitions(
                 client.clone(),
@@ -645,10 +378,9 @@ impl FlowFabricWorker {
         // backend-agnostic construction. No `Self::connect` preamble,
         // no ferriskey round-trips (no PING, no alive-key SET-NX, no
         // `ff:config:partitions` HGETALL). Callers needing a
-        // non-default `PartitionConfig` under non-Valkey backends use
-        // `connect` (Valkey) or override post-construction through a
-        // future `WorkerConfig` field (tracked as a v0.12.0 follow-up
-        // per §4.4 item 10e).
+        // non-default `PartitionConfig` under non-Valkey backends set
+        // [`WorkerConfig::partition_config`] (v0.12 PR-6 closed the
+        // original follow-up flagged here).
         //
         // Lane-empty validation (the one check `connect` did before
         // any Valkey work) is hoisted here so every entry point
@@ -663,7 +395,12 @@ impl FlowFabricWorker {
 
         let max_tasks = config.max_concurrent_tasks.max(1);
         let concurrency_semaphore = Arc::new(Semaphore::new(max_tasks));
-        let partition_config = PartitionConfig::default();
+        // v0.12 PR-6: honor the optional `WorkerConfig::partition_config`
+        // override. `None` keeps the pre-PR-6 default shape (256 / 32 /
+        // 32); `Some(cfg)` lets non-Valkey deployments with a custom
+        // `num_flow_partitions` bind correctly instead of silently
+        // missing data via the wrong partition index.
+        let partition_config = config.partition_config.unwrap_or_default();
 
         #[cfg(feature = "direct-valkey-claim")]
         let scan_cursor_init = scan_cursor_seed(
@@ -1807,39 +1544,6 @@ fn extract_first_array_string(value: &Value) -> Option<String> {
     }
 }
 
-/// Read partition config from Valkey's `ff:config:partitions` hash.
-/// Returns Err if the key doesn't exist or can't be read.
-#[cfg(feature = "valkey-default")]
-async fn read_partition_config(client: &Client) -> Result<PartitionConfig, SdkError> {
-    let key = ff_core::keys::global_config_partitions();
-    let fields: HashMap<String, String> = client
-        .hgetall(&key)
-        .await
-        .map_err(|e| crate::backend_context(e, format!("HGETALL {key}")))?;
-
-    if fields.is_empty() {
-        return Err(SdkError::Config {
-            context: "read_partition_config".into(),
-            field: None,
-            message: "ff:config:partitions not found in Valkey".into(),
-        });
-    }
-
-    let parse = |field: &str, default: u16| -> u16 {
-        fields
-            .get(field)
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &u16| n > 0)
-            .unwrap_or(default)
-    };
-
-    Ok(PartitionConfig {
-        num_flow_partitions: parse("num_flow_partitions", 256),
-        num_budget_partitions: parse("num_budget_partitions", 32),
-        num_quota_partitions: parse("num_quota_partitions", 32),
-    })
-}
-
 /// Cross-check the [`ReclaimGrant`] handed back by
 /// `issue_reclaim_grant` against the [`ReclaimExecutionArgs`] the
 /// consumer is about to dispatch. Catches the grant-for-A + args-for-B
@@ -2089,6 +1793,40 @@ mod sqlite_only_compile_surface_tests {
         #[allow(dead_code)]
         fn _pin<T>(_: std::marker::PhantomData<T>) -> std::marker::PhantomData<ClaimedTask> {
             std::marker::PhantomData
+        }
+    }
+
+    /// v0.12 PR-6 compile anchor — ungating `admin` + `snapshot`
+    /// modules at module level must not re-introduce ferriskey
+    /// symbols under `--no-default-features --features sqlite`.
+    /// Pins that [`FlowFabricAdminClient::new`] and a representative
+    /// snapshot forwarder are addressable without the
+    /// `valkey-default` feature.
+    #[test]
+    fn admin_and_snapshot_addressable_under_sqlite_only() {
+        use crate::admin::FlowFabricAdminClient;
+        use crate::SdkError;
+        use ff_core::contracts::ExecutionSnapshot;
+        use ff_core::types::ExecutionId;
+
+        // `FlowFabricAdminClient::new` is `fn(impl Into<String>)` —
+        // can't fn-pointer-coerce directly. A no-op call with a
+        // concrete `&str` pins the method addressably under the
+        // sqlite-only feature set (the error return-type is the
+        // same `SdkError` the rest of the module returns).
+        #[allow(dead_code)]
+        fn _pin_admin_new() -> Result<FlowFabricAdminClient, SdkError> {
+            FlowFabricAdminClient::new("http://anchor")
+        }
+
+        // Snapshot method is `async`, so coerce via the same
+        // trait-bound pattern as `read_execution_context` above.
+        #[allow(dead_code)]
+        async fn _pin_describe(
+            w: &FlowFabricWorker,
+            id: &ExecutionId,
+        ) -> Result<Option<ExecutionSnapshot>, SdkError> {
+            w.describe_execution(id).await
         }
     }
 }
