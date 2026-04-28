@@ -1063,6 +1063,7 @@ async fn drive_worker(
         lease_ttl_ms: LEASE_TTL_MS,
         claim_poll_interval_ms: POLL_INTERVAL_MS,
         max_concurrent_tasks: 1,
+    partition_config: None,
     };
     let worker = FlowFabricWorker::connect(config).await?;
 

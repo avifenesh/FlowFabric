@@ -790,6 +790,7 @@ async fn drive_worker(
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 50,
         max_concurrent_tasks: 1,
+    partition_config: None,
     };
     let worker = FlowFabricWorker::connect(config).await?;
 

@@ -16,8 +16,16 @@
 
 use std::time::Duration;
 
-use ff_core::contracts::{RotateWaitpointHmacSecretArgs, RotateWaitpointHmacSecretOutcome};
+use ff_core::contracts::RotateWaitpointHmacSecretOutcome;
+// v0.12 PR-6: these imports only power the Valkey-typed
+// `rotate_waitpoint_hmac_secret_all_partitions` helper at the bottom
+// of the module; gated so the ungated module builds clean under
+// `--no-default-features --features sqlite`.
+#[cfg(feature = "valkey-default")]
+use ff_core::contracts::RotateWaitpointHmacSecretArgs;
+#[cfg(feature = "valkey-default")]
 use ff_core::keys::IndexKeys;
+#[cfg(feature = "valkey-default")]
 use ff_core::partition::{Partition, PartitionFamily};
 use serde::{Deserialize, Serialize};
 
@@ -764,6 +772,14 @@ pub struct PartitionRotationOutcome {
 ///     }
 /// }
 /// ```
+// v0.12 PR-6: the `admin` module is ungated at module level so
+// consumers under `--no-default-features --features sqlite` can reach
+// the HTTP admin client surface. This helper is the one remaining
+// Valkey-typed item in the module (takes a `&ferriskey::Client` and
+// fans out `ff_rotate_waitpoint_hmac_secret` FCALLs), so it stays
+// `valkey-default`-gated. See `lib.rs` PR-6 comment for the Option 1
+// / Option 2 decision.
+#[cfg(feature = "valkey-default")]
 pub async fn rotate_waitpoint_hmac_secret_all_partitions(
     client: &ferriskey::Client,
     num_partitions: u16,

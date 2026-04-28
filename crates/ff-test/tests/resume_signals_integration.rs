@@ -37,6 +37,7 @@ async fn build_worker(name_suffix: &str) -> ff_sdk::FlowFabricWorker {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 10,
+    partition_config: None,
     };
     ff_sdk::FlowFabricWorker::connect(cfg).await.unwrap()
 }

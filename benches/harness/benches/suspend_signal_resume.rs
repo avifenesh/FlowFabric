@@ -356,6 +356,7 @@ async fn measure_one_inner(
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: TIGHT_LOOP_POLL_MS,
         max_concurrent_tasks: 1,
+    partition_config: None,
     };
     let worker = FlowFabricWorker::connect(config).await?;
 
