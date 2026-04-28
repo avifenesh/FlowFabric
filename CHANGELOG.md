@@ -5,6 +5,56 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `ff-backend-postgres`: `ff_attempt.outcome` is now cleared on the
+  exec-cancel paths that previously left it stale — `cancel_flow`
+  member loop (`src/flow.rs`) and `exec_core::cancel` (the
+  `Handle`-level cancel). The existing `operator::cancel_execution`
+  path already cleared outcome on live leases; this extends the
+  invariant to the remaining cancel sites so a post-cancel
+  `read_execution_info` never surfaces a stale `retry` /
+  `interrupted` terminal-outcome on a cancelled row.
+  `ff-backend-sqlite` gets the parallel fix on the `cancel_flow`
+  member loop. Closes #355.
+- `ff-backend-postgres`, `ff-backend-sqlite`: added
+  `ff_exec_core.started_at_ms` (migration 0016) as a set-once
+  first-claim timestamp column. Populated by the claim + resume-claim
+  paths via `COALESCE(started_at_ms, now)` so reclaim + retry never
+  overwrite the original value. The Wave-9 Spine-B
+  `read_execution_info` read path drops the LATERAL join (Postgres) /
+  correlated subquery (SQLite) on `ff_attempt.started_at_ms` and reads
+  the column directly. Migration 0016 backfills existing rows from
+  `MIN(ff_attempt.started_at_ms)` per execution. Migration number
+  0015 is reserved for RFC-024 (claim-grant table); if the RFC-024
+  impl PR lands first the two renumber independently — 0016 stays
+  additive and safe. Closes #356.
+- `ff-backend-postgres`: first-claim path now writes
+  `public_state = 'running'` on `ff_exec_core` for parity with the
+  resume-claim path (`src/suspend_ops.rs`) and the SQLite first-claim
+  write landed in PR #392. Prior to this fix the column remained at its
+  create-time `'waiting'` literal after a PG first-claim, so Spine-B
+  `read_execution_info` readers (and any direct `SELECT public_state`)
+  saw the wrong column state until the read-boundary
+  `normalise_public_state` adapter masked it. Regression coverage in
+  `crates/ff-backend-postgres/tests/wave9_followups.rs`
+  (`first_claim_writes_public_state_running`).
+
+### Documentation
+
+- `rfcs/RFC-020-postgres-wave-9.md` §4.1 (Revision 8): corrected the
+  earlier "maps directly" claim for `ff_exec_core.lifecycle_phase` +
+  sibling state columns. Postgres legitimately encodes
+  `(phase × eligibility × terminal-outcome)` in a richer private
+  alphabet than the canonical `ff_core::state` enums (`cancelled`,
+  `released`, `pending_claim`, bare `running`, `blocked` are valid
+  column literals but not enum members). The `normalise_*` shim in
+  `crates/ff-backend-postgres/src/exec_core.rs` is now documented as
+  the read-boundary adapter (Option B per owner decision on #354),
+  not a transient inconsistency; a corresponding module-level doc on
+  `exec_core.rs` spells out the invariant for new read + write paths.
+  Closes #354.
+
 ### Added
 
 - **`crates/ff-backend-sqlite` — Phase 3.5 scanner supervisor (N=1) +

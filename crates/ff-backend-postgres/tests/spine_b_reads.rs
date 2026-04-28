@@ -99,13 +99,55 @@ async fn insert_exec_core(
     result_payload: Option<Vec<u8>>,
     raw_fields: serde_json::Value,
 ) {
+    insert_exec_core_with_started(
+        pool,
+        part,
+        exec_uuid,
+        lane_id,
+        lifecycle_phase,
+        ownership_state,
+        eligibility_state,
+        public_state,
+        attempt_state,
+        attempt_index,
+        now_ms,
+        terminal_at_ms,
+        result_payload,
+        raw_fields,
+        None,
+    )
+    .await;
+}
+
+/// Variant that seeds `ff_exec_core.started_at_ms` (#356). The existing
+/// `insert_exec_core` wraps this with `started_at_ms = None` for
+/// pre-0016 test semantics.
+#[allow(clippy::too_many_arguments)]
+async fn insert_exec_core_with_started(
+    pool: &PgPool,
+    part: i16,
+    exec_uuid: Uuid,
+    lane_id: &str,
+    lifecycle_phase: &str,
+    ownership_state: &str,
+    eligibility_state: &str,
+    public_state: &str,
+    attempt_state: &str,
+    attempt_index: i32,
+    now_ms: i64,
+    terminal_at_ms: Option<i64>,
+    result_payload: Option<Vec<u8>>,
+    raw_fields: serde_json::Value,
+    started_at_ms: Option<i64>,
+) {
     sqlx::query(
         "INSERT INTO ff_exec_core \
            (partition_key, execution_id, lane_id, attempt_index, \
             lifecycle_phase, ownership_state, eligibility_state, \
             public_state, attempt_state, \
-            priority, created_at_ms, terminal_at_ms, result, raw_fields) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13)",
+            priority, created_at_ms, terminal_at_ms, started_at_ms, \
+            result, raw_fields) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, $14)",
     )
     .bind(part)
     .bind(exec_uuid)
@@ -118,6 +160,7 @@ async fn insert_exec_core(
     .bind(attempt_state)
     .bind(now_ms)
     .bind(terminal_at_ms)
+    .bind(started_at_ms)
     .bind(result_payload)
     .bind(raw_fields)
     .execute(pool)
@@ -210,19 +253,19 @@ async fn read_execution_info_missing_returns_none() {
 #[tokio::test]
 #[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
 async fn read_execution_info_lateral_joins_both_attempts() {
-    // Two LATERAL joins in `read_execution_info`:
-    //   * current-attempt (attempt_index = ec.attempt_index) drives
-    //     `outcome` → `TerminalOutcome`;
-    //   * first-attempt (earliest started_at_ms) drives
-    //     `ExecutionInfo.started_at` (first-claim timestamp, preserved
-    //     across retries — Valkey-parity contract).
+    // Since migration 0016 (#356) `started_at` is read directly from
+    // `ff_exec_core.started_at_ms`; the `outcome` LATERAL still pins
+    // to the current attempt.
     //
-    // Seed two attempts:
+    // Seed two attempts + set `ff_exec_core.started_at_ms = first_start`
+    // (the value the set-once claim-path would have written at
+    // first-claim):
     //   * attempt 0 started at `first_start` (old first-claim);
     //   * attempt 1 started at `later_start` (current attempt);
     // then bump `ec.attempt_index = 1`.
     // The read must surface
-    //   * `started_at = first_start` (NOT later_start)
+    //   * `started_at = first_start` (NOT later_start — the set-once
+    //     semantics mean a retry attempt never overwrites the column)
     //   * `outcome`-derived state from attempt_index=1 (NULL → None)
     let Some(fx) = seed_backend().await else {
         return;
@@ -230,7 +273,7 @@ async fn read_execution_info_lateral_joins_both_attempts() {
     let now = TimestampMs::now().0;
     let first_start = now - 10_000;
     let later_start = now - 100;
-    insert_exec_core(
+    insert_exec_core_with_started(
         &fx.pool,
         fx.part,
         fx.exec_uuid,
@@ -249,9 +292,10 @@ async fn read_execution_info_lateral_joins_both_attempts() {
             "execution_kind": "task",
             "blocking_detail": "",
         }),
+        Some(first_start),
     )
     .await;
-    // Attempt 0: first-claim row; drives `started_at`.
+    // Attempt 0: first-claim row.
     insert_attempt(&fx.pool, fx.part, fx.exec_uuid, 0, Some("failed"), Some(first_start))
         .await;
     // Attempt 1: current attempt; drives `outcome` (no terminal outcome yet).
