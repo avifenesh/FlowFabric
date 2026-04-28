@@ -146,6 +146,11 @@ async fn last_outbox_event(
 ///   - `"file:<name>?...mode=memory..."` (the §4.6-recommended named
 ///     form, e.g. `file:ff-test-<uuid>?mode=memory&cache=shared`)
 ///
+/// The `mode=memory` check requires the query-parameter delimiter
+/// (`?` or `&`) so filesystem paths whose filename happens to contain
+/// the substring (e.g. `file:my_mode=memory_db.sqlite`) are not
+/// misclassified as in-memory.
+///
 /// A #372 miss on the third form caused `is_memory = false` for the
 /// §4.6 test-isolation URIs: WAL mode was applied inappropriately
 /// and no sentinel connection was held, so pool-idle cycles dropped
@@ -153,7 +158,8 @@ async fn last_outbox_event(
 fn is_memory_uri(path: &str) -> bool {
     path == ":memory:"
         || path.starts_with("file::memory:")
-        || (path.starts_with("file:") && path.contains("mode=memory"))
+        || (path.starts_with("file:")
+            && (path.contains("?mode=memory") || path.contains("&mode=memory")))
 }
 
 /// Unix-millis wall clock. Matches the PG reference shape
@@ -3114,5 +3120,11 @@ mod tests {
         assert!(!is_memory_uri("./ff.sqlite"));
         assert!(!is_memory_uri("file:/tmp/ff.sqlite"));
         assert!(!is_memory_uri("file:ff-test?cache=shared"));
+        // Filename happens to contain the substring `mode=memory`
+        // but it is not a query parameter — MUST NOT match.
+        assert!(!is_memory_uri("file:my_mode=memory_db.sqlite"));
+        // Query-parameter form with `&` delimiter (mode is not the
+        // first parameter) — MUST match.
+        assert!(is_memory_uri("file:ff-test?cache=shared&mode=memory"));
     }
 }

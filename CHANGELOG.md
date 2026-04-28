@@ -280,8 +280,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **ff-backend-sqlite: claim path writes `public_state = 'running'` to
   `ff_exec_core`.** Matches the Postgres parity write at
   `ff-backend-postgres/src/suspend_ops.rs:958-960`. Before the fix the
-  column stayed at its create-time `'pending'` literal on claimed
-  executions; the Spine-B read normaliser inferred the correct
+  column stayed at its create-time `'waiting'` literal on claimed
+  executions (`'pending'` is the sibling `attempt_state` literal, not
+  `public_state`); the Spine-B read normaliser inferred the correct
   `PublicState::Active` from lifecycle + ownership so downstream
   consumers were unaffected, but direct SQL reads against
   `ff_exec_core.public_state` observed the wrong state.
