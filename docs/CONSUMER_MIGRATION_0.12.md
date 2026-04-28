@@ -416,6 +416,69 @@ methods are gated on ff-core's `streaming` feature, which the
 [`claim_via_server`]: https://docs.rs/ff-sdk/latest/ff_sdk/struct.FlowFabricWorker.html#method.claim_via_server
 [`Scheduler::claim_for_worker`]: https://docs.rs/ff-scheduler
 
+## Known limitations
+
+RFC-023 + RFC-024 + the agnostic-SDK work in v0.12 expand the
+backend-agnostic surface significantly, but a handful of paths remain
+Valkey-first. None block the headline v0.12 consumer flows; all are
+scoped for v0.13 RFC follow-up. Document these so consumers building
+against PG / SQLite aren't surprised at runtime. The
+`claim_from_grant` / `claim_via_server` runtime-`Unavailable` gap on
+PG/SQLite is covered in §8 above; the items below round out the
+surface.
+
+### Scanner-bypass primitives — Valkey only
+
+`EngineBackend::scan_eligible_executions`, `issue_claim_grant`, and
+`block_route` (the agnostic-SDK PR-5 scanner primitives) ship as
+Valkey-only in v0.12; PG and SQLite inherit the `Unavailable` trait
+default. These methods exist to let benches / specialized tooling
+bypass the scheduler; they are gated behind the bench-only
+`direct-valkey-claim` feature on the SDK caller side and are **not**
+a general consumer surface.
+
+PG / SQLite deployments use the scheduler-routed
+`FlowFabricWorker::claim()` path, which is fully supported and
+handles eligibility, capability match, and admission server-side.
+No consumer action needed.
+
+### `read_current_attempt_index` asymmetry
+
+All three backends implement `EngineBackend::read_current_attempt_index`
+in v0.12, but the missing-row behaviour differs by design:
+
+- **Valkey** — returns `AttemptIndex(0)` when `exec_core` is present
+  but the `current_attempt_index` HGET field is absent or empty
+  (matches pre-PR-3 inline SDK semantic). The downstream
+  `claim_resumed_execution` FCALL surfaces the proper
+  `NotAResumedExecution` / `ExecutionNotLeaseable` reject.
+- **Postgres / SQLite** — column is `NOT NULL DEFAULT 0` so a
+  pre-claim row naturally reads `0`, but a **missing** row surfaces
+  as `EngineError::Validation { kind: InvalidInput }`.
+
+The SDK only invokes this method on the resume-grant path after
+`claim_from_resume_grant` admission has already resolved the
+execution, so `exec_core` is guaranteed to exist and the asymmetry is
+not consumer-observable under normal operation. Documented here so
+downstream tooling that calls the trait method directly isn't
+surprised. See rustdoc on
+`EngineBackend::read_current_attempt_index` for the canonical
+per-backend shape.
+
+### v0.12 vs v0.11 bench baseline pending
+
+Published v0.11 → v0.12 bench deltas (Valkey claim/complete p50/p99,
+PG rev-7 cancel p99, SQLite baseline) are **not** captured in-repo at
+tag time. GitHub Actions runners produce numbers too noisy to baseline
+against (shared tenants, variable CPU steal, I/O contention), so they
+are not used as the source of truth for release-to-release perf
+comparisons.
+
+Fresh baselines run on dedicated hosts post-tag will land in a
+follow-up PR against the bench harness README. If you need pre-tag
+perf signal for a PG / Valkey deployment decision, open an issue on
+the repo — we can point at the most recent dedicated-host run.
+
 ## Non-changes
 
 - No Rust API break on Valkey or Postgres hot paths **outside
