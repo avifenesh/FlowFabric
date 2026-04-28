@@ -38,12 +38,15 @@ use ff_core::contracts::decode::{
     build_edge_snapshot, build_execution_snapshot, build_flow_snapshot,
 };
 use ff_core::contracts::{
-    AdditionalWaitpointBinding, CancelFlowArgs, CancelFlowResult, ClaimExecutionArgs,
-    ClaimExecutionResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CompositeBody,
+    AdditionalWaitpointBinding, BlockRouteArgs, BlockRouteOutcome, CancelFlowArgs,
+    CancelFlowResult, ClaimExecutionArgs, ClaimExecutionResult, ClaimResumedExecutionArgs,
+    ClaimResumedExecutionResult, CompositeBody,
     CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
-    ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, IssueReclaimGrantArgs,
+    ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary,
+    IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
     ListSuspendedPage, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
+    ScanEligibleArgs,
     ReportUsageResult, ResumeCondition, ResumePolicy, ResumeTarget,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
     RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretArgs, SeedOutcome,
@@ -4415,6 +4418,182 @@ async fn claim_resumed_execution_impl(
     Ok(partial.complete(execution_id))
 }
 
+/// Scan a lane's eligible ZSET on one partition via `ZRANGEBYSCORE`.
+/// Lifted verbatim from the pre-v0.12-PR-5 SDK inline helper
+/// (`FlowFabricWorker::claim_next` at `ff-sdk/src/worker.rs:~624-637`).
+/// Keep the command shape byte-for-byte identical so bench traces
+/// match pre-PR.
+async fn scan_eligible_executions_impl(
+    client: &ferriskey::Client,
+    args: ScanEligibleArgs,
+) -> Result<Vec<ExecutionId>, EngineError> {
+    let idx = IndexKeys::new(&args.partition);
+    let eligible_key = idx.lane_eligible(&args.lane_id);
+    let limit = args.limit.to_string();
+
+    // Score format: -(priority * 1_000_000_000_000) + created_at_ms.
+    // `ZRANGEBYSCORE -inf +inf LIMIT 0 <limit>` yields lowest-score-
+    // first == highest-priority-first.
+    let raw: ferriskey::Value = client
+        .cmd("ZRANGEBYSCORE")
+        .arg(&eligible_key)
+        .arg("-inf")
+        .arg("+inf")
+        .arg("LIMIT")
+        .arg("0")
+        .arg(&limit)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    let strings: Vec<String> = match raw {
+        ferriskey::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    Ok(ferriskey::Value::BulkString(b)) => {
+                        out.push(String::from_utf8_lossy(&b).into_owned());
+                    }
+                    Ok(ferriskey::Value::SimpleString(s)) => out.push(s),
+                    _ => {}
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    };
+
+    let mut ids = Vec::with_capacity(strings.len());
+    for s in strings {
+        let id = ExecutionId::parse(&s).map_err(|e| {
+            transport_script(ScriptError::Parse {
+                fcall: "claim_execution_from_eligible_set".into(),
+                execution_id: None,
+                message: format!("bad execution_id in eligible set: {e}"),
+            })
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Issue a claim grant via `ff_issue_claim_grant`. Lifted verbatim
+/// from the pre-v0.12-PR-5 SDK inline helper
+/// (`FlowFabricWorker::issue_claim_grant` at
+/// `ff-sdk/src/worker.rs:~763-804`). Wire (KEYS/ARGV) shape is
+/// byte-for-byte identical so bench traces match pre-PR.
+async fn issue_claim_grant_impl(
+    client: &ferriskey::Client,
+    args: IssueClaimGrantArgs,
+) -> Result<IssueClaimGrantOutcome, EngineError> {
+    let ctx = ExecKeyContext::new(&args.partition, &args.execution_id);
+    let idx = IndexKeys::new(&args.partition);
+
+    // KEYS (3): exec_core, claim_grant_key, eligible_zset
+    let keys_owned: [String; 3] = [
+        ctx.core(),
+        ctx.claim_grant(),
+        idx.lane_eligible(&args.lane_id),
+    ];
+    let keys_ref: [&str; 3] = [
+        keys_owned[0].as_str(),
+        keys_owned[1].as_str(),
+        keys_owned[2].as_str(),
+    ];
+
+    // BTreeSet iterates in sorted order → stable CSV for Lua match.
+    let caps_csv: String = args
+        .worker_capabilities
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // ARGV (9): eid, worker_id, worker_instance_id, lane_id,
+    //           capability_hash, grant_ttl_ms, route_snapshot_json,
+    //           admission_summary, worker_capabilities_csv (sorted)
+    let eid_s = args.execution_id.to_string();
+    let worker_id_s = args.worker_id.to_string();
+    let worker_instance_s = args.worker_instance_id.to_string();
+    let lane_s = args.lane_id.to_string();
+    let grant_ttl_s = args.grant_ttl_ms.to_string();
+    let cap_hash = args.capability_hash.clone().unwrap_or_default();
+    let route_snap = args.route_snapshot_json.clone().unwrap_or_default();
+    let admission_sum = args.admission_summary.clone().unwrap_or_default();
+    let argv: [&str; 9] = [
+        &eid_s,
+        &worker_id_s,
+        &worker_instance_s,
+        &lane_s,
+        &cap_hash,
+        &grant_ttl_s,
+        &route_snap,
+        &admission_sum,
+        &caps_csv,
+    ];
+
+    let raw: ferriskey::Value = client
+        .fcall("ff_issue_claim_grant", &keys_ref, &argv)
+        .await
+        .map_err(transport_fk)?;
+
+    // Parse grant result: {1, "OK", ...} (same shape the SDK
+    // inline helper parsed via `parse_success_result`).
+    let parsed = ff_script::result::FcallResult::parse(&raw).map_err(transport_script)?;
+    let _ = parsed.into_success().map_err(transport_script)?;
+    Ok(IssueClaimGrantOutcome::Granted {
+        execution_id: args.execution_id,
+    })
+}
+
+/// Block a route via `ff_block_execution_for_admission`. Lifted
+/// verbatim from the pre-v0.12-PR-5 SDK inline helper
+/// (`FlowFabricWorker::block_route` at
+/// `ff-sdk/src/worker.rs:~818-866`). Wire (KEYS/ARGV) shape is
+/// byte-for-byte identical so bench traces match pre-PR.
+async fn block_route_impl(
+    client: &ferriskey::Client,
+    args: BlockRouteArgs,
+) -> Result<BlockRouteOutcome, EngineError> {
+    let ctx = ExecKeyContext::new(&args.partition, &args.execution_id);
+    let idx = IndexKeys::new(&args.partition);
+
+    let core_key = ctx.core();
+    let eligible_key = idx.lane_eligible(&args.lane_id);
+    let blocked_key = idx.lane_blocked_route(&args.lane_id);
+    let eid_s = args.execution_id.to_string();
+    let now_ms = args.now.0.to_string();
+
+    let keys: [&str; 3] = [&core_key, &eligible_key, &blocked_key];
+    let argv: [&str; 4] = [
+        &eid_s,
+        &args.reason_code,
+        &args.reason_detail,
+        &now_ms,
+    ];
+
+    let raw: ferriskey::Value = client
+        .fcall("ff_block_execution_for_admission", &keys, &argv)
+        .await
+        .map_err(transport_fk)?;
+
+    // Parse the Lua response so a logical reject (e.g. execution went
+    // terminal mid-flight) surfaces as `LuaRejected` rather than
+    // silently succeeding. Mirrors the SDK-side
+    // `parse_success_result(&v, "ff_block_execution_for_admission")`
+    // check with the non-transport branch promoted into the outcome
+    // enum.
+    let parsed = ff_script::result::FcallResult::parse(&raw).map_err(transport_script)?;
+    match parsed.into_success() {
+        Ok(_) => Ok(BlockRouteOutcome::Blocked {
+            execution_id: args.execution_id,
+        }),
+        Err(e) => Ok(BlockRouteOutcome::LuaRejected {
+            message: e.to_string(),
+        }),
+    }
+}
+
 /// Grant-consumer path for [`EngineBackend::claim_execution`].
 ///
 /// Fires exactly one `ff_claim_execution` FCALL against the
@@ -5059,6 +5238,48 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "claim_execution: FCALL ff_claim_execution",
+                )
+            })
+    }
+
+    async fn scan_eligible_executions(
+        &self,
+        args: ScanEligibleArgs,
+    ) -> Result<Vec<ExecutionId>, EngineError> {
+        scan_eligible_executions_impl(&self.client, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "scan_eligible_executions: ZRANGEBYSCORE eligible_zset",
+                )
+            })
+    }
+
+    async fn issue_claim_grant(
+        &self,
+        args: IssueClaimGrantArgs,
+    ) -> Result<IssueClaimGrantOutcome, EngineError> {
+        issue_claim_grant_impl(&self.client, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "issue_claim_grant: FCALL ff_issue_claim_grant",
+                )
+            })
+    }
+
+    async fn block_route(
+        &self,
+        args: BlockRouteArgs,
+    ) -> Result<BlockRouteOutcome, EngineError> {
+        block_route_impl(&self.client, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "block_route: FCALL ff_block_execution_for_admission",
                 )
             })
     }

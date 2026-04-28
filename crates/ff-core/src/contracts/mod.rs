@@ -59,23 +59,35 @@ pub enum CreateExecutionResult {
 
 // ─── issue_claim_grant ───
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Inputs to [`crate::engine_backend::EngineBackend::issue_claim_grant`]
+/// — the trait-level entry point v0.12 PR-5 lifted out of the SDK-side
+/// `FlowFabricWorker::claim_next` inline helper.
+///
+/// `#[non_exhaustive]` + `::new` per
+/// `feedback_non_exhaustive_needs_constructor`: future fields may be
+/// added in minor releases; consumers MUST construct via
+/// [`Self::new`] and mutate optional fields via the public setters
+/// (no `..Default::default()` since the struct is non-exhaustive).
+///
+/// Carries the execution's [`crate::partition::Partition`] so the
+/// Valkey backend can derive `exec_core` / `claim_grant` / the lane's
+/// `eligible_zset` KEYS without a second round-trip.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct IssueClaimGrantArgs {
     pub execution_id: ExecutionId,
     pub lane_id: LaneId,
     pub worker_id: WorkerId,
     pub worker_instance_id: WorkerInstanceId,
-    #[serde(default)]
+    /// Partition context for KEYS derivation. v0.12 PR-5.
+    pub partition: crate::partition::Partition,
     pub capability_hash: Option<String>,
-    #[serde(default)]
     pub route_snapshot_json: Option<String>,
-    #[serde(default)]
     pub admission_summary: Option<String>,
     /// Capabilities this worker advertises. Serialized as a sorted,
     /// comma-separated string to the Lua FCALL (see scheduling.lua
     /// ff_issue_claim_grant). An empty set matches only executions whose
     /// `required_capabilities` is also empty.
-    #[serde(default)]
     pub worker_capabilities: BTreeSet<String>,
     pub grant_ttl_ms: u64,
     /// Caller-side timestamp for bookkeeping. NOT passed to the Lua FCALL —
@@ -83,10 +95,160 @@ pub struct IssueClaimGrantArgs {
     pub now: TimestampMs,
 }
 
+impl IssueClaimGrantArgs {
+    /// Construct an `IssueClaimGrantArgs`. Added alongside
+    /// `#[non_exhaustive]` per `feedback_non_exhaustive_needs_constructor`
+    /// so the SDK worker (and any future caller) can build the args
+    /// without the struct literal becoming a cross-crate breaking
+    /// change on every minor release.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        lane_id: LaneId,
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        partition: crate::partition::Partition,
+        worker_capabilities: BTreeSet<String>,
+        grant_ttl_ms: u64,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            execution_id,
+            lane_id,
+            worker_id,
+            worker_instance_id,
+            partition,
+            capability_hash: None,
+            route_snapshot_json: None,
+            admission_summary: None,
+            worker_capabilities,
+            grant_ttl_ms,
+            now,
+        }
+    }
+}
+
+/// Typed outcome of [`crate::engine_backend::EngineBackend::issue_claim_grant`].
+///
+/// Single-variant today — the Valkey FCALL either writes the grant
+/// and returns `Granted`, or the Lua reject (capability mismatch,
+/// already-granted, etc.) surfaces as a typed [`crate::engine_error::EngineError`]
+/// on the outer `Result`. `#[non_exhaustive]` reserves room for
+/// future additive variants without a breaking match-arm churn on
+/// consumers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IssueClaimGrantOutcome {
+    /// Grant issued.
+    Granted { execution_id: ExecutionId },
+}
+
+/// Legacy name for `IssueClaimGrantOutcome` — retained for
+/// `ff-script`'s `FromFcallResult` plumbing. Prefer
+/// [`IssueClaimGrantOutcome`] in trait-level code.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueClaimGrantResult {
     /// Grant issued.
     Granted { execution_id: ExecutionId },
+}
+
+// ─── scan_eligible_executions + block_route (v0.12 PR-5) ───
+
+/// Inputs to [`crate::engine_backend::EngineBackend::scan_eligible_executions`].
+///
+/// Lifted from the SDK-side `ZRANGEBYSCORE` inline on the
+/// `claim_next` scanner (v0.12 PR-5). The backend reads the lane's
+/// eligible ZSET on the given partition and returns up to `limit`
+/// execution ids in priority order (Valkey: score = `-(priority *
+/// 1e12) + created_at_ms`, so `+inf`-bounded ZRANGEBYSCORE with
+/// `LIMIT 0 <limit>` yields highest-priority-first).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ScanEligibleArgs {
+    pub lane_id: LaneId,
+    pub partition: crate::partition::Partition,
+    /// Maximum number of execution ids to return. Backends MAY
+    /// return fewer when the partition has less work.
+    pub limit: u32,
+}
+
+impl ScanEligibleArgs {
+    /// Construct a `ScanEligibleArgs`. Added alongside
+    /// `#[non_exhaustive]` per
+    /// `feedback_non_exhaustive_needs_constructor`.
+    pub fn new(
+        lane_id: LaneId,
+        partition: crate::partition::Partition,
+        limit: u32,
+    ) -> Self {
+        Self {
+            lane_id,
+            partition,
+            limit,
+        }
+    }
+}
+
+/// Inputs to [`crate::engine_backend::EngineBackend::block_route`].
+///
+/// Lifted from the SDK-side `ff_block_execution_for_admission`
+/// inline helper on the `claim_next` scanner (v0.12 PR-5). Moves an
+/// execution from the lane's eligible ZSET into its blocked_route
+/// ZSET after a `CapabilityMismatch` reject — the engine's unblock
+/// scanner promotes blocked_route back to eligible once a worker
+/// with matching caps registers.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct BlockRouteArgs {
+    pub execution_id: ExecutionId,
+    pub lane_id: LaneId,
+    pub partition: crate::partition::Partition,
+    /// Free-form block reason code (e.g. `"waiting_for_capable_worker"`).
+    pub reason_code: String,
+    /// Human-readable reason detail for operator logs.
+    pub reason_detail: String,
+    pub now: TimestampMs,
+}
+
+impl BlockRouteArgs {
+    /// Construct a `BlockRouteArgs`.
+    pub fn new(
+        execution_id: ExecutionId,
+        lane_id: LaneId,
+        partition: crate::partition::Partition,
+        reason_code: String,
+        reason_detail: String,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            execution_id,
+            lane_id,
+            partition,
+            reason_code,
+            reason_detail,
+            now,
+        }
+    }
+}
+
+/// Typed outcome of [`crate::engine_backend::EngineBackend::block_route`].
+///
+/// `LuaRejected` captures the logical-reject case (e.g. the execution
+/// went terminal between pick and block — eligible ZSET is left
+/// unchanged and the caller should simply `continue` to the next
+/// partition). Transport faults surface on the outer `Result` as
+/// [`crate::engine_error::EngineError::Transport`]; callers that
+/// want the pre-PR-5 "best-effort, log-and-continue" semantic wrap
+/// the call in a `match` and swallow non-success variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockRouteOutcome {
+    /// Execution moved from eligible → blocked_route successfully.
+    Blocked { execution_id: ExecutionId },
+    /// Lua returned a non-success result (e.g. execution went
+    /// terminal between pick and block). `message` carries the Lua
+    /// reject code for operator visibility.
+    LuaRejected { message: String },
 }
 
 /// A claim grant issued by the scheduler for a specific execution.

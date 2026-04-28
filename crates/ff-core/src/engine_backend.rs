@@ -65,9 +65,11 @@ use crate::contracts::{
     CancelFlowArgs, ChangePriorityArgs, ChangePriorityResult, ClaimExecutionArgs,
     ClaimExecutionResult, ClaimForWorkerArgs, ClaimForWorkerOutcome, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult,
-    CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
-    CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
+    BlockRouteArgs, BlockRouteOutcome, CreateBudgetArgs, CreateBudgetResult,
+    CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
+    CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionInfo,
+    IssueClaimGrantArgs, IssueClaimGrantOutcome, ScanEligibleArgs,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
     ListPendingWaitpointsResult, ListSuspendedPage, ReplayExecutionArgs, ReplayExecutionResult,
     ReportUsageAdminArgs, ResetBudgetArgs, ResetBudgetResult, RevokeLeaseArgs, RevokeLeaseResult,
@@ -689,6 +691,103 @@ pub trait EngineBackend: Send + Sync + 'static {
         Err(EngineError::Unavailable {
             op: "claim_resumed_execution",
         })
+    }
+
+    /// Scan a lane's eligible ZSET on one partition for
+    /// highest-priority executions awaiting a worker (v0.12 PR-5).
+    ///
+    /// Lifted from the SDK-side `ZRANGEBYSCORE` inline on
+    /// `FlowFabricWorker::claim_next` — the scheduler-bypass scanner
+    /// gated behind `direct-valkey-claim`. The trait method itself is
+    /// backend-agnostic; consumers that drive the scanner loop
+    /// (bench harnesses, single-tenant dev) compose it with
+    /// [`Self::issue_claim_grant`] + [`Self::claim_execution`] to
+    /// replicate the pre-PR-5 `claim_next` body.
+    ///
+    /// # Backend coverage
+    ///
+    /// * **Valkey** — `ZRANGEBYSCORE eligible_zset -inf +inf LIMIT 0 <limit>`
+    ///   on the lane's partition-scoped eligible key. Single
+    ///   command; no script round-trip. `#[tracing::instrument]` name
+    ///   matches the pre-PR inline shape so trace continuity holds.
+    /// * **Postgres / SQLite** — use the `Err(Unavailable)` default.
+    ///   PG/SQLite consumers drive work through the scheduler-routed
+    ///   [`Self::claim_for_worker`] path instead of the scanner
+    ///   primitives exposed here; lifting the scheduler itself onto
+    ///   the trait is RFC-024 follow-up scope. See
+    ///   `project_claim_from_grant_pg_sqlite_gap.md` for motivation.
+    ///
+    /// Default impl returns [`EngineError::Unavailable`] so the trait
+    /// addition is non-breaking for out-of-tree backends. Same
+    /// precedent as [`Self::claim_execution`] landing in v0.12 PR-4.
+    #[cfg(feature = "core")]
+    async fn scan_eligible_executions(
+        &self,
+        _args: ScanEligibleArgs,
+    ) -> Result<Vec<ExecutionId>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "scan_eligible_executions",
+        })
+    }
+
+    /// Issue a claim grant — the scheduler's admission write — for a
+    /// single execution on a single lane (v0.12 PR-5).
+    ///
+    /// Lifted from the SDK-side `ff_issue_claim_grant` inline helper
+    /// on `FlowFabricWorker::claim_next`. The backend atomically
+    /// writes the grant hash, appends to the per-worker grant index,
+    /// and removes the execution from the lane's eligible ZSET.
+    ///
+    /// Typed rejects surface via [`EngineError::Validation`]:
+    /// `CapabilityMismatch` when the worker's capabilities do not
+    /// cover the execution's `required_capabilities`, `InvalidInput`
+    /// for malformed args. Transport faults surface via
+    /// [`EngineError::Transport`].
+    ///
+    /// # Backend coverage
+    ///
+    /// * **Valkey** — one `ff_issue_claim_grant` FCALL. Keeps pre-PR
+    ///   instrumentation shape.
+    /// * **Postgres / SQLite** — `Err(Unavailable)` default; use
+    ///   [`Self::claim_for_worker`] instead. See
+    ///   [`Self::scan_eligible_executions`] for the cross-link
+    ///   rationale.
+    #[cfg(feature = "core")]
+    async fn issue_claim_grant(
+        &self,
+        _args: IssueClaimGrantArgs,
+    ) -> Result<IssueClaimGrantOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "issue_claim_grant",
+        })
+    }
+
+    /// Move an execution from a lane's eligible ZSET into its
+    /// blocked_route ZSET (v0.12 PR-5).
+    ///
+    /// Lifted from the SDK-side `ff_block_execution_for_admission`
+    /// inline helper on `FlowFabricWorker::claim_next`. Called after
+    /// a [`Self::issue_claim_grant`] `CapabilityMismatch` reject —
+    /// without a block step, the inline scanner would re-pick the
+    /// same top-of-ZSET every tick (parity with
+    /// `ff-scheduler::Scheduler::block_candidate`).
+    ///
+    /// The engine's unblock scanner periodically promotes
+    /// blocked_route back to eligible once a worker with matching
+    /// caps registers.
+    ///
+    /// # Backend coverage
+    ///
+    /// * **Valkey** — one `ff_block_execution_for_admission` FCALL.
+    /// * **Postgres / SQLite** — `Err(Unavailable)` default; the
+    ///   scheduler-routed [`Self::claim_for_worker`] path handles
+    ///   admission rejects server-side.
+    #[cfg(feature = "core")]
+    async fn block_route(
+        &self,
+        _args: BlockRouteArgs,
+    ) -> Result<BlockRouteOutcome, EngineError> {
+        Err(EngineError::Unavailable { op: "block_route" })
     }
 
     /// Consume a scheduler-issued claim grant to mint a fresh attempt.
