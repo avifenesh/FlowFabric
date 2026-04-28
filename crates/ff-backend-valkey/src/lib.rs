@@ -4760,7 +4760,7 @@ impl EngineBackend for ValkeyBackend {
             .map_err(|e| {
                 ff_core::engine_error::backend_context(
                     e,
-                    "read_execution_context: GET payload + HGET execution_kind + HGETALL tags",
+                    "read_execution_context: GET payload + HGETALL core + HGETALL tags",
                 )
             })
     }
