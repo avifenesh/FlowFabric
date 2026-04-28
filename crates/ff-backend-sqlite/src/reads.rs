@@ -20,7 +20,9 @@
 //! execute directly on the pool. Mirrors PG's READ COMMITTED posture
 //! for these three methods (§4.1).
 
-use ff_core::contracts::ExecutionInfo;
+use std::collections::HashMap;
+
+use ff_core::contracts::{ExecutionContext, ExecutionInfo};
 use ff_core::engine_error::{EngineError, ValidationKind};
 use ff_core::state::{
     AttemptState, BlockingReason, EligibilityState, LifecyclePhase, OwnershipState, PublicState,
@@ -320,4 +322,74 @@ pub(crate) async fn get_execution_result_impl(
         None => Ok(None),
         Some((payload,)) => Ok(payload),
     }
+}
+
+// ─── read_execution_context (v0.12 agnostic-SDK prep, PR-1) ────────
+
+/// Point-read of `(input_payload, execution_kind, tags)` from
+/// `ff_exec_core`. Mirrors the Postgres impl
+/// (`ff-backend-postgres::exec_core::read_execution_context_impl`):
+/// payload is the `payload` BLOB column; `execution_kind` + `tags`
+/// live inside the `raw_fields` JSON text column.
+///
+/// Returns [`EngineError::Validation { kind: InvalidInput, .. }`](EngineError::Validation)
+/// when the execution does not exist — the SDK worker only calls this
+/// post-claim, so a missing row is an invariant violation rather than
+/// a routine `Ok(None)`.
+pub(crate) async fn read_execution_context_impl(
+    pool: &SqlitePool,
+    id: &ExecutionId,
+) -> Result<ExecutionContext, EngineError> {
+    let (part, exec_uuid) = split_exec_id(id)?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT payload, raw_fields
+          FROM ff_exec_core
+         WHERE partition_key = ?1 AND execution_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("read_execution_context: execution not found: {id}"),
+        });
+    };
+
+    let payload: Option<Vec<u8>> = row.try_get("payload").map_err(map_sqlx_error)?;
+    let raw_fields_str: String = row.try_get("raw_fields").map_err(map_sqlx_error)?;
+    let raw_fields: JsonValue =
+        serde_json::from_str(&raw_fields_str).map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!("exec_core: raw_fields not valid JSON: {e}"),
+        })?;
+
+    let input_payload = payload.unwrap_or_default();
+
+    let (execution_kind, tags) = match &raw_fields {
+        JsonValue::Object(map) => {
+            let kind = map
+                .get("execution_kind")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+                .unwrap_or_default();
+            let tags: HashMap<String, String> = match map.get("tags") {
+                Some(JsonValue::Object(tag_map)) => tag_map
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                    .collect(),
+                _ => HashMap::new(),
+            };
+            (kind, tags)
+        }
+        _ => (String::new(), HashMap::new()),
+    };
+
+    Ok(ExecutionContext::new(input_payload, execution_kind, tags))
 }
