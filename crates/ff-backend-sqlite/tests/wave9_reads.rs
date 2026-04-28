@@ -199,10 +199,10 @@ async fn read_execution_info_happy_path_post_claim() {
     assert_eq!(info.execution_id, exec_id);
     assert_eq!(info.namespace, "default");
     assert_eq!(info.execution_kind, "op");
-    // Note: SQLite's claim path does not write public_state today
-    // (parity gap with PG); post-claim row retains the INSERT literal
-    // 'waiting' until a future Phase flips it.
-    assert_eq!(info.public_state, PublicState::Waiting);
+    // SQLite's claim path writes `public_state = 'running'` (the
+    // Postgres-parity literal from `suspend_ops.rs:958-960`), which
+    // the Spine-B normaliser maps to `PublicState::Active`.
+    assert_eq!(info.public_state, PublicState::Active);
     assert_eq!(info.state_vector.lifecycle_phase, LifecyclePhase::Active);
     assert_eq!(
         info.state_vector.terminal_outcome,
