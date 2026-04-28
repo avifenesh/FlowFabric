@@ -23,7 +23,7 @@ observability = ["ff-observability/enabled"]
 postgres = ["dep:ff-backend-postgres", "dep:sqlx", "dep:uuid"]
 
 [dependencies]
-ff-core = { workspace = true }
+ff-core = { version = "0.11.0", path = "../ff-core", default-features = false, features = ["core"] }
 ff-observability = { workspace = true }
 ferriskey = { workspace = true }
 futures = { workspace = true }
