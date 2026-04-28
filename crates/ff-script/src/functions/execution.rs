@@ -822,6 +822,9 @@ mod partial_tests {
         let full = partial.complete(eid.clone());
         match full {
             ClaimExecutionResult::Claimed(c) => assert_eq!(c.execution_id, eid),
+            // `#[non_exhaustive]` — v0.12 PR-4 sealed the enum for
+            // forward-compat. Single-variant today.
+            _ => unreachable!("ClaimExecutionResult has only `Claimed`"),
         }
     }
 

@@ -62,8 +62,9 @@ use crate::contracts::{
 use crate::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
     ApplyDependencyToChildResult, BudgetStatus, CancelExecutionArgs, CancelExecutionResult,
-    CancelFlowArgs, ChangePriorityArgs, ChangePriorityResult, ClaimForWorkerArgs,
-    ClaimForWorkerOutcome, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
+    CancelFlowArgs, ChangePriorityArgs, ChangePriorityResult, ClaimExecutionArgs,
+    ClaimExecutionResult, ClaimForWorkerArgs, ClaimForWorkerOutcome, ClaimResumedExecutionArgs,
+    ClaimResumedExecutionResult,
     CreateBudgetArgs, CreateBudgetResult, CreateExecutionArgs, CreateExecutionResult,
     CreateFlowArgs, CreateFlowResult, CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
     DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionInfo,
@@ -687,6 +688,48 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<ClaimResumedExecutionResult, EngineError> {
         Err(EngineError::Unavailable {
             op: "claim_resumed_execution",
+        })
+    }
+
+    /// Consume a scheduler-issued claim grant to mint a fresh attempt.
+    ///
+    /// The SDK's grant-consumer path — paired with
+    /// [`FlowFabricWorker::claim_from_grant`](../../ff_sdk/struct.FlowFabricWorker.html#method.claim_from_grant)
+    /// — routes through this method. The scheduler has already
+    /// validated budget / quota / capabilities and written a grant
+    /// (Valkey `claim_grant` hash / PG+SQLite `ff_claim_grant` row);
+    /// this call atomically consumes that grant and creates the
+    /// attempt row, mints `lease_id` + `lease_epoch`, and returns a
+    /// [`ClaimExecutionResult::Claimed`] carrying the minted lease
+    /// triple.
+    ///
+    /// Distinct from [`Self::claim`] (the scheduler-bypass scanner
+    /// used by the `direct-valkey-claim` feature) — this method
+    /// assumes the grant already exists and skips capability / ZSET
+    /// scanning. The Valkey impl fires exactly one `ff_claim_execution`
+    /// FCALL; the PG / SQLite impls fire one CAS transaction.
+    ///
+    /// Typed failures surface via `ScriptError` → `EngineError`:
+    /// `UseClaimResumedExecution` when the attempt is actually
+    /// `attempt_interrupted` (caller should retry via
+    /// [`Self::claim_resumed_execution`] — see `ContentionKind` at
+    /// `ff_core::engine_error`), `InvalidClaimGrant` when the grant is
+    /// missing / consumed / worker-mismatched, `CapabilityMismatch`
+    /// when the execution's `required_capabilities` drifted after
+    /// grant issuance.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so the
+    /// trait addition is non-breaking for backends that have no
+    /// grant-consumer path (PG / SQLite today — grants are a Valkey
+    /// concept pending RFC-024 extensions). Same precedent as
+    /// [`Self::read_current_attempt_index`] landing in v0.12 PR-3.
+    #[cfg(feature = "core")]
+    async fn claim_execution(
+        &self,
+        _args: ClaimExecutionArgs,
+    ) -> Result<ClaimExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "claim_execution",
         })
     }
 

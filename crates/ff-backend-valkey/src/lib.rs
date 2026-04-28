@@ -39,7 +39,7 @@ use ff_core::contracts::decode::{
 };
 use ff_core::contracts::{
     AdditionalWaitpointBinding, CancelFlowArgs, CancelFlowResult, ClaimExecutionArgs,
-    ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CompositeBody,
+    ClaimExecutionResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult, CompositeBody,
     CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
     ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
@@ -3980,20 +3980,20 @@ async fn claim_impl(
         let lease_id = LeaseId::new();
         let attempt_id = AttemptId::new();
 
-        let args = ClaimExecutionArgs {
-            execution_id: execution_id.clone(),
-            worker_id: policy.worker_id.clone(),
-            worker_instance_id: policy.worker_instance_id.clone(),
-            lane_id: lane.clone(),
-            lease_id: lease_id.clone(),
-            lease_ttl_ms: u64::from(policy.lease_ttl_ms),
-            attempt_id: attempt_id.clone(),
-            expected_attempt_index: att_idx,
-            attempt_policy_json: "{}".to_owned(),
-            attempt_timeout_ms: None,
-            execution_deadline_at: None,
-            now: TimestampMs::now(),
-        };
+        let args = ClaimExecutionArgs::new(
+            execution_id.clone(),
+            policy.worker_id.clone(),
+            policy.worker_instance_id.clone(),
+            lane.clone(),
+            lease_id.clone(),
+            u64::from(policy.lease_ttl_ms),
+            attempt_id.clone(),
+            att_idx,
+            "{}".to_owned(),
+            None,
+            None,
+            TimestampMs::now(),
+        );
 
         let exec_keys = ExecOpKeys {
             ctx: &ctx,
@@ -4393,6 +4393,36 @@ async fn reclaim_execution_impl(
         lease_id = %args.lease_id,
     )
 )]
+/// Grant-consumer path for [`EngineBackend::claim_execution`].
+///
+/// Fires exactly one `ff_claim_execution` FCALL against the
+/// execution's partition, consuming the scheduler-issued claim grant
+/// and minting the attempt row. Key/ARGV shape is identical to what
+/// `claim_impl` (the scheduler-bypass scanner) fires post-grant and
+/// to the pre-PR-4 direct-FCALL helper on the SDK worker — this
+/// extraction preserves every observable Valkey write byte-for-byte.
+async fn claim_execution_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: ClaimExecutionArgs,
+) -> Result<ClaimExecutionResult, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys = ExecOpKeys {
+        ctx: &ctx,
+        idx: &idx,
+        lane_id: &args.lane_id,
+        worker_instance_id: &args.worker_instance_id,
+    };
+    let execution_id = args.execution_id.clone();
+    let partial = ff_claim_execution(client, &keys, &args)
+        .await
+        .map_err(EngineError::from)?;
+    Ok(partial.complete(execution_id))
+}
+
 async fn claim_resumed_execution_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -5005,6 +5035,20 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "claim_resumed_execution: FCALL ff_claim_resumed_execution",
+                )
+            })
+    }
+
+    async fn claim_execution(
+        &self,
+        args: ClaimExecutionArgs,
+    ) -> Result<ClaimExecutionResult, EngineError> {
+        claim_execution_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "claim_execution: FCALL ff_claim_execution",
                 )
             })
     }

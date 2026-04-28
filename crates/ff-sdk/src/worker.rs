@@ -8,9 +8,18 @@ use std::sync::Arc;
 // `valkey-default` so the module compiles under
 // `--no-default-features, features = ["sqlite"]`.
 #[cfg(feature = "valkey-default")]
-use ferriskey::{Client, Value};
+use ferriskey::Client;
+// `Value` + `IndexKeys` are only referenced by the direct-claim
+// scanner (`claim_next`) and its helpers. v0.12 PR-4 routed the
+// `claim_from_grant` hot path through the trait so the last
+// always-on use of `Value` disappeared. Keep both imports scoped to
+// `direct-valkey-claim` so the default-feature build is warning-free.
+#[cfg(feature = "direct-valkey-claim")]
+use ferriskey::Value;
 #[cfg(feature = "valkey-default")]
-use ff_core::keys::{ExecKeyContext, IndexKeys};
+use ff_core::keys::ExecKeyContext;
+#[cfg(feature = "direct-valkey-claim")]
+use ff_core::keys::IndexKeys;
 use ff_core::partition::PartitionConfig;
 #[cfg(feature = "valkey-default")]
 use ff_core::types::*;
@@ -856,14 +865,25 @@ impl FlowFabricWorker {
         }
     }
 
-    /// Low-level claim of a granted execution. Invokes
-    /// `ff_claim_execution` and returns a `ClaimedTask` with auto
-    /// lease renewal.
+    /// Low-level claim of a granted execution. Routes through
+    /// [`EngineBackend::claim_execution`](ff_core::engine_backend::EngineBackend::claim_execution)
+    /// — the trait-level grant-consumer method landed in v0.12 PR-4 —
+    /// and returns a `ClaimedTask` with auto lease renewal.
     ///
-    /// Previously gated behind `direct-valkey-claim`; ungated so
-    /// the public [`claim_from_grant`] entry point can reuse the
-    /// same FCALL plumbing. The method stays private — external
-    /// callers use `claim_from_grant`.
+    /// Pre-PR-4 the SDK fired the `ff_claim_execution` FCALL directly
+    /// against `valkey_client()` and hand-parsed the Lua response shape.
+    /// The body now collapses to `backend.claim_execution(args)` +
+    /// `backend.read_execution_context(...)` + `ClaimedTask::new(...)`;
+    /// the Valkey-specific FCALL plumbing lives behind the trait in
+    /// `ff_backend_valkey::claim_execution_impl`.
+    ///
+    /// The method stays `valkey-default`-gated because
+    /// [`ClaimedTask::new`](crate::task::ClaimedTask) still depends on
+    /// `ValkeyBackend::encode_handle` for handle synthesis (lease-
+    /// renewal loop cookie). The public [`claim_from_grant`] entry
+    /// point that calls this helper stays gated for the same reason.
+    /// A full cross-backend ungate awaits an agnostic `ClaimedTask::new`
+    /// (v0.12 PR-5 / `claim_next` scope).
     ///
     /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
     #[cfg(feature = "valkey-default")]
@@ -874,14 +894,16 @@ impl FlowFabricWorker {
         partition: &ff_core::partition::Partition,
         _now: TimestampMs,
     ) -> Result<ClaimedTask, SdkError> {
+        // Pre-read total_attempt_count from exec_core to derive the
+        // expected attempt index. The Lua uses total_attempt_count as
+        // the new index and builds the attempt key from the hash tag,
+        // so the Rust-side index is mainly documentation/debugging; we
+        // still plumb it through `ClaimExecutionArgs::expected_attempt_index`
+        // so the backend's KEYS construction lines up with what the
+        // Lua computes (byte-for-byte identical to pre-PR-4).
         let ctx = ExecKeyContext::new(partition, execution_id);
-        let idx = IndexKeys::new(partition);
-
-        // Pre-read total_attempt_count from exec_core to derive next attempt index.
-        // The Lua uses total_attempt_count as the new index and dynamically builds
-        // the attempt key from the hash tag, so KEYS[6-8] are placeholders, but
-        // we pass the correct index for documentation/debugging.
-        let total_str: Option<String> = self.valkey_client()
+        let total_str: Option<String> = self
+            .valkey_client()
             .cmd("HGET")
             .arg(ctx.core())
             .arg("total_attempt_count")
@@ -894,123 +916,39 @@ impl FlowFabricWorker {
             .unwrap_or(0);
         let att_idx = AttemptIndex::new(next_idx);
 
-        let lease_id = LeaseId::new().to_string();
-        let attempt_id = AttemptId::new().to_string();
-        let renew_before_ms = self.config.lease_ttl_ms * 2 / 3;
+        let args = ff_core::contracts::ClaimExecutionArgs::new(
+            execution_id.clone(),
+            self.config.worker_id.clone(),
+            self.config.worker_instance_id.clone(),
+            lane_id.clone(),
+            LeaseId::new(),
+            self.config.lease_ttl_ms,
+            AttemptId::new(),
+            att_idx,
+            "{}".to_owned(),
+            None,
+            None,
+            TimestampMs::now(),
+        );
 
-        // KEYS (14): must match lua/execution.lua ff_claim_execution positional order
-        let keys: Vec<String> = vec![
-            ctx.core(),                                    // 1  exec_core
-            ctx.claim_grant(),                             // 2  claim_grant
-            idx.lane_eligible(lane_id),                    // 3  eligible_zset
-            idx.lease_expiry(),                            // 4  lease_expiry_zset
-            idx.worker_leases(&self.config.worker_instance_id), // 5  worker_leases
-            ctx.attempt_hash(att_idx),                     // 6  attempt_hash (placeholder)
-            ctx.attempt_usage(att_idx),                    // 7  attempt_usage (placeholder)
-            ctx.attempt_policy(att_idx),                   // 8  attempt_policy (placeholder)
-            ctx.attempts(),                                // 9  attempts_zset
-            ctx.lease_current(),                           // 10 lease_current
-            ctx.lease_history(),                           // 11 lease_history
-            idx.lane_active(lane_id),                      // 12 active_index
-            idx.attempt_timeout(),                         // 13 attempt_timeout_zset
-            idx.execution_deadline(),                      // 14 execution_deadline_zset
-        ];
-
-        // ARGV (12): must match lua/execution.lua ff_claim_execution positional order
-        let args: Vec<String> = vec![
-            execution_id.to_string(),                      // 1  execution_id
-            self.config.worker_id.to_string(),             // 2  worker_id
-            self.config.worker_instance_id.to_string(),    // 3  worker_instance_id
-            lane_id.to_string(),                           // 4  lane
-            String::new(),                                 // 5  capability_hash
-            lease_id.clone(),                              // 6  lease_id
-            self.config.lease_ttl_ms.to_string(),          // 7  lease_ttl_ms
-            renew_before_ms.to_string(),                   // 8  renew_before_ms
-            attempt_id.clone(),                            // 9  attempt_id
-            "{}".to_owned(),                               // 10 attempt_policy_json
-            String::new(),                                 // 11 attempt_timeout_ms
-            String::new(),                                 // 12 execution_deadline_at
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self.valkey_client()            
-            .fcall("ff_claim_execution", &key_refs, &arg_refs)
-            .await
-            .map_err(SdkError::from)?;
-
-        // Parse claim result: {1, "OK", lease_id, lease_epoch, attempt_index,
-        //                      attempt_id, attempt_type, lease_expires_at}
-        let arr = match &raw {
-            Value::Array(arr) => arr,
-            _ => {
+        // `ClaimExecutionResult` is `#[non_exhaustive]` (v0.12 PR-4)
+        // so let-binding requires an explicit wildcard arm even though
+        // `Claimed` is the only variant today. Future additive variants
+        // surface as a loud `unreachable` rather than a silent miss.
+        let claimed = match self.backend.claim_execution(args).await? {
+            ff_core::contracts::ClaimExecutionResult::Claimed(c) => c,
+            // `#[non_exhaustive]` — future additive variants surface
+            // as an explicit SDK-side rewrite rather than a silent miss.
+            other => {
                 return Err(SdkError::from(ff_script::error::ScriptError::Parse {
                     fcall: "ff_claim_execution".into(),
                     execution_id: Some(execution_id.to_string()),
-                    message: "expected Array".into(),
+                    message: format!(
+                        "unexpected ClaimExecutionResult variant: {other:?}"
+                    ),
                 }));
             }
         };
-
-        let status_code = match arr.first() {
-            Some(Ok(Value::Int(n))) => *n,
-            _ => {
-                return Err(SdkError::from(ff_script::error::ScriptError::Parse {
-                    fcall: "ff_claim_execution".into(),
-                    execution_id: Some(execution_id.to_string()),
-                    message: "bad status code".into(),
-                }));
-            }
-        };
-
-        if status_code != 1 {
-            let err_field_str = |idx: usize| -> String {
-                arr.get(idx)
-                    .and_then(|v| match v {
-                        Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                        Ok(Value::SimpleString(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default()
-            };
-            let error_code = {
-                let s = err_field_str(1);
-                if s.is_empty() { "unknown".to_owned() } else { s }
-            };
-            let detail = err_field_str(2);
-
-            return Err(SdkError::from(
-                ff_script::error::ScriptError::from_code_with_detail(&error_code, &detail)
-                    .unwrap_or_else(|| ff_script::error::ScriptError::Parse {
-                        fcall: "ff_claim_execution".into(),
-                        execution_id: Some(execution_id.to_string()),
-                        message: format!("unknown error: {error_code}"),
-                    }),
-            ));
-        }
-
-        // Extract fields from success response
-        let field_str = |idx: usize| -> String {
-            arr.get(idx + 2) // skip status_code and "OK"
-                .and_then(|v| match v {
-                    Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-                    Ok(Value::SimpleString(s)) => Some(s.clone()),
-                    Ok(Value::Int(n)) => Some(n.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        };
-
-        // Lua returns: ok(lease_id, epoch, expires_at, attempt_id, attempt_index, attempt_type)
-        // Positions:       0         1       2           3            4              5
-        let lease_id = LeaseId::parse(&field_str(0))
-            .unwrap_or_else(|_| LeaseId::new());
-        let lease_epoch = LeaseEpoch::new(field_str(1).parse().unwrap_or(1));
-        // field_str(2) is expires_at — skip it (lease timing managed by renewal)
-        let attempt_id = AttemptId::parse(&field_str(3))
-            .unwrap_or_else(|_| AttemptId::new());
-        let attempt_index = AttemptIndex::new(field_str(4).parse().unwrap_or(0));
 
         // Read execution payload and metadata
         let (input_payload, execution_kind, tags) = self
@@ -1021,10 +959,10 @@ impl FlowFabricWorker {
             self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
-            attempt_index,
-            attempt_id,
-            lease_id,
-            lease_epoch,
+            claimed.attempt_index,
+            claimed.attempt_id,
+            claimed.lease_id,
+            claimed.lease_epoch,
             self.config.lease_ttl_ms,
             lane_id.clone(),
             self.config.worker_instance_id.clone(),
@@ -1852,6 +1790,32 @@ mod sqlite_only_compile_surface_tests {
             id: &ExecutionId,
         ) -> Result<AttemptIndex, EngineError> {
             b.read_current_attempt_index(id).await
+        }
+    }
+
+    /// v0.12 PR-4 compile anchor — the new
+    /// [`EngineBackend::claim_execution`] trait method MUST be
+    /// addressable under `--no-default-features --features sqlite`.
+    /// Mirrors the PR-3 `read_current_attempt_index` anchor: takes a
+    /// generic over the trait bound so `#[async_trait]` lifetime
+    /// elision doesn't block a plain fn-pointer coercion.
+    ///
+    /// The method has an `Err(Unavailable)` default impl; PG + SQLite
+    /// backends don't override it today (grants are Valkey-only until
+    /// the PG/SQLite grant-consumer RFC lands). The anchor pins the
+    /// trait-surface signature — not a runtime call — so the compile
+    /// check passes cleanly on every feature set.
+    #[test]
+    fn claim_execution_addressable_under_sqlite_only() {
+        use ff_core::contracts::{ClaimExecutionArgs, ClaimExecutionResult};
+        use ff_core::engine_error::EngineError;
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            args: ClaimExecutionArgs,
+        ) -> Result<ClaimExecutionResult, EngineError> {
+            b.claim_execution(args).await
         }
     }
 
