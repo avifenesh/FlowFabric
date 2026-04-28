@@ -385,6 +385,17 @@ and clones it into each per-op trait forwarder — replacing the
 pre-PR `ValkeyBackend::encode_handle` synthesis call previously
 hardcoded into `ClaimedTask::new`.
 
+**Source-breaking — `#[non_exhaustive]` on claim contracts.**
+`ClaimedExecution` and `ClaimedResumedExecution` are now marked
+`#[non_exhaustive]` so future backend-populated fields stay
+additive. Consumers that constructed these via struct literals,
+or pattern-matched them without a `..` rest pattern, must switch
+to the public constructors (`ClaimedExecution::new(..)`,
+`ClaimedResumedExecution::new(..)`) or add `..` to exhaustive
+destructures. Backends outside the crate cannot construct claim
+results by literal — use the `::new` constructors that take the
+`handle` as an explicit argument.
+
 **Limitations.** Runtime coverage on PG/SQLite remains the
 scheduler-routed [`claim_via_server`] path. Both backends return
 [`EngineError::Unavailable`](../crates/ff-core/src/engine_error.rs)
