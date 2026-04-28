@@ -13,3 +13,8 @@
 #
 # The parity-drift lint (`scripts/lint-migrations.sh`) parses this
 # format directly.
+
+# RFC-024 PR-D (Postgres) is landing ahead of PR-E (SQLite). The
+# SQLite sibling for `0017_claim_grant_table.sql` lands in PR-E
+# and this skip-entry is removed then.
+0017_claim_grant_table.sql # issue:371

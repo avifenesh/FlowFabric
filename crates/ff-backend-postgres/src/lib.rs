@@ -42,7 +42,8 @@ use ff_core::contracts::{
 #[cfg(feature = "core")]
 use ff_core::state::PublicState;
 use ff_core::contracts::{
-    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, ReportUsageResult,
+    CancelFlowResult, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
+    IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReportUsageResult,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllResult, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SuspendArgs, SuspendOutcome,
 };
@@ -86,6 +87,7 @@ pub use sqlx::PgPool;
 mod admin;
 pub mod attempt;
 pub mod budget;
+pub mod claim_grant;
 pub mod completion;
 #[cfg(feature = "core")]
 pub mod dispatch;
@@ -538,6 +540,24 @@ impl EngineBackend for PostgresBackend {
         token: ResumeToken,
     ) -> Result<Option<Handle>, EngineError> {
         attempt::claim_from_resume_grant(&self.pool, token).await
+    }
+
+    // RFC-024 PR-D — lease-reclaim grant issuance + consumption.
+
+    #[tracing::instrument(name = "pg.issue_reclaim_grant", skip_all)]
+    async fn issue_reclaim_grant(
+        &self,
+        args: IssueReclaimGrantArgs,
+    ) -> Result<IssueReclaimGrantOutcome, EngineError> {
+        claim_grant::issue_reclaim_grant_impl(&self.pool, args).await
+    }
+
+    #[tracing::instrument(name = "pg.reclaim_execution", skip_all)]
+    async fn reclaim_execution(
+        &self,
+        args: ReclaimExecutionArgs,
+    ) -> Result<ReclaimExecutionOutcome, EngineError> {
+        claim_grant::reclaim_execution_impl(&self.pool, args).await
     }
 
     #[tracing::instrument(name = "pg.delay", skip_all)]

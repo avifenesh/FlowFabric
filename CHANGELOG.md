@@ -73,6 +73,55 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-024 PR-D — Postgres `issue_reclaim_grant` + `reclaim_execution`
+  real impls + migration 0017 (continues #371).** Replaces the
+  PR-B+C `EngineError::Unavailable` default with production SQL
+  bodies on the Postgres backend. Scope: `ff-backend-postgres`
+  only; SQLite (PR-E) + Valkey (PR-F) land separately.
+  - `crates/ff-backend-postgres/migrations/0017_claim_grant_table.sql`
+    — new 256-way HASH-partitioned `ff_claim_grant` table with
+    `kind IN ('claim','reclaim')` discriminator, JSONB
+    `worker_capabilities`, per-grant TTL columns + indexes on
+    `(partition_key, execution_id)` and `expires_at_ms`. Adds
+    `ff_exec_core.lease_reclaim_count INTEGER NOT NULL DEFAULT 0`
+    for the RFC-024 §4.6 1000-cap enforcement. Backfills existing
+    `raw_fields.claim_grant` JSON entries into `kind='claim'`
+    rows (grant_id = sha256(grant_key)). `backward_compatible = true`;
+    the legacy JSON column is left in place for one release per
+    RFC-024 §5 / §10 (a follow-up cleanup strips the residue
+    once rolling-deploy windows close).
+  - `crates/ff-backend-postgres/src/claim_grant.rs` — new module
+    housing the `ff_claim_grant` CRUD + the two RFC-024
+    impls. SERIALIZABLE + 3-attempt retry wrapper per the
+    Wave-9 `operator::cancel_execution_impl` pattern.
+  - `PostgresBackend::issue_reclaim_grant` — validates
+    `lifecycle_phase = 'active'` + (ownership_state in
+    `{'lease_expired_reclaimable','lease_revoked'}` OR the
+    attempt's lease has expired / is NULL) under `FOR NO KEY
+    UPDATE`; pre-checks the 1000-cap; signs a reclaim grant via
+    the existing `ff_waitpoint_hmac` keystore; inserts
+    `kind='reclaim'` row. Returns `Granted(ReclaimGrant)` /
+    `NotReclaimable` / `ReclaimCapExceeded`.
+  - `PostgresBackend::reclaim_execution` — locks the reclaim
+    grant row under `FOR UPDATE`, validates grant worker_id
+    match (RFC-024 §4.4 — `worker_instance_id` intentionally
+    informational only), validates TTL, inserts a NEW
+    `ff_attempt` row with `attempt_index = current + 1`
+    (`raw_fields.attempt_type = 'reclaim'`) matching Valkey
+    `ff_reclaim_execution` semantics, marks the prior attempt
+    `outcome = 'interrupted_reclaimed'`, bumps `exec_core.attempt_index`
+    + `lease_reclaim_count`, consumes the grant row, emits a
+    RFC-019 `reclaimed` lease event, and mints a
+    `Handle { kind: Reclaimed, lease_epoch: 1 }`. Enforces the
+    caller-supplied `max_reclaim_count` (default 1000); on
+    exceed: transitions to `terminal_failed` + consumes the
+    grant + returns `ReclaimCapExceeded`.
+  - `crates/ff-backend-postgres/tests/rfc024_reclaim.rs` — 7
+    integration scenarios (happy paths for both methods,
+    wrong-phase, cap-exceeded at issuance, worker-id mismatch,
+    TTL-expired grant, cap-exceeded at reclaim, scheduler
+    write-through verification).
+
 - **RFC-024 PR-B+C — trait method renames + new `ReclaimGrant` type +
   non_exhaustive constructors (closes partial of #371).** Folded PR-B
   and PR-C of the RFC-024 series because the new trait method
@@ -101,6 +150,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     backends keep compiling.
 
 ### Changed
+
+- **RFC-024 PR-D — Postgres scheduler claim-grant storage flips
+  from JSON stash to `ff_claim_grant` table.** Pre-PR-D the
+  scheduler wrote claim grants into
+  `ff_exec_core.raw_fields.claim_grant` as a JSON object (see
+  `scheduler.rs:252` pre-PR-D). Post-PR-D, the scheduler writes a
+  `kind='claim'` row to the new `ff_claim_grant` table; the
+  `verify_grant` read path reads worker identity from the same
+  table. `raw_fields.claim_grant` is left in place for one
+  release for backfill safety.
 
 - **RFC-024 PR-B+C — trait method rename + transitional aliases
   dropped.** Compile-break wave that lands in the same PR as the new

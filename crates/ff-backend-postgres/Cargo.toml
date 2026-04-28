@@ -50,6 +50,11 @@ uuid = { workspace = true }
 # by `suspend_ops.rs` for opaque-handle / payload hex codec.
 hex = "0.4"
 
+# RFC-024 PR-D: SHA256 for the deterministic `ff_claim_grant.grant_id`
+# (sha256 of the HMAC-signed `grant_key` string — stable, collision-
+# resistant, same primitive already in transit via `ff-core::crypto::hmac`).
+sha2 = "0.10"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = { workspace = true }

@@ -249,28 +249,31 @@ impl PostgresScheduler {
         let sig = hmac_sign(secret, kid, message.as_bytes());
         let grant_key = format!("pg:{hash_tag}:{exec_uuid}:{expires_at_ms}:{sig}");
 
-        // Persist the grant inside raw_fields.claim_grant. No schema
-        // delta; raw_fields is the Wave-3 convention for untyped
-        // overflow.
-        let grant_patch = serde_json::json!({
-            "claim_grant": {
-                "grant_key": grant_key,
-                "worker_id": worker_id.as_str(),
-                "worker_instance_id": worker_instance_id.as_str(),
-                "expires_at_ms": expires_at_ms,
-                "issued_at_ms": now,
-                "kid": kid,
-            }
-        });
+        // RFC-024 PR-D: persist the grant into `ff_claim_grant` (the
+        // properly-shaped table with `kind` discriminator). Pre-PR-D
+        // this used the JSON stash at `ff_exec_core.raw_fields.claim_grant`
+        // — the JSON column is left in place for one release for
+        // backfill safety (RFC §5 / §10) but is no longer consulted
+        // by the read path.
+        crate::claim_grant::write_claim_grant(
+            &mut tx,
+            part,
+            &grant_key,
+            exec_uuid,
+            worker_id.as_str(),
+            worker_instance_id.as_str(),
+            grant_ttl_ms,
+            now,
+            expires_at_ms,
+        )
+        .await?;
         sqlx::query(
             r#"
             UPDATE ff_exec_core
-               SET raw_fields = raw_fields || $1::jsonb,
-                   eligibility_state = 'pending_claim'
-             WHERE partition_key = $2 AND execution_id = $3
+               SET eligibility_state = 'pending_claim'
+             WHERE partition_key = $1 AND execution_id = $2
             "#,
         )
-        .bind(grant_patch)
         .bind(part)
         .bind(exec_uuid)
         .execute(&mut *tx)
@@ -348,9 +351,10 @@ pub async fn verify_grant(pool: &PgPool, grant: &ClaimGrant) -> Result<(), Grant
     Ok(())
 }
 
-/// Read the worker identity embedded in `raw_fields.claim_grant`.
-/// Needed by [`verify_grant`] so the signed message can be
-/// reconstructed deterministically.
+/// Read the worker identity for a claim grant by (partition_key,
+/// execution_id). RFC-024 PR-D: reads from the new `ff_claim_grant`
+/// table (kind='claim'); pre-PR-D this read from
+/// `ff_exec_core.raw_fields.claim_grant`.
 async fn read_grant_identity(
     pool: &PgPool,
     grant: &ClaimGrant,
@@ -364,28 +368,11 @@ async fn read_grant_identity(
         .map(|(_, u)| u)
         .ok_or(GrantVerifyError::Malformed)?;
     let exec_uuid = Uuid::parse_str(uuid_str).map_err(|_| GrantVerifyError::Malformed)?;
-    let row = sqlx::query(
-        "SELECT raw_fields FROM ff_exec_core WHERE partition_key = $1 AND execution_id = $2",
-    )
-    .bind(part)
-    .bind(exec_uuid)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| GrantVerifyError::Transport)?
-    .ok_or(GrantVerifyError::UnknownGrant)?;
-    let raw: JsonValue = row.try_get("raw_fields").map_err(|_| GrantVerifyError::Transport)?;
-    let cg = raw.get("claim_grant").ok_or(GrantVerifyError::UnknownGrant)?;
-    let wid = cg
-        .get("worker_id")
-        .and_then(JsonValue::as_str)
-        .ok_or(GrantVerifyError::Malformed)?
-        .to_owned();
-    let wiid = cg
-        .get("worker_instance_id")
-        .and_then(JsonValue::as_str)
-        .ok_or(GrantVerifyError::Malformed)?
-        .to_owned();
-    Ok((wid, wiid))
+    let ident = crate::claim_grant::read_claim_grant_identity(pool, part, exec_uuid)
+        .await
+        .map_err(|_| GrantVerifyError::Transport)?
+        .ok_or(GrantVerifyError::UnknownGrant)?;
+    Ok(ident)
 }
 
 /// Errors from [`verify_grant`].
