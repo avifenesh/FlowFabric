@@ -449,6 +449,275 @@ async fn reclaim_execution_cap_exceeded() {
     assert_eq!(public_state, "failed");
 }
 
+// -- Review-finding regression tests (F1, F2+F3, F4, F5, F7) ---------
+
+/// F1+F6: if the exec transitions to terminal between grant issuance
+/// and grant consumption, reclaim_execution returns NotReclaimable
+/// (no state mutation) instead of reviving the execution.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn reclaim_execution_exec_gone_terminal_returns_not_reclaimable() {
+    let b = fresh_backend().await;
+    let (exec_id, lane_id, _handle) = create_and_claim(&b).await;
+    let exec_uuid = uuid_of(&exec_id);
+    force_lease_expired(&b, exec_uuid).await;
+
+    let _ = b
+        .issue_reclaim_grant(issue_args(&exec_id, &lane_id))
+        .await
+        .expect("issue");
+
+    // Operator-cancel-style transition flips the exec to terminal
+    // after the grant is issued but before the worker consumes it.
+    sqlx::query(
+        "UPDATE ff_exec_core SET lifecycle_phase='terminal', ownership_state='unowned', \
+         public_state='cancelled' WHERE partition_key=0 AND execution_id=?1",
+    )
+    .bind(exec_uuid)
+    .execute(b.pool_for_test())
+    .await
+    .unwrap();
+
+    let r = b
+        .reclaim_execution(reclaim_args(&exec_id, &lane_id, "w1", "w1-i2", 0, None))
+        .await
+        .expect("reclaim");
+    assert!(
+        matches!(r, ReclaimExecutionOutcome::NotReclaimable { .. }),
+        "got {r:?}"
+    );
+
+    // Critical: exec state must still be terminal (not revived).
+    let (phase,): (String,) = sqlx::query_as(
+        "SELECT lifecycle_phase FROM ff_exec_core WHERE partition_key=0 AND execution_id=?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(phase, "terminal", "exec must remain terminal, not revived");
+}
+
+/// F2+F3: cap-exceeded branch clears the prior attempt's lease
+/// fields, marks outcome = interrupted_reclaimed, and emits BOTH
+/// the completion_event (terminal_failed) and the lease_event
+/// (revoked) per RFC-019 §4.2.7 outbox matrix.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn reclaim_cap_exceeded_clears_prior_attempt_and_emits_events() {
+    let b = fresh_backend().await;
+    let (exec_id, lane_id, _handle) = create_and_claim(&b).await;
+    let exec_uuid = uuid_of(&exec_id);
+    force_lease_expired(&b, exec_uuid).await;
+
+    sqlx::query(
+        "UPDATE ff_exec_core SET lease_reclaim_count = 1 \
+         WHERE partition_key=0 AND execution_id=?1",
+    )
+    .bind(exec_uuid)
+    .execute(b.pool_for_test())
+    .await
+    .unwrap();
+
+    let _ = b
+        .issue_reclaim_grant(issue_args(&exec_id, &lane_id))
+        .await
+        .expect("issue");
+
+    let r = b
+        .reclaim_execution(reclaim_args(&exec_id, &lane_id, "w1", "w1-i2", 0, Some(1)))
+        .await
+        .expect("reclaim");
+    assert!(matches!(r, ReclaimExecutionOutcome::ReclaimCapExceeded { .. }));
+
+    // Prior attempt lease-fencing fields cleared + outcome set.
+    let (outcome, worker_id, lease_expires): (Option<String>, Option<String>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT outcome, worker_id, lease_expires_at_ms FROM ff_attempt \
+             WHERE partition_key=0 AND execution_id=?1 AND attempt_index=0",
+        )
+        .bind(exec_uuid)
+        .fetch_one(b.pool_for_test())
+        .await
+        .unwrap();
+    assert_eq!(outcome.as_deref(), Some("interrupted_reclaimed"));
+    assert!(worker_id.is_none(), "worker_id must be cleared");
+    assert!(lease_expires.is_none(), "lease_expires_at_ms must be cleared");
+
+    // completion_event emitted with outcome = 'failed'.
+    let (comp_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM ff_completion_event WHERE partition_key=0 \
+         AND execution_id=?1 AND outcome='failed'",
+    )
+    .bind(exec_uuid)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(comp_count, 1, "terminal_failed must emit completion_event");
+
+    // lease_event emitted with event_type = 'revoked'. Column is
+    // TEXT, bind the hyphenated UUID string.
+    let (lease_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM ff_lease_event WHERE partition_key=0 \
+         AND execution_id=?1 AND event_type='revoked'",
+    )
+    .bind(exec_uuid.to_string())
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(lease_count, 1, "terminal_failed must emit lease_event revoked");
+}
+
+/// F4: the minted handle embeds caller-supplied `attempt_id` +
+/// `lease_id` (not freshly minted internally). Also verifies
+/// LeaseEpoch is non-zero (F5 — monotonically bumped).
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn reclaim_execution_handle_carries_caller_ids_and_nonzero_epoch() {
+    use ff_core::handle_codec::decode as decode_handle;
+
+    let b = fresh_backend().await;
+    let (exec_id, lane_id, _handle) = create_and_claim(&b).await;
+    let exec_uuid = uuid_of(&exec_id);
+    force_lease_expired(&b, exec_uuid).await;
+
+    let _ = b
+        .issue_reclaim_grant(issue_args(&exec_id, &lane_id))
+        .await
+        .expect("issue");
+
+    let caller_attempt_id = AttemptId::new();
+    let caller_lease_id = LeaseId::new();
+    let args = ReclaimExecutionArgs::new(
+        exec_id.clone(),
+        WorkerId::new("w1"),
+        WorkerInstanceId::new("w1-i2"),
+        lane_id.clone(),
+        None,
+        caller_lease_id.clone(),
+        30_000,
+        caller_attempt_id.clone(),
+        String::new(),
+        None,
+        WorkerInstanceId::new("w1-i1"),
+        AttemptIndex::new(0),
+    );
+    let r = b.reclaim_execution(args).await.expect("reclaim");
+    let handle = match r {
+        ReclaimExecutionOutcome::Claimed(h) => h,
+        other => panic!("expected Claimed, got {other:?}"),
+    };
+
+    let decoded = decode_handle(&handle.opaque).expect("decode handle");
+    assert_eq!(decoded.payload.attempt_id, caller_attempt_id, "attempt_id must round-trip");
+    assert_eq!(decoded.payload.lease_id, caller_lease_id, "lease_id must round-trip");
+    assert!(
+        decoded.payload.lease_epoch.0 >= 1,
+        "lease_epoch must be monotonically bumped (>=1), got {}",
+        decoded.payload.lease_epoch.0
+    );
+}
+
+/// F5: lease_epoch monotonically increases across successive
+/// reclaims. Each reclaim reads the prior attempt's epoch and writes
+/// prior + 1 to the new attempt row.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn reclaim_execution_lease_epoch_monotonic_across_reclaims() {
+    let b = fresh_backend().await;
+    let (exec_id, lane_id, _handle) = create_and_claim(&b).await;
+    let exec_uuid = uuid_of(&exec_id);
+
+    // First reclaim (attempt_index 0 → 1).
+    force_lease_expired(&b, exec_uuid).await;
+    let _ = b
+        .issue_reclaim_grant(issue_args(&exec_id, &lane_id))
+        .await
+        .expect("issue-1");
+    let _ = b
+        .reclaim_execution(reclaim_args(&exec_id, &lane_id, "w1", "w1-i2", 0, None))
+        .await
+        .expect("reclaim-1");
+
+    let (epoch_1,): (i64,) = sqlx::query_as(
+        "SELECT lease_epoch FROM ff_attempt WHERE partition_key=0 \
+         AND execution_id=?1 AND attempt_index=1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert!(epoch_1 >= 1, "first reclaim epoch must be >=1, got {epoch_1}");
+
+    // Second reclaim (1 → 2).
+    sqlx::query(
+        "UPDATE ff_exec_core SET ownership_state='lease_expired_reclaimable' \
+         WHERE partition_key=0 AND execution_id=?1",
+    )
+    .bind(exec_uuid)
+    .execute(b.pool_for_test())
+    .await
+    .unwrap();
+    let _ = b
+        .issue_reclaim_grant(issue_args(&exec_id, &lane_id))
+        .await
+        .expect("issue-2");
+    let _ = b
+        .reclaim_execution(reclaim_args(&exec_id, &lane_id, "w1", "w1-i3", 1, None))
+        .await
+        .expect("reclaim-2");
+
+    let (epoch_2,): (i64,) = sqlx::query_as(
+        "SELECT lease_epoch FROM ff_attempt WHERE partition_key=0 \
+         AND execution_id=?1 AND attempt_index=2",
+    )
+    .bind(exec_uuid)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert!(
+        epoch_2 > epoch_1,
+        "second-reclaim epoch ({epoch_2}) must exceed first-reclaim epoch ({epoch_1})"
+    );
+}
+
+/// F7: caller-supplied `current_attempt_index` is ignored in favor of
+/// the server-authoritative `ff_exec_core.attempt_index`. A stale arg
+/// does not backward-pin state nor PK-collide.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn reclaim_execution_ignores_stale_current_attempt_index_arg() {
+    let b = fresh_backend().await;
+    let (exec_id, lane_id, _handle) = create_and_claim(&b).await;
+    let exec_uuid = uuid_of(&exec_id);
+    force_lease_expired(&b, exec_uuid).await;
+
+    let _ = b
+        .issue_reclaim_grant(issue_args(&exec_id, &lane_id))
+        .await
+        .expect("issue");
+
+    // Stale arg: caller thinks attempt_index is 999, but server
+    // authoritative is 0. Server must derive new_attempt_index = 0+1.
+    let r = b
+        .reclaim_execution(reclaim_args(&exec_id, &lane_id, "w1", "w1-i2", 999, None))
+        .await
+        .expect("reclaim");
+    assert!(matches!(r, ReclaimExecutionOutcome::Claimed(_)), "got {r:?}");
+
+    let (attempt_index,): (i64,) = sqlx::query_as(
+        "SELECT attempt_index FROM ff_exec_core WHERE partition_key=0 AND execution_id=?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(b.pool_for_test())
+    .await
+    .unwrap();
+    assert_eq!(
+        attempt_index, 1,
+        "server-derived attempt_index must be 1 (stored 0 + 1), NOT 1000 (stale arg + 1)"
+    );
+}
+
 #[tokio::test]
 #[serial(ff_dev_mode)]
 async fn reclaim_execution_handle_kind_reclaimed() {
