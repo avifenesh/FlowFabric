@@ -25,6 +25,12 @@ postgres = ["dep:ff-backend-postgres", "dep:sqlx", "dep:uuid"]
 [dependencies]
 ff-core = { version = "0.11.0", path = "../ff-core", default-features = false, features = ["core"] }
 ff-observability = { workspace = true }
+# v0.12 PR-7a transitional: `Engine::start_*` accepts
+# `Arc<dyn EngineBackend>` on the boundary but scanners still speak
+# ferriskey, so `start_internal` downcasts the backend to
+# `ValkeyBackend` and reaches for the embedded client. v0.13 (PR-7b)
+# trait-ifies the scanner surface and drops this dep.
+ff-backend-valkey = { workspace = true }
 ferriskey = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }

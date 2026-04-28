@@ -4407,6 +4407,10 @@ fn acquire_stream_permit(
 
 #[async_trait]
 impl EngineBackend for ValkeyBackend {
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
+    }
+
     async fn claim(
         &self,
         lane: &LaneId,
