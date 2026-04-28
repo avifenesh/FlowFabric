@@ -147,6 +147,14 @@ pub struct Supports {
 }
 
 impl Supports {
+    /// Construct a [`Supports`] with every field `false`. Alias for
+    /// [`Self::none`] — provided so external consumers have a
+    /// conventional `new` constructor against this `#[non_exhaustive]`
+    /// struct. Equivalent to [`Self::default`].
+    pub const fn new() -> Self {
+        Self::none()
+    }
+
     /// Construct a `Supports` with every field `false`. Useful as a
     /// starting point when assembling a backend-specific capability
     /// snapshot. Consumers should never see this directly —

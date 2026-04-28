@@ -339,6 +339,14 @@ pub struct BestEffortLiveConfig {
 
 impl BestEffortLiveConfig {
     /// Construct with the given `ttl_ms` and defaults for the other
+    /// knobs. Alias for [`Self::with_ttl`] — provided so external
+    /// consumers have a conventional `new` constructor against this
+    /// `#[non_exhaustive]` struct.
+    pub fn new(ttl_ms: u32) -> Self {
+        Self::with_ttl(ttl_ms)
+    }
+
+    /// Construct with the given `ttl_ms` and defaults for the other
     /// knobs. Matches the shorthand used by
     /// [`StreamMode::best_effort_live`].
     pub fn with_ttl(ttl_ms: u32) -> Self {
@@ -1164,6 +1172,16 @@ pub struct BackendTimeouts {
     pub request: Option<Duration>,
 }
 
+impl BackendTimeouts {
+    /// Construct a [`BackendTimeouts`] with all fields set to their
+    /// backend-default sentinel (`None`). Equivalent to
+    /// [`Self::default`] — provided so external consumers have an
+    /// explicit constructor against this `#[non_exhaustive]` struct.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Retry policy shared across backend connections.
 ///
 /// Matches ferriskey's `ConnectionRetryStrategy` shape (see
@@ -1189,6 +1207,16 @@ pub struct BackendRetry {
     /// Jitter as a percentage of the computed backoff. `None` ⇒ backend
     /// default.
     pub jitter_percent: Option<u32>,
+}
+
+impl BackendRetry {
+    /// Construct a [`BackendRetry`] with all fields set to their
+    /// backend-default sentinel (`None`). Equivalent to
+    /// [`Self::default`] — provided so external consumers have an
+    /// explicit constructor against this `#[non_exhaustive]` struct.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Valkey-specific connection parameters.
@@ -1279,6 +1307,19 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// Construct a [`BackendConfig`] directly from a
+    /// [`BackendConnection`] variant, with default timeouts + retry.
+    /// Provided so external consumers have an explicit constructor
+    /// against this `#[non_exhaustive]` struct; for the common paths
+    /// prefer [`Self::valkey`] / [`Self::postgres`].
+    pub fn new(connection: BackendConnection) -> Self {
+        Self {
+            connection,
+            timeouts: BackendTimeouts::default(),
+            retry: BackendRetry::default(),
+        }
+    }
+
     /// Build a Valkey BackendConfig from host+port. Other fields take
     /// backend defaults.
     pub fn valkey(host: impl Into<String>, port: u16) -> Self {
