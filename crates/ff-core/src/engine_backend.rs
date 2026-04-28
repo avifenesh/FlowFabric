@@ -79,11 +79,9 @@ use crate::partition::PartitionKey;
 #[cfg(feature = "streaming")]
 use crate::contracts::{StreamCursor, StreamFrames};
 use crate::engine_error::EngineError;
-#[cfg(feature = "streaming")]
-use crate::types::AttemptIndex;
 #[cfg(feature = "core")]
 use crate::types::EdgeId;
-use crate::types::{BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs};
+use crate::types::{AttemptIndex, BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs};
 
 /// The engine write surface — a single trait a backend implementation
 /// honours to serve a `FlowFabricWorker`.
@@ -344,6 +342,39 @@ pub trait EngineBackend: Send + Sync + 'static {
         &self,
         execution_id: &ExecutionId,
     ) -> Result<ExecutionContext, EngineError>;
+
+    /// Point-read of the execution's current attempt-index.
+    ///
+    /// Used on the SDK worker's `claim_from_resume_grant` path —
+    /// specifically the private `claim_resumed_execution` helper —
+    /// immediately before dispatching [`Self::claim_resumed_execution`].
+    /// The returned index is fed into
+    /// [`ClaimResumedExecutionArgs::current_attempt_index`](crate::contracts::ClaimResumedExecutionArgs)
+    /// so the backend's script / transaction targets the correct
+    /// existing attempt row (KEYS[6] on Valkey; `ff_attempt` PK tuple
+    /// on PG/SQLite).
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET {exec}:core current_attempt_index` on the
+    ///   execution's partition. Single command.
+    /// * **Postgres** — `SELECT attempt_index FROM ff_exec_core
+    ///   WHERE partition_key = $1 AND execution_id = $2`.
+    /// * **SQLite** — `SELECT attempt_index FROM ff_exec_core
+    ///   WHERE execution_id = ?`.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so the
+    /// trait addition is non-breaking for out-of-tree backends (same
+    /// precedent as [`Self::read_execution_context`] landing in v0.12
+    /// PR-1).
+    async fn read_current_attempt_index(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<AttemptIndex, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_current_attempt_index",
+        })
+    }
 
     /// Snapshot a flow by id. `Ok(None)` ⇒ no such flow.
     async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError>;
@@ -1556,6 +1587,12 @@ mod tests {
                 String::new(),
                 std::collections::HashMap::new(),
             ))
+        }
+        async fn read_current_attempt_index(
+            &self,
+            _execution_id: &ExecutionId,
+        ) -> Result<AttemptIndex, EngineError> {
+            Ok(AttemptIndex::new(0))
         }
         async fn describe_flow(
             &self,

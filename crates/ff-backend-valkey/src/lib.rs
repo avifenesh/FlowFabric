@@ -920,6 +920,51 @@ async fn read_execution_context_impl(
     Ok(ExecutionContext::new(input_payload, execution_kind, tags))
 }
 
+/// Point-read of the execution's current attempt-index from the
+/// `{exec}:core` hash. Single `HGET current_attempt_index` — the same
+/// pattern the SDK worker previously issued inline before it dispatched
+/// `ff_claim_resumed_execution`. Missing row surfaces as
+/// [`EngineError::Validation { kind: InvalidInput, .. }`] matching the
+/// PG + SQLite siblings; the SDK only calls this post-grant, so an
+/// absent core hash is an invariant violation rather than a silent 0.
+#[tracing::instrument(
+    name = "ff.read_current_attempt_index",
+    skip_all,
+    fields(backend = "valkey", execution_id = %id)
+)]
+async fn read_current_attempt_index_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<AttemptIndex, EngineError> {
+    let partition = execution_partition(id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, id);
+
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("current_attempt_index")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    let Some(s) = raw else {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "read_current_attempt_index: execution not found: {id}"
+            ),
+        });
+    };
+    let idx: u32 = s.parse().map_err(|e| EngineError::Validation {
+        kind: ValidationKind::Corruption,
+        detail: format!(
+            "read_current_attempt_index: exec_core.current_attempt_index not a u32: {s:?}: {e}"
+        ),
+    })?;
+    Ok(AttemptIndex::new(idx))
+}
+
 /// List suspended executions in one partition, cursor-paginated,
 /// with suspension `reason_code` populated per entry (issue #183).
 ///
@@ -4765,6 +4810,20 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "read_execution_context: GET payload + HGETALL core + HGETALL tags",
+                )
+            })
+    }
+
+    async fn read_current_attempt_index(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<AttemptIndex, EngineError> {
+        read_current_attempt_index_impl(&self.client, &self.partition_config, execution_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "read_current_attempt_index: HGET exec_core.current_attempt_index",
                 )
             })
     }

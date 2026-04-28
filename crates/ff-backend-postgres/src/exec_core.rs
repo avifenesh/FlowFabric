@@ -368,6 +368,48 @@ pub(super) async fn read_execution_context_impl(
     Ok(ExecutionContext::new(input_payload, execution_kind, tags))
 }
 
+// ─── read_current_attempt_index ──────────────────────────────────
+
+/// Point-read of `attempt_index` from `ff_exec_core`. Used by the SDK
+/// worker on the `claim_from_resume_grant` path before dispatching
+/// `claim_resumed_execution`. Missing row → `InvalidInput` (same
+/// convention as [`read_execution_context_impl`]).
+pub(super) async fn read_current_attempt_index_impl(
+    pool: &PgPool,
+    _partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<ff_core::types::AttemptIndex, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let row = sqlx::query(
+        r#"
+        SELECT attempt_index
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "read_current_attempt_index: execution not found: {id}"
+            ),
+        });
+    };
+    let attempt_index_i: i32 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
+    let attempt_index = ff_core::types::AttemptIndex::new(
+        u32::try_from(attempt_index_i.max(0)).unwrap_or(0),
+    );
+    Ok(attempt_index)
+}
+
 // ─── list_executions ─────────────────────────────────────────────
 
 pub(super) async fn list_executions_impl(
