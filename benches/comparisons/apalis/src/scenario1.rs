@@ -73,6 +73,11 @@ struct Args {
     tasks: usize,
     #[arg(long, default_value = "benches/results")]
     results_dir: String,
+    /// Abort the drain if it takes longer than this — safety net so a
+    /// worker failure (or a stuck claim) fails fast instead of hanging
+    /// the CI loop.
+    #[arg(long, default_value_t = 300)]
+    deadline_secs: u64,
 }
 
 /// 4 KiB payload, serialized as JSON by apalis's default codec.
@@ -172,18 +177,37 @@ async fn main() -> Result<()> {
 
     let drained_watch = drained.clone();
     let shutdown_tx_driver = shutdown_tx.clone();
+    let deadline = Instant::now() + Duration::from_secs(args.deadline_secs);
     let driver = async move {
         loop {
-            if drained_watch.load(Ordering::Relaxed) >= target {
+            let got = drained_watch.load(Ordering::Relaxed);
+            if got >= target {
                 let _ = shutdown_tx_driver.send(());
-                return;
+                return Ok::<(), anyhow::Error>(());
+            }
+            if Instant::now() >= deadline {
+                let _ = shutdown_tx_driver.send(());
+                anyhow::bail!(
+                    "deadline exceeded: {}/{} drained in {}s",
+                    got,
+                    target,
+                    args.deadline_secs
+                );
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
 
     let workers_joined = futures::future::join_all(worker_futs);
-    let (_driver_res, _worker_res) = tokio::join!(driver, workers_joined);
+    let (driver_res, worker_res) = tokio::join!(driver, workers_joined);
+    driver_res?;
+    // Surface any worker failure — ignoring them would silently
+    // mask stuck claims or connection drops.
+    for (wi, res) in worker_res.into_iter().enumerate() {
+        if let Err(e) = res {
+            anyhow::bail!("worker {wi} run_until returned error: {e:?}");
+        }
+    }
     let wall = drain_start.elapsed();
     let lat = latencies.lock().await.clone();
     let throughput = args.tasks as f64 / wall.as_secs_f64();

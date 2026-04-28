@@ -290,6 +290,15 @@ async fn run_sample(
         Ok::<Duration, anyhow::Error>(wall)
     };
 
-    let (driver_res, _worker_res) = tokio::join!(driver, worker_fut);
+    let (driver_res, worker_res) = tokio::join!(driver, worker_fut);
+    // Surface any worker failure — if a worker bails early the
+    // counter-poll driver might already have succeeded, and silently
+    // dropping the error would let a degraded sample slip into the
+    // mean_wall. Re-report whichever side failed first.
+    for (wi, res) in worker_res.into_iter().enumerate() {
+        if let Err(e) = res {
+            anyhow::bail!("worker {wi} run_until returned error: {e:?}");
+        }
+    }
     driver_res
 }
