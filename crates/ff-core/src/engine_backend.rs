@@ -248,9 +248,16 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// resume condition.
     async fn observe_signals(&self, handle: &Handle) -> Result<Vec<ResumeSignal>, EngineError>;
 
-    /// Consume a reclaim grant to mint a resumed-kind handle. Returns
+    /// Consume a resume grant (via [`ResumeToken`]) to mint a
+    /// resumed-kind handle. Routes to `ff_claim_resumed_execution` on
+    /// Valkey / the epoch-bump reconciler on PG/SQLite. Returns
     /// `Ok(None)` when the grant's target execution is no longer
     /// resumable (already reclaimed, terminal, etc.).
+    ///
+    /// **Naming history (RFC-024).** The method name + token name
+    /// historically said "reclaim" but the semantic has always been
+    /// resume-after-suspend. The token type is now `ResumeToken`; a
+    /// follow-up PR renames this method to `claim_from_resume_grant`.
     async fn claim_from_reclaim(&self, token: ResumeToken) -> Result<Option<Handle>, EngineError>;
 
     // Round-5 amendment: lease-releasing peers of `suspend`.

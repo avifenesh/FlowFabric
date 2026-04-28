@@ -851,9 +851,10 @@ impl UsageDimensions {
 /// **Naming history (RFC-024).** This type was historically called
 /// `ReclaimToken`. Its semantic is resume-after-suspend (it wraps a
 /// `ResumeGrant` and feeds `ff_claim_resumed_execution`), so
-/// RFC-024 Rev 2 renames it. A deprecated type alias
+/// RFC-024 Rev 2 renames it. A transitional compatibility alias
 /// `ReclaimToken = ResumeToken` is retained for one release to ease
-/// consumer migration.
+/// consumer migration (no `#[deprecated]` marker — see the alias
+/// doc below for the rationale).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResumeToken {

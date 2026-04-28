@@ -158,10 +158,12 @@ impl ClaimGrant {
 /// `ReclaimGrant`, but its semantic has always been resume-after-
 /// suspend (the routing FCALL is `ff_claim_resumed_execution`, not
 /// `ff_reclaim_execution`). RFC-024 Rev 2 renames the type to
-/// `ResumeGrant` — the name now matches the semantic. A deprecated
-/// type alias `ReclaimGrant = ResumeGrant` is retained for one
-/// release to give consumers a `cargo fix`-compatible migration;
-/// the new lease-reclaim path uses a distinct (future) type.
+/// `ResumeGrant` — the name now matches the semantic. A transitional
+/// compatibility alias `ReclaimGrant = ResumeGrant` is retained for
+/// one release to give consumers a `cargo fix`-compatible migration
+/// (no `#[deprecated]` marker — see the alias doc below for the
+/// rationale); the new lease-reclaim path uses a distinct (future)
+/// type.
 ///
 /// Mirrors [`ClaimGrant`] for the resume path. Differences:
 ///

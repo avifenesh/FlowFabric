@@ -8,9 +8,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **RFC-024 PR-A — `ff-core` resume-path rename + `HandleKind::Reclaimed` variant.**
-  First impl PR of the RFC-024 series (wires `ff_reclaim_execution` +
-  `ff_issue_reclaim_grant` to the consumer surface). Scope is
-  ff-core-only; no backend / SDK / server code touched.
+  First impl PR of the RFC-024 series (the series as a whole wires
+  `ff_reclaim_execution` + `ff_issue_reclaim_grant` to the consumer
+  surface; this PR ships only the type renames + additive
+  `HandleKind::Reclaimed` variant — no new trait methods, no backend
+  wiring, no SDK endpoint). Scope is ff-core-only; no backend / SDK
+  / server code touched.
   - `crates/ff-core/src/contracts/mod.rs` — `ReclaimGrant` struct
     renamed to `ResumeGrant` (the semantic has always been resume-
     after-suspend; the routing FCALL is `ff_claim_resumed_execution`).
