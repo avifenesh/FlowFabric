@@ -42,14 +42,14 @@ fn worker_caps_digest(csv: &str) -> String {
 /// share one wire-level type without a cross-dep between them.
 pub use ff_core::contracts::ClaimGrant;
 
-/// A reclaim grant for a resumed (attempt_interrupted) execution.
+/// A resume grant for a resumed (attempt_interrupted) execution.
 ///
-/// Re-export of [`ff_core::contracts::ReclaimGrant`] for symmetry
+/// Re-export of [`ff_core::contracts::ResumeGrant`] for symmetry
 /// with [`ClaimGrant`]. `ff-scheduler` will be the canonical
 /// producer once the Batch-C reclaim scanner lands; today only
 /// test fixtures construct this type. Consumed by
-/// `FlowFabricWorker::claim_from_reclaim_grant`.
-pub use ff_core::contracts::ReclaimGrant;
+/// `FlowFabricWorker::claim_from_resume_grant`.
+pub use ff_core::contracts::ResumeGrant;
 
 /// Budget check result from a cross-partition budget read.
 #[derive(Debug)]
@@ -800,12 +800,12 @@ impl Scheduler {
                         elapsed_ms = call_start.elapsed().as_millis() as u64,
                         "scheduler: claim call completed (hit)"
                     );
-                    return Ok(Some(ClaimGrant {
-                        execution_id: eid,
-                        partition_key: ff_core::partition::PartitionKey::from(&partition),
-                        grant_key: grant_key.clone(),
-                        expires_at_ms: now_ms + grant_ttl_ms,
-                    }));
+                    return Ok(Some(ClaimGrant::new(
+                        eid,
+                        ff_core::partition::PartitionKey::from(&partition),
+                        grant_key.clone(),
+                        now_ms + grant_ttl_ms,
+                    )));
                 }
                 Err(script_err) => {
                     if matches!(script_err, ScriptError::CapabilityMismatch(_)) {

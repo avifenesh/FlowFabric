@@ -18,7 +18,7 @@ use ff_core::backend::PrepareOutcome;
 use ff_core::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy, FailOutcome,
     FailureClass, FailureReason, Frame, FrameKind, Handle, HandleKind, LeaseRenewal, PatchKind,
-    PendingWaitpoint, ReclaimToken, ResumeSignal, SUMMARY_NULL_SENTINEL, StreamMode,
+    PendingWaitpoint, ResumeToken, ResumeSignal, SUMMARY_NULL_SENTINEL, StreamMode,
     UsageDimensions,
 };
 #[cfg(feature = "streaming")]
@@ -1371,12 +1371,12 @@ async fn read_summary_impl(
     )))
 }
 
-// ── claim_from_reclaim ────────────────────────────────────────────────
+// ── claim_from_resume_grant ────────────────────────────────────────────────
 
 async fn claim_from_reclaim_impl(
     pool: &SqlitePool,
     pubsub: &PubSub,
-    token: &ReclaimToken,
+    token: &ResumeToken,
 ) -> Result<Option<Handle>, EngineError> {
     let eid = &token.grant.execution_id;
     let (part, exec_uuid) = split_exec_id(eid)?;
@@ -1404,7 +1404,7 @@ async fn claim_from_reclaim_inner(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
     part: i64,
     exec_uuid: Uuid,
-    token: &ReclaimToken,
+    token: &ResumeToken,
 ) -> Result<Option<(Handle, Vec<PendingEmit>)>, EngineError> {
     // Latest attempt under the partition/exec. Mirror of PG at
     // `ff-backend-postgres/src/attempt.rs:294-308`.
@@ -2614,7 +2614,7 @@ impl EngineBackend for SqliteBackend {
         retry_serializable(|| crate::suspend_ops::observe_signals_impl(pool, handle)).await
     }
 
-    async fn claim_from_reclaim(&self, token: ReclaimToken) -> Result<Option<Handle>, EngineError> {
+    async fn claim_from_resume_grant(&self, token: ResumeToken) -> Result<Option<Handle>, EngineError> {
         let pool = &self.inner.pool;
         let pubsub = &self.inner.pubsub;
         retry_serializable(|| claim_from_reclaim_impl(pool, pubsub, &token)).await

@@ -1,6 +1,6 @@
 //! Attempt trait-method family — Postgres implementation.
 //!
-//! **RFC-v0.7 Wave 4b.** Bodies for `claim`, `claim_from_reclaim`,
+//! **RFC-v0.7 Wave 4b.** Bodies for `claim`, `claim_from_resume_grant`,
 //! `renew`, `progress`, `complete`, `fail`, `delay`, `wait_children`.
 //!
 //! # Fence-triple invariants (RFC-003)
@@ -35,7 +35,7 @@
 
 use ff_core::backend::{
     BackendTag, CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason, Handle,
-    HandleKind, LeaseRenewal, ReclaimToken,
+    HandleKind, LeaseRenewal, ResumeToken,
 };
 use ff_core::caps::{matches as caps_matches, CapabilityRequirement};
 use ff_core::engine_error::{ContentionKind, EngineError};
@@ -293,11 +293,11 @@ async fn try_claim_in_partition(
     Ok(Some(mint_handle(payload, HandleKind::Fresh)))
 }
 
-// ── claim_from_reclaim ──────────────────────────────────────────────────
+// ── claim_from_resume_grant ──────────────────────────────────────────────────
 
-pub(crate) async fn claim_from_reclaim(
+pub(crate) async fn claim_from_resume_grant(
     pool: &PgPool,
-    token: ReclaimToken,
+    token: ResumeToken,
 ) -> Result<Option<Handle>, EngineError> {
     let eid = &token.grant.execution_id;
     let (part, exec_uuid) = split_exec_id(eid)?;

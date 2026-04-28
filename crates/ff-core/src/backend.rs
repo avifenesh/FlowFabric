@@ -102,11 +102,11 @@ impl BackendTag {
 pub enum HandleKind {
     /// Fresh claim — returned by `claim` / `claim_from_grant`.
     Fresh,
-    /// Resumed from resume grant — returned by `claim_from_reclaim`
-    /// (renames to `claim_from_resume_grant` per RFC-024).
+    /// Resumed from resume grant — returned by `claim_from_resume_grant`
+    /// (renamed from `claim_from_reclaim` per RFC-024 PR-B+C).
     Resumed,
     /// Suspended — returned by `suspend`. Terminal for the lease;
-    /// resumption mints a new Handle via `claim_from_reclaim`.
+    /// resumption mints a new Handle via `claim_from_resume_grant`.
     Suspended,
     /// Reclaimed from a lease-reclaim grant — returned by the new
     /// `reclaim_execution` trait method (RFC-024). Distinct from
@@ -141,7 +141,7 @@ impl HandleOpaque {
 }
 
 /// Opaque attempt cookie held by the worker for the duration of an
-/// attempt. Produced by `claim` / `claim_from_reclaim` / `suspend`;
+/// attempt. Produced by `claim` / `claim_from_resume_grant` / `suspend`;
 /// borrowed by every op (renew, progress, append_frame, complete, fail,
 /// cancel, suspend, delay, wait_children, observe_signals, report_usage).
 ///
@@ -157,7 +157,7 @@ pub struct Handle {
 
 impl Handle {
     /// Construct a new Handle. Called by backend impls only; consumer
-    /// code receives Handles from `claim` / `suspend` / `claim_from_reclaim`.
+    /// code receives Handles from `claim` / `suspend` / `claim_from_resume_grant`.
     pub fn new(backend: BackendTag, kind: HandleKind, opaque: HandleOpaque) -> Self {
         Self {
             backend,
@@ -840,8 +840,8 @@ impl UsageDimensions {
 // ── §3.3.0 Resume / lease types ────────────────────────────────────────
 
 /// Opaque cookie returned by the reclaim scanner; consumed by
-/// `claim_from_reclaim` (renames to `claim_from_resume_grant` per
-/// RFC-024) to mint a resumed Handle.
+/// [`crate::engine_backend::EngineBackend::claim_from_resume_grant`]
+/// to mint a resumed Handle.
 ///
 /// Wraps [`ResumeGrant`] today (the scanner's existing product).
 /// Kept as a newtype so trait signatures name the resume-bound role
@@ -851,17 +851,17 @@ impl UsageDimensions {
 /// **Naming history (RFC-024).** This type was historically called
 /// `ReclaimToken`. Its semantic is resume-after-suspend (it wraps a
 /// `ResumeGrant` and feeds `ff_claim_resumed_execution`), so
-/// RFC-024 Rev 2 renames it. A transitional compatibility alias
-/// `ReclaimToken = ResumeToken` is retained for one release to ease
-/// consumer migration (no `#[deprecated]` marker — see the alias
-/// doc below for the rationale).
+/// RFC-024 Rev 2 renamed it to `ResumeToken`. The transitional
+/// `ReclaimToken` alias lived for one PR and was dropped in PR-B+C;
+/// downstream call sites migrate to `ResumeToken`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResumeToken {
     pub grant: ResumeGrant,
     /// Worker identity that will claim the resumed execution.
     /// Wave 2 additive extension — mirrors the `ClaimPolicy`
-    /// shape since `claim_from_reclaim` does not take a `ClaimPolicy`.
+    /// shape since `claim_from_resume_grant` does not take a
+    /// `ClaimPolicy`.
     pub worker_id: WorkerId,
     /// Worker instance identity.
     pub worker_instance_id: WorkerInstanceId,
@@ -884,15 +884,6 @@ impl ResumeToken {
         }
     }
 }
-
-/// Transitional alias for [`ResumeToken`].
-///
-/// Retained for compile-time compatibility across the RFC-024 PR
-/// series. A follow-up PR rewrites downstream call sites to
-/// `ResumeToken` and removes this alias. No `#[deprecated]` marker
-/// here because workspace clippy runs with `-D warnings` and the
-/// downstream rename sweep ships separately.
-pub type ReclaimToken = ResumeToken;
 
 /// Result of a successful `renew` call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

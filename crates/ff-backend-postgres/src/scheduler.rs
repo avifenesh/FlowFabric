@@ -286,12 +286,12 @@ impl PostgresScheduler {
                 detail: format!("scheduler: reassembling exec id: {e}"),
             }
         })?;
-        Ok(Some(ClaimGrant {
-            execution_id: eid,
-            partition_key: PartitionKey::from(&partition),
+        Ok(Some(ClaimGrant::new(
+            eid,
+            PartitionKey::from(&partition),
             grant_key,
-            expires_at_ms: expires_at_ms as u64,
-        }))
+            expires_at_ms as u64,
+        )))
     }
 }
 

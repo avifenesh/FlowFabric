@@ -236,7 +236,7 @@ async fn cancel_execution_once(
 
     // Step 4b — clear lease on the current attempt row if one was
     // active. Zeroes `worker_instance_id` + `lease_expires_at_ms` so
-    // the `lease_expiry` reconciler + `claim_from_reclaim` path see a
+    // the `lease_expiry` reconciler + `claim_from_resume_grant` path see a
     // released slot. `lease_epoch` bumps by 1 to fence any in-flight
     // RMW (same pattern as `revoke_lease`).
     if lease_active {

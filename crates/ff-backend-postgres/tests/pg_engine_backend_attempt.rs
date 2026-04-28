@@ -1,6 +1,6 @@
 //! Wave 4b attempt-family integration tests.
 //!
-//! Exercises the `claim`, `claim_from_reclaim`, `renew`, `progress`,
+//! Exercises the `claim`, `claim_from_resume_grant`, `renew`, `progress`,
 //! `complete`, `fail`, `delay`, `wait_children` trait methods against
 //! a live Postgres with the Wave-3 schema applied.
 //!
@@ -16,11 +16,11 @@
 //!  --test pg_engine_backend_attempt -- --ignored`
 
 use ff_backend_postgres::PostgresBackend;
-use ff_core::backend::ReclaimToken;
+use ff_core::backend::ResumeToken;
 use ff_core::backend::{
     CapabilitySet, ClaimPolicy, FailOutcome, FailureClass, FailureReason,
 };
-use ff_core::contracts::ReclaimGrant;
+use ff_core::contracts::ResumeGrant;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{ContentionKind, EngineError};
 use ff_core::partition::{PartitionConfig, PartitionKey};
@@ -223,18 +223,18 @@ async fn fail_permanent_terminal() {
     assert_eq!(completion_outbox_count(&pool, exec_uuid).await, 1);
 }
 
-fn reclaim_grant(eid: ff_core::types::ExecutionId, lane: LaneId, part_idx: u16) -> ReclaimGrant {
+fn reclaim_grant(eid: ff_core::types::ExecutionId, lane: LaneId, part_idx: u16) -> ResumeGrant {
     let pk = PartitionKey::from(&ff_core::partition::Partition {
         family: ff_core::partition::PartitionFamily::Flow,
         index: part_idx,
     });
-    ReclaimGrant {
-        execution_id: eid,
-        partition_key: pk,
-        grant_key: "gkey".into(),
-        expires_at_ms: (now_ms() as u64) + 60_000,
-        lane_id: lane,
-    }
+    ResumeGrant::new(
+        eid,
+        pk,
+        "gkey".into(),
+        (now_ms() as u64) + 60_000,
+        lane,
+    )
 }
 
 #[tokio::test]
@@ -251,9 +251,9 @@ async fn claim_from_reclaim_happy_path_bumps_epoch() {
         .bind(part).bind(exec_uuid).execute(&pool).await.unwrap();
     let eid = ff_core::types::ExecutionId::parse(&format!("{{fp:{part}}}:{exec_uuid}")).unwrap();
     let grant = reclaim_grant(eid, lane_id.clone(), part as u16);
-    let token = ReclaimToken::new(grant, WorkerId::new("w-rec"), WorkerInstanceId::new("w-rec-1"), 30_000);
+    let token = ResumeToken::new(grant, WorkerId::new("w-rec"), WorkerInstanceId::new("w-rec-1"), 30_000);
     let (epoch_before, _) = lease_row(&pool, part, exec_uuid).await;
-    let handle = backend.claim_from_reclaim(token).await.expect("reclaim").expect("Some");
+    let handle = backend.claim_from_resume_grant(token).await.expect("reclaim").expect("Some");
     let (epoch_after, _) = lease_row(&pool, part, exec_uuid).await;
     assert!(epoch_after > epoch_before, "epoch must bump: {epoch_before} -> {epoch_after}");
     backend.renew(&handle).await.expect("renew after reclaim");
@@ -271,8 +271,8 @@ async fn claim_from_reclaim_live_lease_returns_none() {
         .await.unwrap().unwrap();
     let eid = ff_core::types::ExecutionId::parse(&format!("{{fp:{part}}}:{exec_uuid}")).unwrap();
     let grant = reclaim_grant(eid, lane_id.clone(), part as u16);
-    let token = ReclaimToken::new(grant, WorkerId::new("w-thief"), WorkerInstanceId::new("w-thief-1"), 30_000);
-    let out = backend.claim_from_reclaim(token).await.expect("call ok");
+    let token = ResumeToken::new(grant, WorkerId::new("w-thief"), WorkerInstanceId::new("w-thief-1"), 30_000);
+    let out = backend.claim_from_resume_grant(token).await.expect("call ok");
     assert!(out.is_none(), "live lease must reject reclaim");
 }
 

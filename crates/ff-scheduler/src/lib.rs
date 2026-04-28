@@ -2,4 +2,4 @@
 
 pub mod claim;
 
-pub use claim::{ClaimGrant, ReclaimGrant, Scheduler, SchedulerConfig, SchedulerError};
+pub use claim::{ClaimGrant, ResumeGrant, Scheduler, SchedulerConfig, SchedulerError};

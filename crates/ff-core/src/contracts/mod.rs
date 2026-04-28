@@ -107,6 +107,7 @@ pub enum IssueClaimGrantResult {
 /// decision. The matching field on [`ResumeGrant`] is an
 /// intentional divergence — see the note on that type.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClaimGrant {
     /// The execution that was granted.
     pub execution_id: ExecutionId,
@@ -125,6 +126,22 @@ pub struct ClaimGrant {
 }
 
 impl ClaimGrant {
+    /// Construct a fresh-claim grant. Added alongside `#[non_exhaustive]`
+    /// per RFC-024 §3.1 + `feedback_non_exhaustive_needs_constructor`.
+    pub fn new(
+        execution_id: ExecutionId,
+        partition_key: crate::partition::PartitionKey,
+        grant_key: String,
+        expires_at_ms: u64,
+    ) -> Self {
+        Self {
+            execution_id,
+            partition_key,
+            grant_key,
+            expires_at_ms,
+        }
+    }
+
     /// Parse `partition_key` into a typed
     /// [`crate::partition::Partition`]. Intended for internal
     /// consumers (scheduler emitter, SDK worker claim path) that
@@ -157,13 +174,11 @@ impl ClaimGrant {
 /// **Naming history (RFC-024).** This type was historically called
 /// `ReclaimGrant`, but its semantic has always been resume-after-
 /// suspend (the routing FCALL is `ff_claim_resumed_execution`, not
-/// `ff_reclaim_execution`). RFC-024 Rev 2 renames the type to
-/// `ResumeGrant` — the name now matches the semantic. A transitional
-/// compatibility alias `ReclaimGrant = ResumeGrant` is retained for
-/// one release to give consumers a `cargo fix`-compatible migration
-/// (no `#[deprecated]` marker — see the alias doc below for the
-/// rationale); the new lease-reclaim path uses a distinct (future)
-/// type.
+/// `ff_reclaim_execution`). RFC-024 PR-A renamed the type to
+/// `ResumeGrant` — the name now matches the semantic. RFC-024 PR-B+C
+/// dropped the transitional `ReclaimGrant = ResumeGrant` alias and
+/// introduced a distinct new [`ReclaimGrant`] for the lease-reclaim
+/// path (`reclaim_execution` / `ff_reclaim_execution`).
 ///
 /// Mirrors [`ClaimGrant`] for the resume path. Differences:
 ///
@@ -194,6 +209,7 @@ impl ClaimGrant {
 ///
 /// [`FlowFabricWorker::claim_from_resume_grant`]: https://docs.rs/ff-sdk
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResumeGrant {
     /// The execution granted for resumption.
     pub execution_id: ExecutionId,
@@ -216,6 +232,24 @@ pub struct ResumeGrant {
 }
 
 impl ResumeGrant {
+    /// Construct a resume grant. Added alongside `#[non_exhaustive]`
+    /// per RFC-024 §3.1 + `feedback_non_exhaustive_needs_constructor`.
+    pub fn new(
+        execution_id: ExecutionId,
+        partition_key: crate::partition::PartitionKey,
+        grant_key: String,
+        expires_at_ms: u64,
+        lane_id: LaneId,
+    ) -> Self {
+        Self {
+            execution_id,
+            partition_key,
+            grant_key,
+            expires_at_ms,
+            lane_id,
+        }
+    }
+
     /// Parse `partition_key` into a typed
     /// [`crate::partition::Partition`]. See [`ClaimGrant::partition`]
     /// for the alias-collapse note.
@@ -226,16 +260,70 @@ impl ResumeGrant {
     }
 }
 
-/// Transitional alias for [`ResumeGrant`].
+/// A lease-reclaim grant issued for an execution in
+/// `lease_expired_reclaimable` or `lease_revoked` state (RFC-024 §3.1).
 ///
-/// Retained for compile-time compatibility across the RFC-024 PR
-/// series. A follow-up PR rewrites downstream call sites to
-/// `ResumeGrant` and removes this alias; that same PR introduces a
-/// distinct new `ReclaimGrant` type for the lease-reclaim path
-/// (`reclaim_execution` / `ff_reclaim_execution`). No `#[deprecated]`
-/// marker on this PR because workspace clippy runs with `-D warnings`
-/// and the downstream rename sweep ships separately.
-pub type ReclaimGrant = ResumeGrant;
+/// Distinct from [`ResumeGrant`]: the reclaim grant routes to
+/// `ff_reclaim_execution` (Valkey) / the new-attempt reclaim impl
+/// (PG/SQLite), which creates a NEW attempt row and bumps the
+/// execution's `lease_reclaim_count`. The resume grant, by contrast,
+/// re-uses the existing attempt under `ff_claim_resumed_execution`.
+///
+/// Carries `lane_id` for symmetry with [`ResumeGrant`] — the Lua
+/// `ff_reclaim_execution` needs the lane for key construction, and
+/// the consuming worker would otherwise pay a round-trip to recover
+/// it from `exec_core`.
+///
+/// Backend impl bodies ship under PR-D (PG) / PR-E (SQLite) / PR-F
+/// (Valkey). This PR lands only the type + trait surface; default
+/// [`crate::engine_backend::EngineBackend::issue_reclaim_grant`] and
+/// [`crate::engine_backend::EngineBackend::reclaim_execution`] return
+/// [`crate::engine_error::EngineError::Unavailable`] until each
+/// backend PR wires its real body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReclaimGrant {
+    /// The execution granted for lease-reclaim.
+    pub execution_id: ExecutionId,
+    /// Opaque partition handle for this execution's hash-tag slot.
+    pub partition_key: crate::partition::PartitionKey,
+    /// Backend-scoped grant key (Valkey key / PG+SQLite
+    /// `ff_claim_grant.grant_id`).
+    pub grant_key: String,
+    /// Monotonic ms when the grant expires; unconsumed grants vanish.
+    pub expires_at_ms: u64,
+    /// Lane the execution belongs to — needed by
+    /// `ff_reclaim_execution` for `KEYS[*]` construction.
+    pub lane_id: LaneId,
+}
+
+impl ReclaimGrant {
+    /// Construct a reclaim grant. Added alongside `#[non_exhaustive]`
+    /// per RFC-024 §3.1 + `feedback_non_exhaustive_needs_constructor`.
+    pub fn new(
+        execution_id: ExecutionId,
+        partition_key: crate::partition::PartitionKey,
+        grant_key: String,
+        expires_at_ms: u64,
+        lane_id: LaneId,
+    ) -> Self {
+        Self {
+            execution_id,
+            partition_key,
+            grant_key,
+            expires_at_ms,
+            lane_id,
+        }
+    }
+
+    /// Parse `partition_key` into a typed
+    /// [`crate::partition::Partition`].
+    pub fn partition(
+        &self,
+    ) -> Result<crate::partition::Partition, crate::partition::PartitionKeyParseError> {
+        self.partition_key.parse()
+    }
+}
 
 // ─── claim_execution ───
 
@@ -531,6 +619,7 @@ pub enum FailExecutionResult {
 // ─── issue_reclaim_grant ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IssueReclaimGrantArgs {
     pub execution_id: ExecutionId,
     pub worker_id: WorkerId,
@@ -543,11 +632,49 @@ pub struct IssueReclaimGrantArgs {
     pub route_snapshot_json: Option<String>,
     #[serde(default)]
     pub admission_summary: Option<String>,
+    /// Worker capabilities (parity with `IssueClaimGrantArgs`). The
+    /// Lua primitive `ff_issue_reclaim_grant` reads these at ARGV[9].
+    /// Populated by the SDK admin path from the registered worker's
+    /// `WorkerRegistration::capabilities` per RFC-024 §3.2 (B-2).
+    #[serde(default)]
+    pub worker_capabilities: BTreeSet<String>,
     /// Caller-side timestamp for bookkeeping. NOT passed to the Lua FCALL —
     /// ff_issue_reclaim_grant uses `redis.call("TIME")` for grant_expires_at
     /// (same as ff_issue_claim_grant). Kept for contract symmetry with
     /// IssueClaimGrantArgs and scheduler audit logging.
     pub now: TimestampMs,
+}
+
+impl IssueReclaimGrantArgs {
+    /// Construct an `IssueReclaimGrantArgs`. Added alongside
+    /// `#[non_exhaustive]` per RFC-024 §3.2 +
+    /// `feedback_non_exhaustive_needs_constructor`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        lane_id: LaneId,
+        capability_hash: Option<String>,
+        grant_ttl_ms: u64,
+        route_snapshot_json: Option<String>,
+        admission_summary: Option<String>,
+        worker_capabilities: BTreeSet<String>,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            execution_id,
+            worker_id,
+            worker_instance_id,
+            lane_id,
+            capability_hash,
+            grant_ttl_ms,
+            route_snapshot_json,
+            admission_summary,
+            worker_capabilities,
+            now,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -556,9 +683,35 @@ pub enum IssueReclaimGrantResult {
     Granted { expires_at_ms: TimestampMs },
 }
 
+/// Typed outcome of [`crate::engine_backend::EngineBackend::issue_reclaim_grant`]
+/// (RFC-024 §3.2).
+///
+/// Construction surface: backends produce variants; consumers match
+/// on variants. No `::new()` — variants ARE the surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IssueReclaimGrantOutcome {
+    /// Grant issued — hand the carried [`ReclaimGrant`] to
+    /// [`crate::engine_backend::EngineBackend::reclaim_execution`].
+    Granted(ReclaimGrant),
+    /// Execution is not in a reclaimable state (not
+    /// `lease_expired_reclaimable` / `lease_revoked`).
+    NotReclaimable {
+        execution_id: ExecutionId,
+        detail: String,
+    },
+    /// `max_reclaim_count` exceeded; execution transitioned to
+    /// terminal_failed by the backend primitive.
+    ReclaimCapExceeded {
+        execution_id: ExecutionId,
+        reclaim_count: u32,
+    },
+}
+
 // ─── reclaim_execution ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReclaimExecutionArgs {
     pub execution_id: ExecutionId,
     pub worker_id: WorkerId,
@@ -572,17 +725,78 @@ pub struct ReclaimExecutionArgs {
     /// JSON-encoded attempt policy for the reclaim attempt.
     #[serde(default)]
     pub attempt_policy_json: String,
-    /// Maximum reclaim count before terminal failure. Default: 100.
-    #[serde(default = "default_max_reclaim_count")]
-    pub max_reclaim_count: u32,
+    /// Maximum reclaim count before terminal failure. `None` ⇒ backend
+    /// applies the Rust-surface default of 1000 per RFC-024 §4.6. The
+    /// Lua fallback remains 100 for pre-RFC ARGV-omitted call sites;
+    /// the two-default coexistence is explicit by design.
+    #[serde(default)]
+    pub max_reclaim_count: Option<u32>,
     /// Old worker instance (for old_worker_leases key construction).
     pub old_worker_instance_id: WorkerInstanceId,
     /// Current attempt index (for old_attempt/old_stream_meta key construction).
     pub current_attempt_index: AttemptIndex,
 }
 
-fn default_max_reclaim_count() -> u32 {
-    100
+impl ReclaimExecutionArgs {
+    /// Construct a `ReclaimExecutionArgs`. Added alongside
+    /// `#[non_exhaustive]` per RFC-024 §3.2 +
+    /// `feedback_non_exhaustive_needs_constructor`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        lane_id: LaneId,
+        capability_hash: Option<String>,
+        lease_id: LeaseId,
+        lease_ttl_ms: u64,
+        attempt_id: AttemptId,
+        attempt_policy_json: String,
+        max_reclaim_count: Option<u32>,
+        old_worker_instance_id: WorkerInstanceId,
+        current_attempt_index: AttemptIndex,
+    ) -> Self {
+        Self {
+            execution_id,
+            worker_id,
+            worker_instance_id,
+            lane_id,
+            capability_hash,
+            lease_id,
+            lease_ttl_ms,
+            attempt_id,
+            attempt_policy_json,
+            max_reclaim_count,
+            old_worker_instance_id,
+            current_attempt_index,
+        }
+    }
+}
+
+/// Typed outcome of [`crate::engine_backend::EngineBackend::reclaim_execution`]
+/// (RFC-024 §3.2).
+///
+/// Distinct from the wire-level [`ReclaimExecutionResult`]; this enum
+/// is the trait-surface shape consumers match on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReclaimExecutionOutcome {
+    /// Execution reclaimed — carries the new-attempt
+    /// [`crate::backend::Handle`] (kind = `Reclaimed`).
+    Claimed(crate::backend::Handle),
+    /// Execution is not in a reclaimable state.
+    NotReclaimable {
+        execution_id: ExecutionId,
+        detail: String,
+    },
+    /// `max_reclaim_count` exceeded; execution transitioned to
+    /// terminal_failed.
+    ReclaimCapExceeded {
+        execution_id: ExecutionId,
+        reclaim_count: u32,
+    },
+    /// The supplied grant was not found / already consumed / expired.
+    GrantNotFound { execution_id: ExecutionId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

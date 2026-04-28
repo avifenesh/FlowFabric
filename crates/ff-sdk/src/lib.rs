@@ -59,21 +59,21 @@
 //! * [`FlowFabricWorker::claim_from_grant`] — fresh claims. Use
 //!   `ff_scheduler::Scheduler::claim_for_worker` to obtain the
 //!   [`ClaimGrant`], then hand it to the SDK.
-//! * [`FlowFabricWorker::claim_from_reclaim_grant`] — resumed claims
+//! * [`FlowFabricWorker::claim_from_resume_grant`] — resumed claims
 //!   for an `attempt_interrupted` execution. Wraps a
-//!   [`ReclaimGrant`].
+//!   [`ResumeGrant`].
 //!
 //! `claim_next` bypasses budget and quota admission control; the
 //! grant-based path does not. See each method's rustdoc for the
 //! exact migration recipe.
 //!
-//! `ClaimGrant` / `ReclaimGrant` (and the `ClaimPolicy` /
-//! `ReclaimToken` wire types on the scheduler-owner side) are
-//! re-exported from `ff-sdk` (#283) so consumers do not need a
-//! direct `ff-scheduler` dep just to type these signatures.
+//! `ClaimGrant` / `ResumeGrant` / `ReclaimGrant` (and the
+//! `ClaimPolicy` / `ResumeToken` wire types on the scheduler-owner
+//! side) are re-exported from `ff-sdk` (#283) so consumers do not need
+//! a direct `ff-scheduler` dep just to type these signatures.
 //!
 //! [`ClaimGrant`]: crate::ClaimGrant
-//! [`ReclaimGrant`]: crate::ReclaimGrant
+//! [`ResumeGrant`]: crate::ResumeGrant
 
 #[cfg(feature = "valkey-default")]
 pub mod admin;
@@ -149,13 +149,13 @@ pub use ff_core::contracts::{
     SuspensionRequester, TimeoutBehavior, WaitpointBinding,
 };
 // #283 — Claim-flow wire types. Consumers typing `claim_from_grant` /
-// `claim_from_reclaim_grant` signatures (or wrapping
-// `EngineBackend::claim_for_worker`) can name these as
+// `claim_from_resume_grant` / `claim_from_reclaim_grant` signatures (or
+// wrapping `EngineBackend::claim_for_worker`) can name these as
 // `ff_sdk::ClaimGrant` etc. without pinning `ff-scheduler` directly.
 // `Scheduler` itself is intentionally not re-exported: implementing a
 // scheduler is specialized and stays behind the `ff-scheduler` dep.
-pub use ff_core::backend::{ClaimPolicy, ReclaimToken};
-pub use ff_core::contracts::{ClaimGrant, ReclaimGrant};
+pub use ff_core::backend::{ClaimPolicy, ResumeToken};
+pub use ff_core::contracts::{ClaimGrant, ReclaimGrant, ResumeGrant};
 // RFC-023 Phase 1a (§4.4 item 10): re-export always reachable. The
 // Valkey-specific methods (`connect`, `claim_*`, `deliver_signal`)
 // are item-level cfg-gated; under sqlite-only features the type
@@ -214,7 +214,7 @@ pub enum SdkError {
     /// [`FlowFabricWorker::claim_from_grant`] and
     /// [`FlowFabricWorker::claim_from_reclaim_grant`] when the
     /// concurrency semaphore is saturated. Distinct from `Ok(None)`:
-    /// a `ClaimGrant`/`ReclaimGrant` represents real work already
+    /// a `ClaimGrant`/`ResumeGrant` represents real work already
     /// selected by the scheduler, so silently dropping it would waste
     /// the grant and let the grant TTL elapse. Surfacing the
     /// saturation lets the caller release the grant (or wait +

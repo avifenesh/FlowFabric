@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use ff_core::backend::{
     AppendFrameOutcome, BackendConfig, CancelFlowPolicy, CancelFlowWait, CapabilitySet,
     ClaimPolicy, FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal,
-    PendingWaitpoint, ReclaimToken, ResumeSignal, SummaryDocument, TailVisibility,
+    PendingWaitpoint, ResumeToken, ResumeSignal, SummaryDocument, TailVisibility,
     UsageDimensions,
 };
 #[cfg(feature = "core")]
@@ -532,12 +532,12 @@ impl EngineBackend for PostgresBackend {
         suspend_ops::observe_signals_impl(&self.pool, handle).await
     }
 
-    #[tracing::instrument(name = "pg.claim_from_reclaim", skip_all)]
-    async fn claim_from_reclaim(
+    #[tracing::instrument(name = "pg.claim_from_resume_grant", skip_all)]
+    async fn claim_from_resume_grant(
         &self,
-        token: ReclaimToken,
+        token: ResumeToken,
     ) -> Result<Option<Handle>, EngineError> {
-        attempt::claim_from_reclaim(&self.pool, token).await
+        attempt::claim_from_resume_grant(&self.pool, token).await
     }
 
     #[tracing::instrument(name = "pg.delay", skip_all)]

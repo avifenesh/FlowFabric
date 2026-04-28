@@ -961,7 +961,7 @@ impl ClaimedTask {
             SuspendOutcome::Suspended { details, handle: new_handle } => {
                 // Renewal is stopped only AFTER a successful Suspended
                 // outcome. The suspended-kind handle is what the caller
-                // will later hand to `observe_signals` / `claim_from_reclaim`.
+                // will later hand to `observe_signals` / `claim_from_resume_grant`.
                 self.stop_renewal();
                 Ok(TrySuspendOutcome::Suspended(SuspendedHandle {
                     handle: new_handle,
