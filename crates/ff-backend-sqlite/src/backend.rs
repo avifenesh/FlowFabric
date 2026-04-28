@@ -2738,6 +2738,13 @@ impl EngineBackend for SqliteBackend {
         crate::reads::read_current_attempt_index_impl(&self.inner.pool, execution_id).await
     }
 
+    async fn read_total_attempt_count(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ff_core::types::AttemptIndex, EngineError> {
+        crate::reads::read_total_attempt_count_impl(&self.inner.pool, execution_id).await
+    }
+
     async fn describe_flow(&self, _id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError> {
         unavailable("sqlite.describe_flow")
     }

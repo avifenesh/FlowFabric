@@ -22,6 +22,7 @@
 
 use crate::contracts::ResumeGrant;
 use crate::types::{TimestampMs, WaitpointToken, WorkerId, WorkerInstanceId};
+use serde::{Deserialize, Serialize};
 
 // DX (HHH v0.3.4 re-smoke): `Namespace` lives in `ff_core::types` but
 // is used on `BackendConfig` + `ScannerFilter` (both defined in this
@@ -52,7 +53,7 @@ use std::time::Duration;
 /// `#[non_exhaustive]`: new backend variants land additively as impls
 /// come online (e.g. `Postgres` in Stage 2, hypothetical third backends
 /// later).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum BackendTag {
     /// The Valkey FCALL-backed implementation.
@@ -97,7 +98,7 @@ impl BackendTag {
 ///
 /// Replaces round-1's compile-time `Handle` / `ResumeHandle` /
 /// `SuspendToken` type split (RFC-012 §4.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HandleKind {
     /// Fresh claim — returned by `claim` / `claim_from_grant`.
@@ -125,7 +126,7 @@ pub enum HandleKind {
 ///
 /// `Box<[u8]>` chosen over `bytes::Bytes` (RFC-012 §7.17) to avoid a
 /// public-type transitive dep on the `bytes` crate.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HandleOpaque(Box<[u8]>);
 
 impl HandleOpaque {
@@ -147,7 +148,7 @@ impl HandleOpaque {
 ///
 /// See RFC-012 §4.1 for the round-4 design — terminal ops borrow rather
 /// than consume so callers can retry after a transport error.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Handle {
     pub backend: BackendTag,
@@ -165,6 +166,28 @@ impl Handle {
             opaque,
         }
     }
+}
+
+/// Serde default for a `HandleKind::Fresh` stub handle on
+/// [`crate::contracts::ClaimedExecution::handle`]. Used when
+/// deserializing a legacy payload that predates the v0.12 PR-5.5 field
+/// addition; live backends populate the field directly.
+pub fn stub_handle_fresh() -> Handle {
+    Handle::new(
+        BackendTag::Valkey,
+        HandleKind::Fresh,
+        HandleOpaque::new(Box::new([])),
+    )
+}
+
+/// Serde default for a `HandleKind::Resumed` stub handle on
+/// [`crate::contracts::ClaimedResumedExecution::handle`].
+pub fn stub_handle_resumed() -> Handle {
+    Handle::new(
+        BackendTag::Valkey,
+        HandleKind::Resumed,
+        HandleOpaque::new(Box::new([])),
+    )
 }
 
 // ── §3.3.0 Claim / lifecycle supporting types ──────────────────────────

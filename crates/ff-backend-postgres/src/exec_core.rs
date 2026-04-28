@@ -414,6 +414,57 @@ pub(super) async fn read_current_attempt_index_impl(
     Ok(attempt_index)
 }
 
+// ─── read_total_attempt_count ────────────────────────────────────
+
+/// Point-read of `total_attempt_count` from `ff_exec_core.raw_fields`
+/// JSONB. Used by the SDK worker's `claim_from_grant` path to compute
+/// the next fresh attempt index (retry-path fix, v0.12 PR-5.5). The
+/// field is seeded to `"0"` by `create_execution_impl` and bumped by
+/// the same SQL transactions that advance the attempt row — it lives
+/// in the JSON bag rather than a column, matching the SQLite sibling.
+///
+/// Missing row → `InvalidInput`. Missing/non-numeric field → `0` (the
+/// FCALL surface handles the loud error case; this pre-read is
+/// best-effort).
+pub(super) async fn read_total_attempt_count_impl(
+    pool: &PgPool,
+    _partition_config: &PartitionConfig,
+    id: &ExecutionId,
+) -> Result<ff_core::types::AttemptIndex, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let row = sqlx::query(
+        r#"
+        SELECT raw_fields ->> 'total_attempt_count' AS total_attempt_count
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "read_total_attempt_count: execution not found: {id}"
+            ),
+        });
+    };
+    let raw: Option<String> = row
+        .try_get("total_attempt_count")
+        .map_err(map_sqlx_error)?;
+    let count = raw
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    Ok(ff_core::types::AttemptIndex::new(count))
+}
+
 // ─── list_executions ─────────────────────────────────────────────
 
 pub(super) async fn list_executions_impl(
