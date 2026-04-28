@@ -4393,36 +4393,6 @@ async fn reclaim_execution_impl(
         lease_id = %args.lease_id,
     )
 )]
-/// Grant-consumer path for [`EngineBackend::claim_execution`].
-///
-/// Fires exactly one `ff_claim_execution` FCALL against the
-/// execution's partition, consuming the scheduler-issued claim grant
-/// and minting the attempt row. Key/ARGV shape is identical to what
-/// `claim_impl` (the scheduler-bypass scanner) fires post-grant and
-/// to the pre-PR-4 direct-FCALL helper on the SDK worker — this
-/// extraction preserves every observable Valkey write byte-for-byte.
-async fn claim_execution_impl(
-    client: &ferriskey::Client,
-    partition_config: &PartitionConfig,
-    args: ClaimExecutionArgs,
-) -> Result<ClaimExecutionResult, EngineError> {
-    let partition = execution_partition(&args.execution_id, partition_config);
-    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
-    let idx = IndexKeys::new(&partition);
-
-    let keys = ExecOpKeys {
-        ctx: &ctx,
-        idx: &idx,
-        lane_id: &args.lane_id,
-        worker_instance_id: &args.worker_instance_id,
-    };
-    let execution_id = args.execution_id.clone();
-    let partial = ff_claim_execution(client, &keys, &args)
-        .await
-        .map_err(EngineError::from)?;
-    Ok(partial.complete(execution_id))
-}
-
 async fn claim_resumed_execution_impl(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
@@ -4440,6 +4410,46 @@ async fn claim_resumed_execution_impl(
     };
     let execution_id = args.execution_id.clone();
     let partial = ff_claim_resumed_execution(client, &keys, &args)
+        .await
+        .map_err(EngineError::from)?;
+    Ok(partial.complete(execution_id))
+}
+
+/// Grant-consumer path for [`EngineBackend::claim_execution`].
+///
+/// Fires exactly one `ff_claim_execution` FCALL against the
+/// execution's partition, consuming the scheduler-issued claim grant
+/// and minting the attempt row. Key/ARGV shape is identical to what
+/// `claim_impl` (the scheduler-bypass scanner) fires post-grant and
+/// to the pre-PR-4 direct-FCALL helper on the SDK worker — this
+/// extraction preserves every observable Valkey write byte-for-byte.
+#[tracing::instrument(
+    name = "ff.claim_execution",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        worker_instance_id = %args.worker_instance_id,
+        lease_id = %args.lease_id,
+    )
+)]
+async fn claim_execution_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: ClaimExecutionArgs,
+) -> Result<ClaimExecutionResult, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    let keys = ExecOpKeys {
+        ctx: &ctx,
+        idx: &idx,
+        lane_id: &args.lane_id,
+        worker_instance_id: &args.worker_instance_id,
+    };
+    let execution_id = args.execution_id.clone();
+    let partial = ff_claim_execution(client, &keys, &args)
         .await
         .map_err(EngineError::from)?;
     Ok(partial.complete(execution_id))

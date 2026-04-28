@@ -892,7 +892,7 @@ impl FlowFabricWorker {
         execution_id: &ExecutionId,
         lane_id: &LaneId,
         partition: &ff_core::partition::Partition,
-        _now: TimestampMs,
+        now: TimestampMs,
     ) -> Result<ClaimedTask, SdkError> {
         // Pre-read total_attempt_count from exec_core to derive the
         // expected attempt index. The Lua uses total_attempt_count as
@@ -928,17 +928,17 @@ impl FlowFabricWorker {
             "{}".to_owned(),
             None,
             None,
-            TimestampMs::now(),
+            now,
         );
 
         // `ClaimExecutionResult` is `#[non_exhaustive]` (v0.12 PR-4)
         // so let-binding requires an explicit wildcard arm even though
-        // `Claimed` is the only variant today. Future additive variants
-        // surface as a loud `unreachable` rather than a silent miss.
+        // `Claimed` is the only variant today. A future additive variant
+        // surfaces here as a typed `ScriptError::Parse` — loud, routed
+        // through the existing SDK error path, and never silently
+        // dropped.
         let claimed = match self.backend.claim_execution(args).await? {
             ff_core::contracts::ClaimExecutionResult::Claimed(c) => c,
-            // `#[non_exhaustive]` — future additive variants surface
-            // as an explicit SDK-side rewrite rather than a silent miss.
             other => {
                 return Err(SdkError::from(ff_script::error::ScriptError::Parse {
                     fcall: "ff_claim_execution".into(),

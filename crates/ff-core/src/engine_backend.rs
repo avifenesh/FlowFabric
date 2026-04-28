@@ -693,13 +693,12 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     /// Consume a scheduler-issued claim grant to mint a fresh attempt.
     ///
-    /// The SDK's grant-consumer path — paired with
-    /// [`FlowFabricWorker::claim_from_grant`](../../ff_sdk/struct.FlowFabricWorker.html#method.claim_from_grant)
-    /// — routes through this method. The scheduler has already
-    /// validated budget / quota / capabilities and written a grant
-    /// (Valkey `claim_grant` hash / PG+SQLite `ff_claim_grant` row);
-    /// this call atomically consumes that grant and creates the
-    /// attempt row, mints `lease_id` + `lease_epoch`, and returns a
+    /// The SDK's grant-consumer path — paired with `FlowFabricWorker::claim_from_grant`
+    /// in `ff-sdk` — routes through this method. The scheduler has
+    /// already validated budget / quota / capabilities and written a
+    /// grant (Valkey `claim_grant` hash); this call atomically
+    /// consumes that grant and creates the attempt row, mints
+    /// `lease_id` + `lease_epoch`, and returns a
     /// [`ClaimExecutionResult::Claimed`] carrying the minted lease
     /// triple.
     ///
@@ -707,7 +706,7 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// used by the `direct-valkey-claim` feature) — this method
     /// assumes the grant already exists and skips capability / ZSET
     /// scanning. The Valkey impl fires exactly one `ff_claim_execution`
-    /// FCALL; the PG / SQLite impls fire one CAS transaction.
+    /// FCALL.
     ///
     /// Typed failures surface via `ScriptError` → `EngineError`:
     /// `UseClaimResumedExecution` when the attempt is actually
@@ -718,11 +717,21 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// when the execution's `required_capabilities` drifted after
     /// grant issuance.
     ///
+    /// # Backend coverage
+    ///
+    /// * **Valkey** — implemented in `ff-backend-valkey` (one
+    ///   `ff_claim_execution` FCALL).
+    /// * **Postgres / SQLite** — use the `Err(Unavailable)` default in
+    ///   this PR. Grants on PG / SQLite today flow through
+    ///   `PostgresScheduler::claim_for_worker` (a sibling struct, not
+    ///   an `EngineBackend` method); wiring the default-over-trait
+    ///   behaviour into a PG / SQLite `claim_execution` impl lands
+    ///   with a future RFC-024 grant-consumer extension.
+    ///
     /// The default impl returns [`EngineError::Unavailable`] so the
-    /// trait addition is non-breaking for backends that have no
-    /// grant-consumer path (PG / SQLite today — grants are a Valkey
-    /// concept pending RFC-024 extensions). Same precedent as
-    /// [`Self::read_current_attempt_index`] landing in v0.12 PR-3.
+    /// trait addition is non-breaking for out-of-tree backends. Same
+    /// precedent as [`Self::read_current_attempt_index`] landing in
+    /// v0.12 PR-3.
     #[cfg(feature = "core")]
     async fn claim_execution(
         &self,
