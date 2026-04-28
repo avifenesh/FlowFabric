@@ -28,7 +28,7 @@ use ff_core::contracts::{
 use ff_core::engine_error::{ContentionKind, EngineError, ValidationKind};
 use ff_core::handle_codec::{encode as encode_opaque, HandlePayload};
 use ff_core::partition::{Partition, PartitionFamily, PartitionKey};
-use ff_core::types::{AttemptId, AttemptIndex, ExecutionId, LeaseEpoch, LeaseId};
+use ff_core::types::{AttemptIndex, ExecutionId, LeaseEpoch};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
@@ -105,6 +105,45 @@ pub async fn write_claim_grant<'c>(
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_error)?;
+
+    // RFC-024 PR-D rollout dual-write — mirror the grant into the
+    // legacy `ff_exec_core.raw_fields.claim_grant` JSON blob so an
+    // older-version reader still in the rolling-deploy window can
+    // verify grants issued by the new code. The new code reads from
+    // `ff_claim_grant` exclusively; this write exists only for
+    // mixed-version read compat and is dropped in a future
+    // v0.13+ migration (0018) once the deploy window closes.
+    //
+    // Shape matches the pre-PR-D payload at `scheduler.rs:252`:
+    //   { grant_key, worker_id, worker_instance_id,
+    //     expires_at_ms, issued_at_ms, kid }
+    // `kid` is not available here (sig lives inside `grant_key`);
+    // legacy verify code only needs the 5 fields it actually reads.
+    let grant_json = serde_json::json!({
+        "grant_key": grant_key,
+        "worker_id": worker_id,
+        "worker_instance_id": worker_instance_id,
+        "expires_at_ms": expires_at_ms,
+        "issued_at_ms": issued_at_ms,
+    });
+    sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET raw_fields = jsonb_set(
+                   COALESCE(raw_fields, '{}'::jsonb),
+                   '{claim_grant}',
+                   $3::jsonb,
+                   true)
+         WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .bind(grant_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
     Ok(())
 }
 
@@ -164,10 +203,17 @@ fn split_exec_id(eid: &ExecutionId) -> Result<(i16, Uuid), EngineError> {
         kind: ValidationKind::InvalidInput,
         detail: format!("execution_id missing `}}:`: {s}"),
     })?;
-    let part: i16 = rest[..close].parse().map_err(|_| EngineError::Validation {
+    // Parse the wire-shape `u16` partition index and cast to the
+    // schema's `smallint` column type. Matches the
+    // `partition.index as i16` convention used in
+    // `budget.rs:221`/`exec_core.rs:318`. Parsing directly as `i16`
+    // would accept negatives and wrap under cast — wrong hash-tag
+    // routing on negative input.
+    let part_u: u16 = rest[..close].parse().map_err(|_| EngineError::Validation {
         kind: ValidationKind::InvalidInput,
         detail: format!("execution_id partition index not u16: {s}"),
     })?;
+    let part = part_u as i16;
     let uuid = Uuid::parse_str(&rest[close + 2..]).map_err(|_| EngineError::Validation {
         kind: ValidationKind::InvalidInput,
         detail: format!("execution_id UUID invalid: {s}"),
@@ -447,7 +493,10 @@ async fn reclaim_execution_once(
         });
     }
 
-    let next_reclaim_count = (cur_reclaim_count as u32).saturating_add(1);
+    // Column is `INTEGER NOT NULL DEFAULT 0` so the row value SHOULD
+    // always be ≥ 0. Clamp defensively anyway: a negative value would
+    // wrap under `as u32` and skip the cap check.
+    let next_reclaim_count = (cur_reclaim_count.max(0) as u32).saturating_add(1);
     if next_reclaim_count > max_reclaim_count {
         sqlx::query(
             r#"
@@ -576,11 +625,19 @@ async fn reclaim_execution_once(
 
     tx.commit().await.map_err(map_sqlx_error)?;
 
+    // RFC-024 §3.3 / §4.4: the HandlePayload carries the
+    // caller-supplied `attempt_id` + `lease_id`. Valkey PR-F round-
+    // trips these through `ff_reclaim_execution` ARGV[5] (lease_id) +
+    // ARGV[7] (attempt_id) — the Lua echoes them back in the success
+    // tuple, so the handle the Valkey surface mints embeds the
+    // caller's identifiers. Postgres has no Lua round-trip; we use
+    // the args values directly to preserve cross-backend parity +
+    // idempotency + lease fencing.
     let payload = HandlePayload::new(
         args.execution_id.clone(),
         AttemptIndex::new(u32::try_from(new_attempt_index.max(0)).unwrap_or(0)),
-        AttemptId::new(),
-        LeaseId::new(),
+        args.attempt_id.clone(),
+        args.lease_id.clone(),
         LeaseEpoch(1),
         u32::try_from(args.lease_ttl_ms.min(u32::MAX as u64)).unwrap_or(u32::MAX) as u64,
         args.lane_id.clone(),

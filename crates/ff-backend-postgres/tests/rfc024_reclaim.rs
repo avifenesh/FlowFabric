@@ -435,4 +435,144 @@ async fn scheduler_claim_grant_writes_new_table_kind_claim() {
     let row = row.expect("grant row in ff_claim_grant");
     assert_eq!(row.0, "claim");
     assert_eq!(row.1, "w-sched");
+
+    // RFC-024 PR-D rollout dual-write: the legacy JSON blob at
+    // `ff_exec_core.raw_fields.claim_grant` must ALSO be populated
+    // so an older-version reader in a rolling-deploy window can
+    // still verify grants issued by the new code.
+    let legacy_json: sqlx::types::JsonValue = sqlx::query_scalar(
+        "SELECT raw_fields->'claim_grant' FROM ff_exec_core WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        legacy_json.is_object(),
+        "legacy raw_fields.claim_grant must be populated by dual-write, got {legacy_json}"
+    );
+    assert_eq!(
+        legacy_json.get("worker_id").and_then(|v| v.as_str()),
+        Some("w-sched")
+    );
+    assert_eq!(
+        legacy_json.get("worker_instance_id").and_then(|v| v.as_str()),
+        Some("w-sched-1")
+    );
+    assert!(
+        legacy_json.get("grant_key").and_then(|v| v.as_str()).is_some(),
+        "legacy blob missing grant_key: {legacy_json}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_handle_carries_caller_supplied_ids() {
+    // F6 parity: HandlePayload inside the minted handle must embed
+    // the caller-supplied attempt_id + lease_id, not fresh IDs.
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-ids-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    let caller_attempt = AttemptId::new();
+    let caller_lease = LeaseId::new();
+    let args = ReclaimExecutionArgs::new(
+        eid.clone(),
+        WorkerId::new("w-rec"),
+        WorkerInstanceId::new("w-rec-1"),
+        lane_id.clone(),
+        None,
+        caller_lease.clone(),
+        30_000,
+        caller_attempt.clone(),
+        "{}".into(),
+        None,
+        WorkerInstanceId::new("w-orig-1"),
+        ff_core::types::AttemptIndex::new(0),
+    );
+    let outcome = backend.reclaim_execution(args).await.expect("ok");
+    let handle = match outcome {
+        ReclaimExecutionOutcome::Claimed(h) => h,
+        other => panic!("expected Claimed, got {other:?}"),
+    };
+    let decoded = ff_core::handle_codec::decode(&handle.opaque).expect("decode handle");
+    assert_eq!(
+        decoded.payload.attempt_id, caller_attempt,
+        "HandlePayload.attempt_id must echo caller-supplied value"
+    );
+    assert_eq!(
+        decoded.payload.lease_id, caller_lease,
+        "HandlePayload.lease_id must echo caller-supplied value"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_negative_reclaim_count_does_not_wrap() {
+    // F5 defensive clamp: a (hypothetical) negative
+    // `lease_reclaim_count` row must not wrap under `as u32`. The
+    // schema disallows negatives via `DEFAULT 0`, but the code
+    // clamps before cast anyway. Force a negative via direct UPDATE
+    // (bypassing the schema's intent) and confirm the clamped path
+    // still increments to 1 rather than saturating.
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-neg-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 0).await;
+    // Bypass: overwrite the count to -1 post-seed.
+    sqlx::query(
+        "UPDATE ff_exec_core SET lease_reclaim_count = -1 WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    let outcome = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", None))
+        .await
+        .expect("ok");
+    assert!(
+        matches!(outcome, ReclaimExecutionOutcome::Claimed(_)),
+        "got {outcome:?}"
+    );
+    let new_count: i32 = sqlx::query_scalar(
+        "SELECT lease_reclaim_count FROM ff_exec_core WHERE partition_key=$1 AND execution_id=$2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(new_count, 1, "clamped (-1).max(0)+1 must be 1, got {new_count}");
+}
+
+#[test]
+fn execution_id_parse_rejects_negative_partition() {
+    // F4 upstream invariant: `ExecutionId::parse` already enforces
+    // a `u16` partition index, so a negative literal never reaches
+    // `split_exec_id` in practice. The i16→u16 parse fix in
+    // `split_exec_id` is defense-in-depth + matches the Wave-9
+    // `partition.index as i16` convention; verify the upstream
+    // invariant that makes that layering sound.
+    assert!(
+        ExecutionId::parse("{fp:-1}:00000000-0000-0000-0000-000000000000").is_err(),
+        "ExecutionId::parse must reject negative partition index"
+    );
+    assert!(
+        ExecutionId::parse("{fp:0}:00000000-0000-0000-0000-000000000000").is_ok()
+    );
 }

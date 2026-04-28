@@ -18,11 +18,16 @@
 -- Additive (`backward_compatible = true`). The new table starts empty
 -- except for the backfilled JSON rows; existing schedulers / workers
 -- keep functioning because `raw_fields.claim_grant` remains readable.
--- The scheduler.rs read + write paths flip to the new table in this
--- PR, but a rolling-deploy window where the older process still reads
--- JSON is safe: grants issued by the new process write BOTH to the
--- table and — during a transition window — the legacy JSON blob
--- remains a valid fallback (§6 Backend parity).
+-- The scheduler.rs read path flips to the new table in this PR.
+--
+-- DUAL-WRITE DURING ROLLOUT: `claim_grant::write_claim_grant` writes
+-- to BOTH the new `ff_claim_grant` table AND the legacy
+-- `ff_exec_core.raw_fields.claim_grant` JSON blob. The legacy write
+-- exists solely for mixed-version read compat during a rolling
+-- deploy — old-version processes verify grants by reading the JSON
+-- and must see fresh writes. A future v0.13+ migration (0018) drops
+-- the legacy JSON write once the deploy window closes.
+-- (§6 Backend parity.)
 
 -- ============================================================
 -- Section 0 — pgcrypto (digest()) for deterministic grant_id backfill
