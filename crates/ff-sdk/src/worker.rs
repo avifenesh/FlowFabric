@@ -9,17 +9,8 @@ use std::sync::Arc;
 // `--no-default-features, features = ["sqlite"]`.
 #[cfg(feature = "valkey-default")]
 use ferriskey::Client;
-// `Value` + `IndexKeys` are only referenced by the direct-claim
-// scanner (`claim_next`) and its helpers. v0.12 PR-4 routed the
-// `claim_from_grant` hot path through the trait so the last
-// always-on use of `Value` disappeared. Keep both imports scoped to
-// `direct-valkey-claim` so the default-feature build is warning-free.
-#[cfg(feature = "direct-valkey-claim")]
-use ferriskey::Value;
 #[cfg(feature = "valkey-default")]
 use ff_core::keys::ExecKeyContext;
-#[cfg(feature = "direct-valkey-claim")]
-use ff_core::keys::IndexKeys;
 use ff_core::partition::PartitionConfig;
 #[cfg(feature = "valkey-default")]
 use ff_core::types::*;
@@ -99,17 +90,13 @@ pub struct FlowFabricWorker {
     client: Option<Client>,
     config: WorkerConfig,
     partition_config: PartitionConfig,
-    /// Sorted, deduplicated, comma-separated capabilities — computed once
-    /// from `config.capabilities` at connect time. Passed as ARGV[9] to
-    /// `ff_issue_claim_grant` on every claim. BTreeSet sorting is critical:
-    /// Lua's `ff_issue_claim_grant` relies on a stable CSV form for
-    /// reproducible logs and tests.
-    #[cfg(feature = "direct-valkey-claim")]
-    worker_capabilities_csv: String,
-    /// 8-hex FNV-1a digest of `worker_capabilities_csv`. Used in
+    /// 8-hex FNV-1a digest of the sorted capabilities CSV. Used in
     /// per-mismatch logs so the 4KB CSV never echoes on every reject
-    /// during an incident. Full CSV logged once at connect-time WARN for
-    /// cross-reference. Mirrors `ff-scheduler::claim::worker_caps_digest`.
+    /// during an incident. For [`Self::connect`]-built workers, the
+    /// full CSV is additionally logged once at connect-time WARN via
+    /// `valkey_preamble::run` for cross-reference; [`Self::connect_with`]-
+    /// built workers compute the hash without the companion CSV log.
+    /// Mirrors `ff-scheduler::claim::worker_caps_digest`.
     #[cfg(feature = "direct-valkey-claim")]
     worker_capabilities_hash: String,
     #[cfg(feature = "direct-valkey-claim")]
@@ -253,7 +240,7 @@ impl FlowFabricWorker {
         let crate::valkey_preamble::PreambleOutput {
             partition_config,
             #[cfg(feature = "direct-valkey-claim")]
-            capabilities_csv: worker_capabilities_csv,
+            capabilities_csv: _worker_capabilities_csv,
             #[cfg(feature = "direct-valkey-claim")]
             capabilities_hash: worker_capabilities_hash,
         } = crate::valkey_preamble::run(&client, &config).await?;
@@ -294,8 +281,6 @@ impl FlowFabricWorker {
             client: Some(client),
             config,
             partition_config,
-            #[cfg(feature = "direct-valkey-claim")]
-            worker_capabilities_csv,
             #[cfg(feature = "direct-valkey-claim")]
             worker_capabilities_hash,
             #[cfg(feature = "direct-valkey-claim")]
@@ -457,26 +442,22 @@ impl FlowFabricWorker {
             }
         }
         #[cfg(feature = "direct-valkey-claim")]
-        let worker_capabilities_csv: String = {
+        let worker_capabilities_hash = {
             let set: std::collections::BTreeSet<&str> = config
                 .capabilities
                 .iter()
                 .map(|s| s.as_str())
                 .filter(|s| !s.is_empty())
                 .collect();
-            set.into_iter().collect::<Vec<_>>().join(",")
+            let csv: String = set.into_iter().collect::<Vec<_>>().join(",");
+            ff_core::hash::fnv1a_xor8hex(&csv)
         };
-        #[cfg(feature = "direct-valkey-claim")]
-        let worker_capabilities_hash =
-            ff_core::hash::fnv1a_xor8hex(&worker_capabilities_csv);
 
         Ok(Self {
             #[cfg(feature = "valkey-default")]
             client: None,
             config,
             partition_config,
-            #[cfg(feature = "direct-valkey-claim")]
-            worker_capabilities_csv,
             #[cfg(feature = "direct-valkey-claim")]
             worker_capabilities_hash,
             #[cfg(feature = "direct-valkey-claim")]
@@ -612,60 +593,64 @@ impl FlowFabricWorker {
         let chunk = PARTITION_SCAN_CHUNK.min(num_partitions);
         let start = self.scan_cursor.fetch_add(chunk, Ordering::Relaxed) % num_partitions;
 
+        // Hoist the sorted/deduped capability set out of the loop — the
+        // per-partition iteration reused a fresh BTreeSet on every
+        // step pre-fix, adding O(n log n) alloc/sort to the scanner
+        // hot path on every tick. Computed once per `claim_next` call.
+        let worker_capabilities: std::collections::BTreeSet<String> = self
+            .config
+            .capabilities
+            .iter()
+            .cloned()
+            .collect();
+
         for step in 0..chunk {
             let partition_idx = ((start + step) % num_partitions) as u16;
             let partition = ff_core::partition::Partition {
                 family: ff_core::partition::PartitionFamily::Execution,
                 index: partition_idx,
             };
-            let idx = IndexKeys::new(&partition);
-            let eligible_key = idx.lane_eligible(&lane_id);
 
-            // ZRANGEBYSCORE to get the highest-priority eligible execution.
-            // Score format: -(priority * 1_000_000_000_000) + created_at_ms
-            // ZRANGEBYSCORE with "-inf" "+inf" LIMIT 0 1 gives lowest score = highest priority.
-            let result: Value = self.valkey_client()                
-                .cmd("ZRANGEBYSCORE")
-                .arg(&eligible_key)
-                .arg("-inf")
-                .arg("+inf")
-                .arg("LIMIT")
-                .arg("0")
-                .arg("1")
-                .execute()
-                .await
-                .map_err(|e| crate::backend_context(e, "ZRANGEBYSCORE failed"))?;
-
-            let execution_id_str = match extract_first_array_string(&result) {
-                Some(s) => s,
+            // v0.12 PR-5: trait-routed scanner primitive. Replaces the
+            // pre-PR-5 `ZRANGEBYSCORE` inline; the Valkey backend fires
+            // the identical command byte-for-byte (see
+            // `ff_backend_valkey::scan_eligible_executions_impl`).
+            let scan_args = ff_core::contracts::ScanEligibleArgs::new(
+                lane_id.clone(),
+                partition,
+                1,
+            );
+            let candidates = self.backend.scan_eligible_executions(scan_args).await?;
+            let execution_id = match candidates.into_iter().next() {
+                Some(id) => id,
                 None => continue, // No eligible executions on this partition
             };
 
-            let execution_id = ExecutionId::parse(&execution_id_str).map_err(|e| {
-                SdkError::from(ff_script::error::ScriptError::Parse {
-                    fcall: "claim_execution_from_eligible_set".into(),
-                    execution_id: None,
-                    message: format!("bad execution_id in eligible set: {e}"),
-                })
-            })?;
-
-            // Step 1: Issue claim grant
-            let grant_result = self
-                .issue_claim_grant(&execution_id, &lane_id, &partition, &idx)
-                .await;
+            // Step 1: Issue claim grant (v0.12 PR-5: trait-routed).
+            let grant_args = ff_core::contracts::IssueClaimGrantArgs::new(
+                execution_id.clone(),
+                lane_id.clone(),
+                self.config.worker_id.clone(),
+                self.config.worker_instance_id.clone(),
+                partition,
+                worker_capabilities.clone(),
+                5_000, // grant_ttl_ms
+                now,
+            );
+            let grant_result = self.backend.issue_claim_grant(grant_args).await;
 
             match grant_result {
-                Ok(()) => {}
-                Err(SdkError::Engine(ref boxed))
+                Ok(_) => {}
+                Err(ref boxed)
                     if matches!(
-                        **boxed,
+                        boxed,
                         crate::EngineError::Validation {
                             kind: crate::ValidationKind::CapabilityMismatch,
                             ..
                         }
                     ) =>
                 {
-                    let missing = match &**boxed {
+                    let missing = match boxed {
                         crate::EngineError::Validation { detail, .. } => detail.clone(),
                         _ => unreachable!(),
                     };
@@ -684,10 +669,40 @@ impl FlowFabricWorker {
                         missing = %missing,
                         "capability mismatch, blocking execution off eligible (SDK inline claim)"
                     );
-                    self.block_route(&execution_id, &lane_id, &partition, &idx).await;
+                    // v0.12 PR-5: trait-routed block_route. Swallow
+                    // typed outcomes + transport faults (best-effort
+                    // semantic preserved from pre-PR-5 behaviour —
+                    // see `BlockRouteOutcome::LuaRejected` rustdoc).
+                    let block_args = ff_core::contracts::BlockRouteArgs::new(
+                        execution_id.clone(),
+                        lane_id.clone(),
+                        partition,
+                        "waiting_for_capable_worker".to_owned(),
+                        "no connected worker satisfies required_capabilities".to_owned(),
+                        now,
+                    );
+                    match self.backend.block_route(block_args).await {
+                        Ok(ff_core::contracts::BlockRouteOutcome::Blocked { .. }) => {}
+                        Ok(ff_core::contracts::BlockRouteOutcome::LuaRejected { message }) => {
+                            tracing::warn!(
+                                execution_id = %execution_id,
+                                error = %message,
+                                "SDK block_route: Lua rejected; eligible ZSET unchanged, next \
+                                 poll will re-evaluate"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                execution_id = %execution_id,
+                                error = %e,
+                                "SDK block_route: transport failure; eligible ZSET unchanged"
+                            );
+                        }
+                    }
                     continue;
                 }
-                Err(SdkError::Engine(ref e)) if is_retryable_claim_error(e) => {
+                Err(ref e) if is_retryable_claim_error(e) => {
                     tracing::debug!(
                         execution_id = %execution_id,
                         error = %e,
@@ -695,7 +710,7 @@ impl FlowFabricWorker {
                     );
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(SdkError::from(e)),
             }
 
             // Step 2: Claim the execution
@@ -758,111 +773,6 @@ impl FlowFabricWorker {
 
         // No eligible work found on any partition
         Ok(None)
-    }
-
-    #[cfg(feature = "direct-valkey-claim")]
-    async fn issue_claim_grant(
-        &self,
-        execution_id: &ExecutionId,
-        lane_id: &LaneId,
-        partition: &ff_core::partition::Partition,
-        idx: &IndexKeys,
-    ) -> Result<(), SdkError> {
-        let ctx = ExecKeyContext::new(partition, execution_id);
-
-        // KEYS (3): exec_core, claim_grant_key, eligible_zset
-        let keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.claim_grant(),
-            idx.lane_eligible(lane_id),
-        ];
-
-        // ARGV (9): eid, worker_id, worker_instance_id, lane_id,
-        //           capability_hash, grant_ttl_ms, route_snapshot_json,
-        //           admission_summary, worker_capabilities_csv (sorted)
-        let args: Vec<String> = vec![
-            execution_id.to_string(),
-            self.config.worker_id.to_string(),
-            self.config.worker_instance_id.to_string(),
-            lane_id.to_string(),
-            String::new(), // capability_hash
-            "5000".to_owned(), // grant_ttl_ms (5 seconds)
-            String::new(), // route_snapshot_json
-            String::new(), // admission_summary
-            self.worker_capabilities_csv.clone(), // sorted CSV
-        ];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: Value = self.valkey_client()            
-            .fcall("ff_issue_claim_grant", &key_refs, &arg_refs)
-            .await
-            .map_err(SdkError::from)?;
-
-        crate::task::parse_success_result(&raw, "ff_issue_claim_grant")
-    }
-
-    /// Move an execution from the lane's eligible ZSET into its
-    /// blocked_route ZSET via `ff_block_execution_for_admission`. Called
-    /// after a `CapabilityMismatch` reject — without this, the inline
-    /// direct-claim path would re-pick the same top-of-zset every tick
-    /// (same pattern the scheduler's block_candidate handles). The
-    /// engine's unblock scanner periodically promotes blocked_route
-    /// back to eligible once a worker with matching caps registers.
-    ///
-    /// Best-effort: transport or logical rejects (e.g. the execution
-    /// already went terminal between pick and block) are logged and the
-    /// outer loop simply `continue`s to the next partition. Parity with
-    /// ff-scheduler::Scheduler::block_candidate.
-    #[cfg(feature = "direct-valkey-claim")]
-    async fn block_route(
-        &self,
-        execution_id: &ExecutionId,
-        lane_id: &LaneId,
-        partition: &ff_core::partition::Partition,
-        idx: &IndexKeys,
-    ) {
-        let ctx = ExecKeyContext::new(partition, execution_id);
-        let core_key = ctx.core();
-        let eligible_key = idx.lane_eligible(lane_id);
-        let blocked_key = idx.lane_blocked_route(lane_id);
-        let eid_s = execution_id.to_string();
-        let now_ms = TimestampMs::now().0.to_string();
-
-        let keys: [&str; 3] = [&core_key, &eligible_key, &blocked_key];
-        let argv: [&str; 4] = [
-            &eid_s,
-            "waiting_for_capable_worker",
-            "no connected worker satisfies required_capabilities",
-            &now_ms,
-        ];
-
-        match self.valkey_client()            
-            .fcall::<Value>("ff_block_execution_for_admission", &keys, &argv)
-            .await
-        {
-            Ok(v) => {
-                // Parse Lua result so a logical reject (e.g. execution
-                // went terminal mid-flight) is visible — same fix we
-                // applied to ff-scheduler's block_candidate.
-                if let Err(e) = crate::task::parse_success_result(&v, "ff_block_execution_for_admission") {
-                    tracing::warn!(
-                        execution_id = %execution_id,
-                        error = %e,
-                        "SDK block_route: Lua rejected; eligible ZSET unchanged, next poll \
-                         will re-evaluate"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    execution_id = %execution_id,
-                    error = %e,
-                    "SDK block_route: transport failure; eligible ZSET unchanged"
-                );
-            }
-        }
     }
 
     /// Low-level claim of a granted execution. Routes through
@@ -1475,18 +1385,6 @@ fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
     (ff_core::hash::fnv1a_u64(worker_instance_id.as_bytes()) as usize) % num_partitions
 }
 
-#[cfg(feature = "direct-valkey-claim")]
-fn extract_first_array_string(value: &Value) -> Option<String> {
-    match value {
-        Value::Array(arr) if !arr.is_empty() => match &arr[0] {
-            Ok(Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-            Ok(Value::SimpleString(s)) => Some(s.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// Cross-check the [`ReclaimGrant`] handed back by
 /// `issue_reclaim_grant` against the [`ReclaimExecutionArgs`] the
 /// consumer is about to dispatch. Catches the grant-for-A + args-for-B
@@ -1816,6 +1714,58 @@ mod sqlite_only_compile_surface_tests {
             args: ClaimExecutionArgs,
         ) -> Result<ClaimExecutionResult, EngineError> {
             b.claim_execution(args).await
+        }
+    }
+
+    /// v0.12 PR-5 compile anchor — the three new scanner-primitive
+    /// trait methods (`scan_eligible_executions`, `issue_claim_grant`,
+    /// `block_route`) MUST be addressable under
+    /// `--no-default-features --features sqlite`. Each has an
+    /// `Err(Unavailable)` default impl; PG + SQLite backends don't
+    /// override (the scheduler-routed `claim_for_worker` path is the
+    /// supported PG/SQLite entry point). The anchor pins the trait-
+    /// surface signatures — not runtime calls — so the compile check
+    /// passes cleanly on every feature set.
+    #[test]
+    fn scan_eligible_executions_addressable_under_sqlite_only() {
+        use ff_core::contracts::ScanEligibleArgs;
+        use ff_core::engine_error::EngineError;
+        use ff_core::types::ExecutionId;
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            args: ScanEligibleArgs,
+        ) -> Result<Vec<ExecutionId>, EngineError> {
+            b.scan_eligible_executions(args).await
+        }
+    }
+
+    #[test]
+    fn issue_claim_grant_addressable_under_sqlite_only() {
+        use ff_core::contracts::{IssueClaimGrantArgs, IssueClaimGrantOutcome};
+        use ff_core::engine_error::EngineError;
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            args: IssueClaimGrantArgs,
+        ) -> Result<IssueClaimGrantOutcome, EngineError> {
+            b.issue_claim_grant(args).await
+        }
+    }
+
+    #[test]
+    fn block_route_addressable_under_sqlite_only() {
+        use ff_core::contracts::{BlockRouteArgs, BlockRouteOutcome};
+        use ff_core::engine_error::EngineError;
+
+        #[allow(dead_code)]
+        async fn _pin<B: EngineBackend + ?Sized>(
+            b: &B,
+            args: BlockRouteArgs,
+        ) -> Result<BlockRouteOutcome, EngineError> {
+            b.block_route(args).await
         }
     }
 

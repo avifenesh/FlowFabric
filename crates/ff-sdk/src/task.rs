@@ -1441,8 +1441,14 @@ fn resume_waitpoint_id_from_suspension(
     Ok(Some(waitpoint_id))
 }
 
+// v0.12 PR-5: inline SDK callers removed (the `claim_next` scanner
+// now routes through `EngineBackend::issue_claim_grant` +
+// `block_route`, whose Valkey impls own the parse). The helper is
+// retained for the regression tests in this module (terminal-op
+// replay detail extraction) until they move to ff-backend-valkey;
+// future PRs may delete both the helper and its tests together.
 #[cfg(feature = "valkey-default")]
-#[cfg_attr(not(feature = "direct-valkey-claim"), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(), SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
