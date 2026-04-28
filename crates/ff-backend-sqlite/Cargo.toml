@@ -28,6 +28,13 @@ ff-core = { version = "0.11.0", path = "../ff-core", default-features = false, f
 # the backend from the operating distro's libsqlite3 version — RFC-023
 # §7.1 owner recommendation. JSON1 + RETURNING (>= 3.35) rely on this.
 sqlx = { workspace = true, features = ["sqlite", "runtime-tokio", "macros", "migrate", "json", "chrono", "uuid"] }
+# Explicit `libsqlite3-sys` dep with the `bundled` feature enabled. sqlx
+# 0.8 does not expose a `sqlite-bundled` feature alias, so bundled-mode
+# has to be turned on via a direct dep + Cargo's feature unification.
+# Without this, sqlx's `sqlite` feature pulls `libsqlite3-sys` in
+# system-link mode and the "bundled" claim in the comment above silently
+# does not hold. Version pin must match the one sqlx 0.8 resolves to.
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
@@ -46,6 +53,13 @@ hex = "0.4"
 # `Pin<Box<dyn Stream<Item=...>>>` — same dep shape as
 # `ff-backend-postgres` uses for its lease/completion subscribers.
 futures-core = { workspace = true }
+
+[package.metadata.cargo-machete]
+# `libsqlite3-sys` is not imported directly; it is declared so Cargo's
+# feature unification enables the `bundled` feature on sqlx's transitive
+# use of it (RFC-023 §7.1). cargo-machete can't see through feature
+# propagation, so whitelist the dep here.
+ignored = ["libsqlite3-sys"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
