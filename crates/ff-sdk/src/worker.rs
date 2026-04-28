@@ -1275,7 +1275,6 @@ impl FlowFabricWorker {
             .await?;
 
         Ok(ClaimedTask::new(
-            self.valkey_client().clone(),
             self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
@@ -1676,7 +1675,6 @@ impl FlowFabricWorker {
             .await?;
 
         Ok(ClaimedTask::new(
-            self.valkey_client().clone(),
             self.backend.clone(),
             self.partition_config,
             execution_id.clone(),
@@ -2072,6 +2070,25 @@ mod sqlite_only_compile_surface_tests {
             id: &ExecutionId,
         ) -> Result<ExecutionContext, EngineError> {
             b.read_execution_context(id).await
+        }
+    }
+
+    /// v0.12 PR-2 compile anchor — `ClaimedTask` as a type MUST be
+    /// addressable under `--no-default-features --features sqlite`
+    /// (the `task` module is no longer `valkey-default`-gated at the
+    /// module level). The `impl ClaimedTask { ... }` block is still
+    /// valkey-gated because `synth_handle` / `new` depend on
+    /// `ff_backend_valkey::ValkeyBackend::encode_handle`; this anchor
+    /// pins the struct path + its field types through a generic-over-T
+    /// wrapper so a compile-time lookup of `ClaimedTask` is exercised
+    /// mechanically under the sqlite-only feature set.
+    #[test]
+    fn claimed_task_type_addressable_under_sqlite_only() {
+        use crate::task::ClaimedTask;
+
+        #[allow(dead_code)]
+        fn _pin<T>(_: std::marker::PhantomData<T>) -> std::marker::PhantomData<ClaimedTask> {
+            std::marker::PhantomData
         }
     }
 }

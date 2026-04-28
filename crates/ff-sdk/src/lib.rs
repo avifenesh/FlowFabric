@@ -88,7 +88,11 @@ pub mod engine_error;
 pub mod layer;
 #[cfg(feature = "valkey-default")]
 pub mod snapshot;
-#[cfg(feature = "valkey-default")]
+// v0.12 PR-2: `task` is always compiled. Items that depend on
+// ferriskey / ff-backend-valkey / ff-core streaming+suspension types
+// are gated at the item level inside `task.rs`; the module itself is
+// reachable under `default-features = false, features = ["sqlite"]`
+// so consumers can name `ClaimedTask` as a type.
 pub mod task;
 // RFC-023 Phase 1a (§4.4 item 10): `worker` is always compiled.
 // The ferriskey-dependent methods inside it are `valkey-default`-
