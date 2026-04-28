@@ -7,6 +7,44 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **RFC-024 PR-G — SDK consumer surface for lease-reclaim (closes
+  #371 end-to-end).** Adds the three consumer-facing surfaces that
+  cairn-fabric (and any pull-mode consumer) calls to recover from
+  `lease_expired`. Backend impls landed earlier in PR-D/E/F; this
+  PR wires them through to the SDK + HTTP.
+  - `ff-sdk::FlowFabricAdminClient::issue_reclaim_grant(&self,
+    execution_id, IssueReclaimGrantRequest) ->
+    Result<IssueReclaimGrantResponse, SdkError>` — HTTP admin-surface
+    wrapper over `POST /v1/executions/{id}/reclaim`. `status`-
+    discriminated response enum with `Granted` /
+    `NotReclaimable` / `ReclaimCapExceeded` variants; consumers
+    lift `Granted` into `ff_core::contracts::ReclaimGrant` via
+    `IssueReclaimGrantResponse::into_grant`. `valkey-default`-gated
+    (lives alongside the existing reqwest-based admin surface).
+  - `ff-sdk::FlowFabricWorker::claim_from_reclaim_grant(&self,
+    ReclaimGrant, ReclaimExecutionArgs) ->
+    Result<ReclaimExecutionOutcome, SdkError>` — **backend-agnostic**
+    (no cfg gate). Dispatches through
+    `EngineBackend::reclaim_execution` on whichever backend the
+    worker was connected with. Compiles + runs under
+    `--no-default-features, features = ["sqlite"]`; companion
+    compile-anchor in `crates/ff-sdk/tests/rfc024_sdk.rs` pins the
+    signature so accidental cfg-gating regressions fail the build.
+  - `ff-server`: new `POST /v1/executions/{id}/reclaim` route.
+    Dispatches through the `EngineBackend` trait's
+    `issue_reclaim_grant`; all three in-tree backends
+    (Valkey / Postgres / SQLite) implement it at v0.12.0. 64 KiB
+    `BODY_LIMIT_CONTROL` cap; validates `worker_id` /
+    `worker_instance_id` / `lane_id` the same way the existing
+    `/v1/workers/{id}/claim` handler does, rejects zero-or-over-
+    60s `grant_ttl_ms`.
+- `docs/CONSUMER_MIGRATION_0.12.md` §7 — comprehensive RFC-024
+  consumer-migration section: breaking-change inventory from PR-B/C,
+  additive surfaces from PR-G, full cairn F64-bridge-retry →
+  reclaim migration snippet, handle-kind awareness note, and the
+  `ReclaimGrant` vs `ResumeGrant` rename clarification for
+  migrators.
+
 - `examples/ff-dev/` — RFC-023 Phase 4 headline example for the
   SQLite dev-only backend (v0.12.0 release target). ~200-line
   consumer-facing demo that drives the `EngineBackend` trait directly
