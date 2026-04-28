@@ -1198,10 +1198,11 @@ enum IssueReclaimGrantResponseDto {
     },
 }
 
-/// Maximum grant TTL accepted — mirrors `CLAIM_GRANT_TTL_MS_MAX` so
-/// a misconfigured client can't squat an execution on a multi-hour
-/// reclaim grant.
-const RECLAIM_GRANT_TTL_MS_MAX: u64 = 60_000;
+/// Maximum grant TTL accepted — aliased to `CLAIM_GRANT_TTL_MS_MAX`
+/// so a misconfigured client can't squat an execution on a
+/// multi-hour reclaim grant and so the two ceilings cannot drift
+/// (PR #407 review F2).
+const RECLAIM_GRANT_TTL_MS_MAX: u64 = CLAIM_GRANT_TTL_MS_MAX;
 
 async fn issue_reclaim_grant(
     State(server): State<Arc<Server>>,
