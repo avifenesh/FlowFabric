@@ -462,10 +462,15 @@ async fn reclaim_execution_once(
 
     let core_row = sqlx::query(
         r#"
-        SELECT lifecycle_phase, attempt_index, lease_reclaim_count
-          FROM ff_exec_core
-         WHERE partition_key = $1 AND execution_id = $2
-         FOR NO KEY UPDATE
+        SELECT ec.lifecycle_phase, ec.attempt_index, ec.lease_reclaim_count,
+               COALESCE(a.lease_epoch, 0) AS prior_lease_epoch
+          FROM ff_exec_core ec
+          LEFT JOIN ff_attempt a
+            ON a.partition_key = ec.partition_key
+           AND a.execution_id  = ec.execution_id
+           AND a.attempt_index = ec.attempt_index
+         WHERE ec.partition_key = $1 AND ec.execution_id = $2
+         FOR NO KEY UPDATE OF ec
         "#,
     )
     .bind(part)
@@ -483,6 +488,14 @@ async fn reclaim_execution_once(
     let cur_attempt_index: i32 = core_row.try_get("attempt_index").map_err(map_sqlx_error)?;
     let cur_reclaim_count: i32 = core_row
         .try_get("lease_reclaim_count")
+        .map_err(map_sqlx_error)?;
+    // Prior-attempt lease epoch drives the monotonic bump for the new
+    // attempt's `lease_epoch` (Bug B parity — Valkey Lua
+    // `flowfabric.lua:3106` + SQLite `reclaim.rs::reclaim_execution_inner`
+    // both use `prior + 1`). LEFT JOIN tolerates a missing
+    // prior-attempt row (COALESCE → 0, bump → 1).
+    let prior_lease_epoch: i64 = core_row
+        .try_get("prior_lease_epoch")
         .map_err(map_sqlx_error)?;
 
     if lifecycle_phase == "terminal" || lifecycle_phase == "cancelled" {
@@ -525,6 +538,40 @@ async fn reclaim_execution_once(
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx_error)?;
+
+        // Bug A parity fix — RFC-024 §4.2.7 / RFC-019 outbox matrix:
+        // every terminal transition emits BOTH a completion_event and a
+        // lease_event. Cap-exceeded is `terminal_failed`, so both fire.
+        // Mirrors SQLite `reclaim.rs::reclaim_execution_inner` cap-
+        // exceeded branch (lines 376-384, post-PR-E `d16ad68`).
+        sqlx::query(
+            r#"
+            INSERT INTO ff_completion_event (
+                partition_key, execution_id, flow_id, outcome,
+                namespace, instance_tag, occurred_at_ms
+            )
+            SELECT partition_key, execution_id, flow_id, 'failed',
+                   NULL, NULL, $3
+              FROM ff_exec_core
+             WHERE partition_key = $1 AND execution_id = $2
+            "#,
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+        lease_event::emit(
+            &mut tx,
+            part,
+            exec_uuid,
+            None,
+            lease_event::EVENT_REVOKED,
+            now,
+        )
+        .await?;
+
         tx.commit().await.map_err(map_sqlx_error)?;
         return Ok(ReclaimExecutionOutcome::ReclaimCapExceeded {
             execution_id: args.execution_id.clone(),
@@ -549,9 +596,17 @@ async fn reclaim_execution_once(
     .await
     .map_err(map_sqlx_error)?;
 
-    // Insert NEW attempt row (attempt_index = cur+1, epoch = 1,
-    // attempt_type = 'reclaim' in raw_fields).
+    // Insert NEW attempt row (attempt_index = cur+1, epoch = prior+1,
+    // attempt_type = 'reclaim' in raw_fields). Bug B parity fix: the
+    // new lease_epoch is derived from the prior attempt's epoch so
+    // fencing remains monotonic across successive reclaims (matches
+    // Valkey Lua `flowfabric.lua:3106` + SQLite `reclaim.rs`).
     let new_attempt_index = cur_attempt_index + 1;
+    // Defensive clamp: `ff_attempt.lease_epoch` is `bigint` with no
+    // CHECK constraint, so a malformed row could surface a negative
+    // value. Clamp before bump so the DB-persisted epoch matches the
+    // handle's non-negative u64 value (no DB/handle divergence).
+    let new_lease_epoch: i64 = prior_lease_epoch.max(0).saturating_add(1);
     let lease_ttl_ms = i64::try_from(args.lease_ttl_ms).unwrap_or(i64::MAX);
     let new_lease_expires = now.saturating_add(lease_ttl_ms);
     sqlx::query(
@@ -564,7 +619,7 @@ async fn reclaim_execution_once(
         ) VALUES (
             $1, $2, $3,
             $4, $5,
-            1, $6, $7,
+            $8, $6, $7,
             jsonb_build_object('attempt_type', 'reclaim')
         )
         "#,
@@ -576,6 +631,7 @@ async fn reclaim_execution_once(
     .bind(args.worker_instance_id.as_str())
     .bind(new_lease_expires)
     .bind(now)
+    .bind(new_lease_epoch)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
@@ -638,7 +694,7 @@ async fn reclaim_execution_once(
         AttemptIndex::new(u32::try_from(new_attempt_index.max(0)).unwrap_or(0)),
         args.attempt_id.clone(),
         args.lease_id.clone(),
-        LeaseEpoch(1),
+        LeaseEpoch(u64::try_from(new_lease_epoch.max(0)).unwrap_or(0)),
         u32::try_from(args.lease_ttl_ms.min(u32::MAX as u64)).unwrap_or(u32::MAX) as u64,
         args.lane_id.clone(),
         args.worker_instance_id.clone(),
