@@ -148,6 +148,19 @@ async fn read_exec_phase(backend: &SqliteBackend, exec_uuid: Uuid) -> String {
     .expect("read lifecycle_phase")
 }
 
+/// Read one exec_core row's `public_state`.
+async fn read_exec_public_state(backend: &SqliteBackend, exec_uuid: Uuid) -> String {
+    let pool = backend.pool_for_test();
+    sqlx::query_scalar::<_, String>(
+        "SELECT public_state FROM ff_exec_core \
+          WHERE partition_key = 0 AND execution_id = ?1",
+    )
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .expect("read public_state")
+}
+
 // ── claim ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -169,6 +182,19 @@ async fn claim_happy_path_mints_handle_and_transitions_state() {
 
     // exec_core flipped to active.
     assert_eq!(read_exec_phase(&backend, exec_uuid).await, "active");
+
+    // `public_state = 'running'` parity write with Postgres
+    // (`ff-backend-postgres/src/suspend_ops.rs:958-960`). The
+    // Spine-B normaliser maps the raw literal back to
+    // `PublicState::Active`; before the fix the `public_state`
+    // column remained at its create-time `'waiting'` literal
+    // (`'pending'` is the sibling `attempt_state` literal, not
+    // `public_state`) and direct SQL readers observed the wrong
+    // public state even though the inferred enum was correct.
+    assert_eq!(
+        read_exec_public_state(&backend, exec_uuid).await,
+        "running"
+    );
 
     // Attempt row created with no terminal outcome yet.
     assert_eq!(read_attempt_outcome(&backend, exec_uuid, 0).await, None);

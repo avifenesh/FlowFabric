@@ -138,6 +138,47 @@ async fn last_outbox_event(
 
 // ── Phase 2a.2 helpers: hot-path shared logic ──────────────────────────
 
+/// Classify a sqlite path/URI as in-memory (RFC-023 §4.6).
+///
+/// Matches the three on-disk-free forms the backend supports:
+///   - bare `":memory:"` (rewritten internally to a shared-cache URI)
+///   - `"file::memory:..."` (the short-form shared-cache URI)
+///   - `"file:<name>?...mode=memory..."` (the §4.6-recommended named
+///     form, e.g. `file:ff-test-<uuid>?mode=memory&cache=shared`)
+///
+/// The `mode=memory` check parses the URI query string and requires
+/// an exact `mode=memory` `key=value` pair (delimited by `?`/`&`,
+/// terminated by `&`/`#`/end-of-string). A substring-only check
+/// would mis-classify filesystem paths whose filename happens to
+/// contain the substring (e.g. `file:my_mode=memory_db.sqlite`) or
+/// a longer value (`?mode=memory_extra`) as in-memory.
+///
+/// A #372 miss on the third form caused `is_memory = false` for the
+/// §4.6 test-isolation URIs: WAL mode was applied inappropriately
+/// and no sentinel connection was held, so pool-idle cycles dropped
+/// the shared cache mid-test.
+fn is_memory_uri(path: &str) -> bool {
+    if path == ":memory:" || path.starts_with("file::memory:") {
+        return true;
+    }
+    if !path.starts_with("file:") {
+        return false;
+    }
+    // Require `mode=memory` to appear as a real URI query parameter —
+    // a `key=value` pair delimited by `?` or `&`, ending at `&`, `#`,
+    // or end-of-string. A substring-only check would mis-classify
+    // filesystem paths whose filename happens to contain
+    // `mode=memory` (e.g. `file:my_mode=memory_db.sqlite`) or a
+    // longer value like `?mode=memory_extra`.
+    let Some(query_start) = path.find('?') else {
+        return false;
+    };
+    let query = &path[query_start + 1..];
+    // Strip URI fragment before splitting pairs.
+    let query = query.split('#').next().unwrap_or("");
+    query.split('&').any(|kv| kv == "mode=memory")
+}
+
 /// Unix-millis wall clock. Matches the PG reference shape
 /// (`ff-backend-postgres/src/attempt.rs:55-63`); SQLite stores the
 /// same `*_ms` fields so the value is directly comparable.
@@ -2254,7 +2295,7 @@ impl SqliteBackend {
         // pool shares ONE in-memory database. Without this rewrite,
         // each pool connection opens its own private DB and tests see
         // schema mismatches silently.
-        let is_memory = path == ":memory:" || path.starts_with("file::memory:");
+        let is_memory = is_memory_uri(path);
         let effective_path: std::borrow::Cow<'_, str> = if path == ":memory:" {
             std::borrow::Cow::Borrowed("file::memory:?cache=shared")
         } else {
@@ -3064,5 +3105,76 @@ impl EngineBackend for SqliteBackend {
         // applies the migrations inside `SqliteBackend::new` itself
         // rather than here, matching the PG posture.
         Ok(PrepareOutcome::NoOp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_memory_uri;
+
+    /// #372 regression: `is_memory_uri` must detect the three in-memory
+    /// URI forms the backend supports, including the RFC-023 §4.6
+    /// recommended `file:<name>?mode=memory&cache=shared` test-
+    /// isolation form. A miss on the third form caused WAL to be
+    /// applied inappropriately and no sentinel connection to be held,
+    /// so pool-idle cycles dropped the shared cache mid-test.
+    #[test]
+    fn is_memory_detects_all_uri_forms() {
+        // Bare.
+        assert!(is_memory_uri(":memory:"));
+        // Short-form shared-cache URI.
+        assert!(is_memory_uri("file::memory:"));
+        assert!(is_memory_uri("file::memory:?cache=shared"));
+        // §4.6 named form (the one #372 missed).
+        assert!(is_memory_uri(
+            "file:ff-test-abc123?mode=memory&cache=shared"
+        ));
+        assert!(is_memory_uri(
+            "file:ff-test-00000000-0000-0000-0000-000000000000?mode=memory&cache=shared"
+        ));
+        // Filesystem paths and unrelated URIs must not match.
+        assert!(!is_memory_uri("/tmp/ff.sqlite"));
+        assert!(!is_memory_uri("./ff.sqlite"));
+        assert!(!is_memory_uri("file:/tmp/ff.sqlite"));
+        assert!(!is_memory_uri("file:ff-test?cache=shared"));
+        // Filename happens to contain the substring `mode=memory`
+        // but it is not a query parameter — MUST NOT match.
+        assert!(!is_memory_uri("file:my_mode=memory_db.sqlite"));
+        // Query-parameter form with `&` delimiter (mode is not the
+        // first parameter) — MUST match.
+        assert!(is_memory_uri("file:ff-test?cache=shared&mode=memory"));
+    }
+
+    /// Filename that happens to contain the substring `mode=memory`
+    /// must NOT be classified as in-memory — it is a persistent file
+    /// path, not a URI query parameter.
+    #[test]
+    fn is_memory_uri_rejects_filename_with_mode_memory() {
+        assert!(!is_memory_uri("file:my_mode=memory_db.sqlite"));
+        // Also guard against a value-prefix mismatch: a query
+        // parameter whose value starts with `memory` but isn't
+        // exactly `memory` must not match.
+        assert!(!is_memory_uri("file:foo?mode=memory_extra"));
+    }
+
+    /// Simple `?mode=memory` query parameter — the canonical form.
+    #[test]
+    fn is_memory_uri_accepts_query_param() {
+        assert!(is_memory_uri("file:test?mode=memory"));
+    }
+
+    /// RFC-023 §4.6 recommended test-isolation form — the original
+    /// #372 regression case.
+    #[test]
+    fn is_memory_uri_accepts_shared_cache_form() {
+        assert!(is_memory_uri(
+            "file:ff-test-00000000-0000-0000-0000-000000000000?mode=memory&cache=shared"
+        ));
+    }
+
+    /// Plain file path (no query string) must not match.
+    #[test]
+    fn is_memory_uri_rejects_plain_file() {
+        assert!(!is_memory_uri("file:./data.db"));
     }
 }

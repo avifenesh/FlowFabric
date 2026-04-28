@@ -9,11 +9,20 @@
 /// Flip exec_core to `active/leased/running` on a successful claim
 /// (mirror of PG's claim-path UPDATE at
 /// `ff-backend-postgres/src/attempt.rs:236-250`).
+///
+/// `public_state = 'running'` mirrors the Postgres resume-claim write
+/// at `ff-backend-postgres/src/suspend_ops.rs:958-960` and normalises
+/// to [`ff_core::types::PublicState::Active`] via
+/// [`crate::reads::normalise_public_state`]. Without this write the
+/// column remained at its create-time `'waiting'` literal on SQLite
+/// while Spine-B consumers (and any direct `SELECT public_state`)
+/// expected the claimed-execution literal.
 pub(crate) const UPDATE_EXEC_CORE_CLAIM_SQL: &str = r#"
     UPDATE ff_exec_core
        SET lifecycle_phase = 'active',
            ownership_state = 'leased',
            eligibility_state = 'not_applicable',
+           public_state = 'running',
            attempt_state = 'running_attempt'
      WHERE partition_key = ?1 AND execution_id = ?2
 "#;
