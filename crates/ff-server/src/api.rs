@@ -1957,3 +1957,128 @@ mod claim_grant_dto_tests {
         assert_eq!(jf["partition_key"], je["partition_key"]);
     }
 }
+
+#[cfg(test)]
+mod reclaim_grant_dto_tests {
+    //! Wire-shape tests for `POST /v1/executions/{id}/reclaim`
+    //! (RFC-024 §3.5).
+    //!
+    //! Pins the exact request + response JSON shapes the server
+    //! accepts and emits, so any drift between the server DTOs and the
+    //! `ff-sdk::admin::IssueReclaimGrant{Request,Response}` types
+    //! surfaces at compile-adjacent test time rather than on a live
+    //! SDK round-trip. Parallels `claim_grant_dto_tests`.
+    use super::*;
+    use ff_core::partition::{Partition, PartitionFamily, PartitionKey};
+    use serde_json::json;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    fn sample_partition_key() -> PartitionKey {
+        let p = Partition {
+            family: PartitionFamily::Flow,
+            index: 7,
+        };
+        PartitionKey::from(&p)
+    }
+
+    #[test]
+    fn issue_reclaim_grant_body_deserializes_required_and_optional_fields() {
+        // Full-field wire shape the SDK emits. Exercises
+        // `#[serde(default)]` optional fields + `worker_capabilities`
+        // defaulting.
+        let wire = json!({
+            "worker_id": "w1",
+            "worker_instance_id": "w1-i1",
+            "lane_id": "main",
+            "capability_hash": "cap-hash-abc",
+            "grant_ttl_ms": 30_000u64,
+            "route_snapshot_json": "{\"route\":\"x\"}",
+            "admission_summary": "admitted",
+            "worker_capabilities": ["cpu", "gpu"],
+        });
+        let body: IssueReclaimGrantBody =
+            serde_json::from_value(wire).expect("deserialize full body");
+        assert_eq!(body.worker_id, "w1");
+        assert_eq!(body.worker_instance_id, "w1-i1");
+        assert_eq!(body.lane_id, "main");
+        assert_eq!(body.capability_hash.as_deref(), Some("cap-hash-abc"));
+        assert_eq!(body.grant_ttl_ms, 30_000);
+        assert_eq!(
+            body.route_snapshot_json.as_deref(),
+            Some("{\"route\":\"x\"}")
+        );
+        assert_eq!(body.admission_summary.as_deref(), Some("admitted"));
+        let caps: BTreeSet<&str> =
+            body.worker_capabilities.iter().map(String::as_str).collect();
+        assert!(caps.contains("cpu"));
+        assert!(caps.contains("gpu"));
+    }
+
+    #[test]
+    fn issue_reclaim_grant_body_defaults_when_optionals_absent() {
+        // Minimum wire shape; `capability_hash`, `route_snapshot_json`,
+        // `admission_summary` all `#[serde(default)]` to `None`, and
+        // `worker_capabilities` defaults to empty `Vec`.
+        let wire = json!({
+            "worker_id": "w1",
+            "worker_instance_id": "w1-i1",
+            "lane_id": "main",
+            "grant_ttl_ms": 30_000u64,
+        });
+        let body: IssueReclaimGrantBody =
+            serde_json::from_value(wire).expect("deserialize minimal body");
+        assert!(body.capability_hash.is_none());
+        assert!(body.route_snapshot_json.is_none());
+        assert!(body.admission_summary.is_none());
+        assert!(body.worker_capabilities.is_empty());
+    }
+
+    #[test]
+    fn issue_reclaim_grant_response_dto_granted_serializes_with_status_tag() {
+        let dto = IssueReclaimGrantResponseDto::Granted {
+            execution_id: "{fp:7}:11111111-1111-4111-8111-111111111111".to_owned(),
+            partition_key: sample_partition_key(),
+            grant_key: "reclaim:grant:abc".to_owned(),
+            expires_at_ms: 1_700_000_000_000,
+            lane_id: "main".to_owned(),
+        };
+        let json: Value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["status"], "granted");
+        assert_eq!(
+            json["execution_id"],
+            "{fp:7}:11111111-1111-4111-8111-111111111111"
+        );
+        // `partition_key` serialises transparent: a bare string, not
+        // an object. Same precedent as `claim_grant_dto`.
+        assert_eq!(json["partition_key"], json!("{fp:7}"));
+        assert_eq!(json["grant_key"], "reclaim:grant:abc");
+        assert_eq!(json["expires_at_ms"], json!(1_700_000_000_000u64));
+        assert_eq!(json["lane_id"], "main");
+    }
+
+    #[test]
+    fn issue_reclaim_grant_response_dto_not_reclaimable_serializes_with_status_tag() {
+        let dto = IssueReclaimGrantResponseDto::NotReclaimable {
+            execution_id: "{fp:7}:11111111-1111-4111-8111-111111111111".to_owned(),
+            detail: "capability_mismatch: gpu".to_owned(),
+        };
+        let json: Value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["status"], "not_reclaimable");
+        assert_eq!(json["detail"], "capability_mismatch: gpu");
+        assert!(json.get("grant_key").is_none());
+        assert!(json.get("partition_key").is_none());
+    }
+
+    #[test]
+    fn issue_reclaim_grant_response_dto_reclaim_cap_exceeded_serializes_with_status_tag() {
+        let dto = IssueReclaimGrantResponseDto::ReclaimCapExceeded {
+            execution_id: "{fp:7}:11111111-1111-4111-8111-111111111111".to_owned(),
+            reclaim_count: 1000,
+        };
+        let json: Value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["status"], "reclaim_cap_exceeded");
+        assert_eq!(json["reclaim_count"], 1000);
+        assert!(json.get("grant_key").is_none());
+    }
+}

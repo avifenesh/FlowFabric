@@ -295,13 +295,23 @@ impl FlowFabricAdminClient {
     ///
     /// The request body carries `worker_capabilities`. Consumers typically
     /// source these from their registered worker's configured
-    /// `WorkerConfig::capabilities` — the Lua
-    /// `ff_issue_reclaim_grant` validates the requested capability-hash
-    /// against the execution's route snapshot; a mismatch surfaces as
+    /// `WorkerConfig::capabilities`. Admission compares
+    /// `worker_capabilities` against the execution's
+    /// `required_capabilities` (persisted on `exec_core` at
+    /// `create_execution` time from
+    /// `ExecutionPolicy.routing_requirements.required_capabilities`);
+    /// any required capability missing from the worker set surfaces as
     /// `IssueReclaimGrantResponse::NotReclaimable { detail:
-    /// "capability_mismatch" }`. The SDK does not re-read worker state
-    /// automatically — admin clients are not bound to a worker — so
-    /// the consumer threads the capabilities through at call-time.
+    /// "capability_mismatch: <missing csv>" }` (Lua
+    /// `ff_issue_reclaim_grant`, `crates/ff-script/src/flowfabric.lua`
+    /// §3969-3982; sqlite/PG backends mirror the check). The SDK does
+    /// not re-read worker state automatically — admin clients are not
+    /// bound to a worker — so the consumer threads the capabilities
+    /// through at call-time.
+    ///
+    /// `capability_hash` is NOT consulted for admission; it is stored
+    /// verbatim on the grant hash for audit / downstream observability
+    /// only.
     ///
     /// # Consumer flow (RFC-024 §4.4)
     ///
@@ -413,8 +423,12 @@ pub struct IssueReclaimGrantRequest {
     /// Lane the execution belongs to. Needed by
     /// `ff_issue_reclaim_grant` for `KEYS[*]` construction.
     pub lane_id: String,
-    /// Capability hash for capability-match validation; `None` to
-    /// skip the match (the Lua's `ARGV[5]` defaults to empty).
+    /// Opaque capability-hash token stored verbatim on the issued
+    /// grant for audit / downstream observability. NOT used for
+    /// admission — admission compares `worker_capabilities` against
+    /// the execution's `required_capabilities` (see the
+    /// [`FlowFabricAdminClient::issue_reclaim_grant`] rustdoc).
+    /// `None` leaves the field empty on the grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_hash: Option<String>,
     /// Grant TTL in milliseconds. Bounded server-side.

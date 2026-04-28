@@ -1551,7 +1551,13 @@ impl FlowFabricWorker {
     ///
     /// No cfg-gate. Compiles + runs under every feature set ff-sdk
     /// supports (including sqlite-only). Verified by the compile-time
-    /// type assertion in `sqlite_only_compile_surface_tests`.
+    /// type assertion
+    /// `worker_claim_from_reclaim_grant_is_backend_agnostic_at_type_level`
+    /// in `crates/ff-sdk/tests/rfc024_sdk.rs`, which pins the method's
+    /// full signature under the default feature set and is paralleled
+    /// by `sqlite_only_compile_surface_tests` in this file for the
+    /// `--no-default-features, features = ["sqlite"]` compile anchor on
+    /// the rest of the backend-agnostic surface.
     ///
     /// # worker_capabilities
     ///

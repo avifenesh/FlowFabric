@@ -63,7 +63,7 @@ fn issue_reclaim_grant_request_skips_none_optional_fields() {
 fn issue_reclaim_grant_response_granted_deserializes() {
     let wire = serde_json::json!({
         "status": "granted",
-        "execution_id": "0x0100000000000000000000000000000000000000000000000000000000000001",
+        "execution_id": "{fp:7}:11111111-1111-4111-8111-111111111111",
         "partition_key": "{fp:7}",
         "grant_key": "reclaim:grant:abc",
         "expires_at_ms": 1_700_000_000_000u64,
@@ -86,7 +86,7 @@ fn issue_reclaim_grant_response_granted_deserializes() {
 fn issue_reclaim_grant_response_not_reclaimable_deserializes() {
     let wire = serde_json::json!({
         "status": "not_reclaimable",
-        "execution_id": "0x0100000000000000000000000000000000000000000000000000000000000001",
+        "execution_id": "{fp:7}:11111111-1111-4111-8111-111111111111",
         "detail": "capability_mismatch",
     });
     let resp: IssueReclaimGrantResponse = serde_json::from_value(wire).expect("deserialize");
@@ -102,7 +102,7 @@ fn issue_reclaim_grant_response_not_reclaimable_deserializes() {
 fn issue_reclaim_grant_response_reclaim_cap_exceeded_deserializes() {
     let wire = serde_json::json!({
         "status": "reclaim_cap_exceeded",
-        "execution_id": "0x0100000000000000000000000000000000000000000000000000000000000001",
+        "execution_id": "{fp:7}:11111111-1111-4111-8111-111111111111",
         "reclaim_count": 1000,
     });
     let resp: IssueReclaimGrantResponse = serde_json::from_value(wire).expect("deserialize");
@@ -117,14 +117,14 @@ fn issue_reclaim_grant_response_reclaim_cap_exceeded_deserializes() {
 #[test]
 fn issue_reclaim_grant_response_into_grant_rejects_non_granted_variants() {
     let not_reclaimable = IssueReclaimGrantResponse::NotReclaimable {
-        execution_id: "0x0100000000000000000000000000000000000000000000000000000000000001"
+        execution_id: "{fp:7}:11111111-1111-4111-8111-111111111111"
             .into(),
         detail: "capability_mismatch".into(),
     };
     assert!(not_reclaimable.into_grant().is_err());
 
     let cap_exceeded = IssueReclaimGrantResponse::ReclaimCapExceeded {
-        execution_id: "0x0100000000000000000000000000000000000000000000000000000000000001"
+        execution_id: "{fp:7}:11111111-1111-4111-8111-111111111111"
             .into(),
         reclaim_count: 1000,
     };

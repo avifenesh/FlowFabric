@@ -221,6 +221,26 @@ The three new consumer surfaces in v0.12.0:
   Request body carries worker identity + lane + capabilities;
   response is a `status`-discriminated JSON outcome.
 
+#### Admission model
+
+Grant issuance rejects with
+`IssueReclaimGrantResponse::NotReclaimable { detail }` when any of:
+
+- The execution's `lifecycle_phase` is not `active`, or its
+  `ownership_state` is neither `lease_expired_reclaimable` nor
+  `lease_revoked` (detail carries the observed state).
+- A capability is missing: the backend computes the set difference
+  of `exec_core.required_capabilities` (populated from
+  `ExecutionPolicy.routing_requirements.required_capabilities` at
+  `create_execution` time) minus the request's
+  `worker_capabilities`. A non-empty difference surfaces as
+  `detail: "capability_mismatch: <missing csv>"`.
+
+`capability_hash` on the request body is **not** consulted for
+admission — it is an opaque audit token stored verbatim on the
+grant hash. Set it to `None` unless you have a downstream
+correlation use-case.
+
 #### Cairn migration pattern — F64 bridge retry loop → reclaim
 
 Pre-RFC cairn-fabric pattern at `cairn-rs/.../f64_bridge.rs`
@@ -340,13 +360,15 @@ flow.
 - **Land the RFC-024 consumer migration** — replace the
   `F64 bridge retry loop` with the snippet above, drop the
   `remove once FF#371 ships` comment, close tracking issue #371.
-- **Optional: capability-hash correlation** — the
-  `IssueReclaimGrantRequest::capability_hash` field maps to the
-  execution's route-snapshot capability hash. Cairn's existing
-  capability plumbing at admission time can surface the same
-  hash on reclaim for stricter capability-match validation;
-  passing `None` (the ergonomic default) reuses the admission-
-  time stored hash.
+- **Optional: capability-hash audit correlation** — the
+  `IssueReclaimGrantRequest::capability_hash` field is an opaque
+  token stored verbatim on the issued grant for audit /
+  observability. It is **not** used for admission — admission
+  compares `worker_capabilities` against the execution's
+  `required_capabilities` (persisted on `exec_core` at
+  `create_execution` time). Cairn can thread its existing
+  admission-time capability-hash through for downstream
+  correlation, or pass `None` to leave the field empty.
 
 ## Non-changes
 
