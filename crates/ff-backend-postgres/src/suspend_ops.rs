@@ -953,15 +953,23 @@ pub(crate) async fn claim_resumed_execution_impl(
     .await
     .map_err(map_sqlx_error)?;
 
+    // #356: started_at_ms is set-once on ff_exec_core; the resume-claim
+    // path preserves the original first-claim timestamp via COALESCE.
+    // On a suspended exec that was resumed before 0016 backfill, the
+    // column may be NULL here — we seed it with `now` as a defensible
+    // fallback (post-suspension resume is as close to "first observable
+    // claim" as the column can get in that edge case).
     sqlx::query(
         "UPDATE ff_exec_core \
             SET lifecycle_phase = 'active', ownership_state = 'leased', \
                 eligibility_state = 'not_applicable', \
-                public_state = 'running', attempt_state = 'running_attempt' \
+                public_state = 'running', attempt_state = 'running_attempt', \
+                started_at_ms = COALESCE(started_at_ms, $3) \
           WHERE partition_key = $1 AND execution_id = $2",
     )
     .bind(part)
     .bind(exec_uuid)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;

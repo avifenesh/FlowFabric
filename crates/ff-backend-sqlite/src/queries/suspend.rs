@@ -69,10 +69,17 @@ pub const UPDATE_EXEC_CORE_RESUMABLE_SQL: &str = "UPDATE ff_exec_core \
          eligibility_state = 'eligible_now' \
      WHERE partition_key = ?1 AND execution_id = ?2";
 
+// #356: `started_at_ms` is set-once on ff_exec_core via migration
+// 0016; the resume-claim path preserves the original first-claim
+// timestamp via COALESCE (seeds `?3 = now` as a defensible fallback
+// for any pre-0016-backfill exec that resumes before a first-claim
+// column-write — structurally the same as the PG sibling in
+// `ff-backend-postgres/src/suspend_ops.rs`).
 pub const UPDATE_EXEC_CORE_RUNNING_SQL: &str = "UPDATE ff_exec_core \
      SET lifecycle_phase = 'active', ownership_state = 'leased', \
          eligibility_state = 'not_applicable', \
-         public_state = 'running', attempt_state = 'running_attempt' \
+         public_state = 'running', attempt_state = 'running_attempt', \
+         started_at_ms = COALESCE(started_at_ms, ?3) \
      WHERE partition_key = ?1 AND execution_id = ?2";
 
 pub const SELECT_EXEC_STATE_FOR_RESUME_SQL: &str =

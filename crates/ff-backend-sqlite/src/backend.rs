@@ -414,9 +414,14 @@ async fn claim_inner(
         .map_err(map_sqlx_error)?;
     let epoch_i: i64 = epoch_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
 
+    // #356: `started_at_ms` is set-once on ff_exec_core (migration
+    // 0016); COALESCE preserves the first-claim timestamp across
+    // reclaim + retry attempts, matching Valkey's dedicated
+    // `exec_core["started_at"]` semantics.
     sqlx::query(q_exec::UPDATE_EXEC_CORE_CLAIM_SQL)
         .bind(part)
         .bind(exec_uuid)
+        .bind(now)
         .execute(&mut **conn)
         .await
         .map_err(map_sqlx_error)?;
@@ -2139,6 +2144,17 @@ async fn cancel_flow_impl(
                 .bind(part)
                 .bind(exec_uuid)
                 .bind(now_ms)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+
+            // #355: clear the current attempt's `outcome` so a later
+            // `read_execution_info` doesn't surface a stale
+            // terminal-outcome on a cancelled row. PG parallel in
+            // `ff-backend-postgres/src/flow.rs` cancel-member loop.
+            sqlx::query(q_flow::UPDATE_ATTEMPT_CLEAR_OUTCOME_FOR_CURRENT_SQL)
+                .bind(part)
+                .bind(exec_uuid)
                 .execute(&mut *conn)
                 .await
                 .map_err(map_sqlx_error)?;

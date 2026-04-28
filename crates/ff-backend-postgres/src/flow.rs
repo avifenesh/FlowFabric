@@ -686,6 +686,26 @@ async fn cancel_flow_once(
         .await
         .map_err(map_sqlx_error)?;
 
+        // #355: clear the current attempt's `outcome` so a later
+        // `read_execution_info` doesn't surface a stale
+        // `retry`/`interrupted` terminal-outcome on the cancelled row.
+        // Mirror of the SQLite companion statement in
+        // `ff-backend-sqlite/src/queries/flow.rs`
+        // (`UPDATE_ATTEMPT_CLEAR_OUTCOME_FOR_CURRENT_SQL`).
+        sqlx::query(
+            "UPDATE ff_attempt \
+                SET outcome = NULL \
+              WHERE partition_key = $1 \
+                AND execution_id  = $2 \
+                AND attempt_index = (SELECT attempt_index FROM ff_exec_core \
+                                      WHERE partition_key = $1 AND execution_id = $2)",
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
         // Emit a completion outbox row (trigger fires NOTIFY).
         sqlx::query(
             "INSERT INTO ff_completion_event \

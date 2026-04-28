@@ -23,9 +23,12 @@ pub(crate) const SELECT_PUBLIC_STATE_SQL: &str = r#"
 // ── read_execution_info (§4.1) ─────────────────────────────────────
 
 /// Multi-column projection of `ff_exec_core` joined with the current
-/// attempt row (for `outcome`) + the earliest started attempt row
-/// (for `started_at`). Mirrors PG's LATERAL joins with SQLite
-/// correlated subqueries in the SELECT list.
+/// attempt row (for `outcome`). Mirrors PG's single remaining LATERAL
+/// join with a SQLite correlated subquery in the SELECT list. Since
+/// migration 0016 (#356) `ff_exec_core.started_at_ms` is a set-once
+/// column populated on first claim, so the earlier "earliest attempt
+/// started_at_ms" subquery is gone — `ExecutionInfo.started_at` reads
+/// directly from the base row.
 ///
 /// Binds: ?1 partition_key, ?2 execution_id BLOB.
 pub(crate) const SELECT_EXECUTION_INFO_SQL: &str = r#"
@@ -41,19 +44,13 @@ pub(crate) const SELECT_EXECUTION_INFO_SQL: &str = r#"
            ec.attempt_index,
            ec.created_at_ms,
            ec.terminal_at_ms,
+           ec.started_at_ms,
            ec.raw_fields,
            (SELECT outcome
               FROM ff_attempt a
              WHERE a.partition_key = ec.partition_key
                AND a.execution_id  = ec.execution_id
-               AND a.attempt_index = ec.attempt_index) AS attempt_outcome,
-           (SELECT started_at_ms
-              FROM ff_attempt a
-             WHERE a.partition_key = ec.partition_key
-               AND a.execution_id  = ec.execution_id
-               AND a.started_at_ms IS NOT NULL
-             ORDER BY a.attempt_index ASC
-             LIMIT 1) AS first_started_at_ms
+               AND a.attempt_index = ec.attempt_index) AS attempt_outcome
       FROM ff_exec_core ec
      WHERE ec.partition_key = ?1 AND ec.execution_id = ?2
 "#;

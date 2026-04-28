@@ -1023,6 +1023,7 @@ pub(crate) async fn claim_resumed_execution_impl(
         sqlx::query(q_suspend::UPDATE_EXEC_CORE_RUNNING_SQL)
             .bind(part)
             .bind(exec_uuid)
+            .bind(now)
             .execute(&mut *conn)
             .await
             .map_err(map_sqlx_error)?;

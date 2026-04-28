@@ -23,7 +23,8 @@ pub(crate) const UPDATE_EXEC_CORE_CLAIM_SQL: &str = r#"
            ownership_state = 'leased',
            eligibility_state = 'not_applicable',
            public_state = 'running',
-           attempt_state = 'running_attempt'
+           attempt_state = 'running_attempt',
+           started_at_ms = COALESCE(started_at_ms, ?3)
      WHERE partition_key = ?1 AND execution_id = ?2
 "#;
 

@@ -1,9 +1,10 @@
 # RFC-020: Postgres Wave 9 — deferred backend impls
 
-**Status:** ACCEPTED — Revision 7
+**Status:** ACCEPTED — Revision 8
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-04-26
 **Accepted:** 2026-04-26
+**Revision 8:** 2026-04-26 — Wave 9 follow-up findings (#354, #355, #356) landed. **(#354)** §4.1 "maps directly" claim for `ff_exec_core.lifecycle_phase` + sibling state columns corrected to acknowledge the richer private alphabet encoded at the column level (Postgres writes `cancelled`, `released`, `pending_claim`, bare `running`, `blocked` as legitimate literals); the `normalise_*` shim in `crates/ff-backend-postgres/src/exec_core.rs` is documented as the boundary adapter, not a transient inconsistency — Option B (bless the adapter) per owner decision. **(#355)** `ff_attempt.outcome` now cleared on the two cancel paths that previously left it stale (`flow.rs` cancel-member loop; `exec_core::cancel_impl`); the existing `operator::cancel_execution_once` path already cleared it on live leases. **(#356)** Additive migration 0016 promotes first-claim timestamp from a LATERAL join on `ff_attempt.started_at_ms` to a typed `ff_exec_core.started_at_ms` column, set-once on first claim; Spine-B read path drops the LATERAL join. Parallel SQLite migration. Scope grows by one additive migration (0016 — 0015 reserved for RFC-024 claim-grant table) on each backend; method count unchanged.
 **Revision 2:** 2026-04-26 — Round-1 reviewer findings addressed (schema-ground-truth, design-spine reframe, drop G6, full-parity + coherent-wave directive)
 **Revision 3:** 2026-04-26 — Round-2 reviewer findings addressed: (A1/A2) new `ff_operator_event` channel (migration 0010) instead of repurposing `ff_signal_event`; (A3) `PendingWaitpointInfo` contract aligned, additive migration 0011 adds `waitpoint_key`/`state`/`required_signal_names`/`activated_at_ms` (**Revision 5 correction: `waitpoint_key` already shipped via migration 0004; 0011 adds 3 columns, not 4**); (A4) reconciler per-attempt scoping audited; (A5) `outcome`/`lifecycle_phase` column-binding clarified; (B1–B4) release-PR line items tightened; (C1) per-release-risk engagement in §8.7; (C2) intra-ack race traced to SERIALIZABLE retry; (C3a–d) resolved in §4.2.4/§4.2.7/§4.1/§6.3. Scope grows by two additive migrations (0010 + 0011); method count unchanged at 13.
 **Revision 4:** 2026-04-26 — Round-3 reviewer-A findings addressed: (NEW-1) `lifecycle_phase` enum literals corrected to lowercase real-enum values (`cancelled` / `runnable` / `NOT IN ('terminal','cancelled')`) across §4.2.1, §4.2.4, §4.2.5, §4.2.6; (NEW-4) stray `FOR UPDATE` removed from UPDATE in §4.2.4; (NEW-5) `waitpoint_key` pre-0011 projection behavior pinned in §4.5 (COALESCE to `''` + degraded-row counter) — **superseded by Revision 5 (moot: column already exists from 0004)**; (NEW-2) SERIALIZABLE retry budget pinned to 3 (matches `CANCEL_FLOW_MAX_ATTEMPTS` in `flow.rs:52`) in §4.2.3; (B-1) scope note for the producer-side `suspend_*` write-path change added to §3; (B-2) rollback-forward-only caveat added to §6.2; (C-polish) §8 adds a one-liner pointing at §4.2.4 for the repurpose-`ff_signal_event` rejection. No scope, alternatives, or new forks re-opened.
@@ -220,6 +221,36 @@ across every method in the spine.
 **Decision: join-on-read against the real schema.** A denormalised
 `ff_execution_view` projection was considered and rejected (§7.1
 owner-resolve).
+
+**Column-literal alphabet (Revision 8 correction, closes #354).** The
+Postgres `ff_exec_core` state columns (`lifecycle_phase`,
+`ownership_state`, `eligibility_state`, `public_state`,
+`attempt_state`) encode `(phase × eligibility × terminal-outcome)` in
+a **richer private alphabet** than the canonical `LifecyclePhase` /
+`OwnershipState` / `EligibilityState` / `PublicState` / `AttemptState`
+enums in `ff_core::state`. Earlier revisions described this mapping as
+"maps directly"; that claim was wrong. Write-paths in this crate
+(`flow.rs:674` cancel-member, `suspend_ops.rs` suspension-resume
+claim, `exec_core.rs` initial insert, scheduler-transitional claim
+paths) legitimately write Postgres-specific literals such as
+`cancelled`, `released`, `pending_claim`, bare `running`, `blocked`
+that are not members of the public enums. Read-paths call through a
+normalisation shim (`normalise_lifecycle_phase`,
+`normalise_ownership_state`, `normalise_eligibility_state`,
+`normalise_public_state`, `normalise_attempt_state` in
+`crates/ff-backend-postgres/src/exec_core.rs`) that collapses the
+column literals to the closest public-enum variant before
+`serde_json::from_str` deserialises into the enum type. **This
+adapter-at-the-read-boundary is the documented architecture, not a
+transient shim.** Option A (migrating the write-paths to canonical
+literals) was considered and rejected: it would relocate the
+encoding of terminal-outcome + scheduler-transitional state from SQL
+columns into per-write computation, which does not simplify the
+codebase — it just moves the mapping layer and loses the column-level
+audit trail of which backend phase produced each row. New read paths
+against these columns MUST call through the `normalise_*` helpers;
+new write paths MAY introduce new column literals, but MUST update
+the corresponding `normalise_*` arm in the same PR.
 
 The three reads project from the same column set:
 

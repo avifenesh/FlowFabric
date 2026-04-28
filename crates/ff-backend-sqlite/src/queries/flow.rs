@@ -106,6 +106,24 @@ pub(crate) const UPDATE_EXEC_CORE_CANCEL_MEMBER_SQL: &str = r#"
      WHERE partition_key = ?1 AND execution_id = ?2
 "#;
 
+/// Clear the current attempt's `outcome` on cancel-member so a later
+/// `read_execution_info` doesn't surface a stale `retry`/`interrupted`
+/// terminal-outcome on a cancelled row (#355). Mirror of the PG
+/// companion statement added on the cancel-member loop in
+/// `ff-backend-postgres/src/flow.rs`.
+///
+/// Binds:
+///   1. partition_key (i64)
+///   2. execution_id (Uuid)
+pub(crate) const UPDATE_ATTEMPT_CLEAR_OUTCOME_FOR_CURRENT_SQL: &str = r#"
+    UPDATE ff_attempt
+       SET outcome = NULL
+     WHERE partition_key = ?1
+       AND execution_id  = ?2
+       AND attempt_index = (SELECT attempt_index FROM ff_exec_core
+                             WHERE partition_key = ?1 AND execution_id = ?2)
+"#;
+
 /// RFC-016 Stage C bookkeeping: enqueue a pending-cancel row for
 /// every edge_group with `running_count > 0` on the cancelled flow
 /// (the Wave-5 dispatcher reads this).
