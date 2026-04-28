@@ -17,6 +17,8 @@ members = [
     "crates/ff-observability",
     "crates/ff-observability-http",
     "crates/flowfabric",
+    "tools/publish-list-lint",
+    "tools/non-exhaustive-lint",
 ]
 
 [workspace.package]
