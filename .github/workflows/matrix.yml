@@ -596,6 +596,42 @@ jobs:
             cargo check -p "$CRATE" --no-default-features --features "$feat"
           done <<< "$feats"
 
+  # RFC-023 Phase 4a — ff-core feature-leak guard. The agnostic-SDK
+  # compile anchor (`ff-sdk --no-default-features --features sqlite`)
+  # is only meaningful if ff-core stays at the minimal feature set
+  # (`core` only). Backends that over-activate their direct ff-core
+  # dep would silently leak `streaming` / `suspension` / `budget`
+  # through the sqlite cell and defeat the anchor. The valkey-default
+  # cell legitimately enables `streaming` via ff-backend-valkey's own
+  # `streaming` feature, so it is exempt.
+  feature-leak-guard:
+    name: feature-leak-guard (ff-sdk sqlite minimal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
+        with:
+          key: feature-leak-guard
+      - name: ff-sdk[sqlite] ff-core edge is core-only
+        run: |
+          set -euo pipefail
+          out=$(cargo tree -p ff-sdk --no-default-features --features sqlite --format '{p} {f}')
+          echo "$out" | grep -E "ff-core|ff-backend" || true
+          # Extract the feature list on every `ff-core vX` line in the
+          # tree. The first field after the trailing `) ` is the
+          # comma-joined active feature list.
+          ffcore_feats=$(echo "$out" | grep -oE "ff-core v[0-9.]+ \([^)]+\) [a-z,_-]*" | awk '{print $NF}' | sort -u)
+          echo "ff-core feature sets observed:"
+          echo "$ffcore_feats"
+          for forbidden in streaming suspension budget; do
+            if echo "$ffcore_feats" | grep -qw "$forbidden"; then
+              echo "FEATURE-LEAK: ff-core has '$forbidden' active in ff-sdk[sqlite] minimal anchor" >&2
+              exit 1
+            fi
+          done
+          echo "ff-sdk[sqlite] ff-core edge is minimal (core only) — ok"
+
   # RFC-023 §4.1 + issue #365 — parity-drift lint for the PG ↔ SQLite
   # migration pair. Blocks PRs that add a PG migration without a
   # matching SQLite port (or an `.sqlite-skip` entry with an issue
@@ -638,6 +674,7 @@ jobs:
       - publish-list-drift
       - non-exhaustive-lint
       - feature-propagation
+      - feature-leak-guard
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -651,6 +688,7 @@ jobs:
           PUBLISH_LIST_DRIFT_RESULT: ${{ needs.publish-list-drift.result }}
           NON_EXHAUSTIVE_LINT_RESULT: ${{ needs.non-exhaustive-lint.result }}
           FEATURE_PROPAGATION_RESULT: ${{ needs.feature-propagation.result }}
+          FEATURE_LEAK_GUARD_RESULT: ${{ needs.feature-leak-guard.result }}
         run: |
           fail=0
           case "$MATRIX_RESULT" in
@@ -684,5 +722,9 @@ jobs:
           case "$FEATURE_PROPAGATION_RESULT" in
             success|skipped) echo "feature-propagation: $FEATURE_PROPAGATION_RESULT — ok" ;;
             *) echo "feature-propagation: $FEATURE_PROPAGATION_RESULT — blocking merge" >&2; fail=1 ;;
+          esac
+          case "$FEATURE_LEAK_GUARD_RESULT" in
+            success|skipped) echo "feature-leak-guard: $FEATURE_LEAK_GUARD_RESULT — ok" ;;
+            *) echo "feature-leak-guard: $FEATURE_LEAK_GUARD_RESULT — blocking merge" >&2; fail=1 ;;
           esac
           exit $fail
