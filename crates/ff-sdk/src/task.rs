@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "valkey-default")]
 use std::time::Duration;
 
-use ferriskey::{Client, Value};
-use ff_core::backend::{Handle, HandleKind, PendingWaitpoint};
+#[cfg(feature = "valkey-default")]
+use ferriskey::Value;
+use ff_core::backend::Handle;
+#[cfg(feature = "valkey-default")]
+use ff_core::backend::{HandleKind, PendingWaitpoint};
+#[cfg(feature = "valkey-default")]
 use ff_core::contracts::ReportUsageResult;
 use ff_core::engine_backend::EngineBackend;
+#[cfg(feature = "valkey-default")]
 use ff_core::engine_error::StateKind;
 use ff_script::error::ScriptError;
 use ff_core::partition::PartitionConfig;
@@ -95,6 +101,7 @@ pub enum SignalOutcome {
     Duplicate { existing_signal_id: String },
 }
 
+#[cfg(feature = "valkey-default")]
 impl SignalOutcome {
     /// Parse a raw `ff_deliver_signal` FCALL result into a `SignalOutcome`.
     ///
@@ -141,10 +148,8 @@ pub use ff_core::backend::FailOutcome;
 ///
 /// `complete`, `fail`, and `cancel` consume `self` — this prevents
 /// double-complete bugs at the type level.
+#[cfg_attr(not(feature = "valkey-default"), allow(dead_code))]
 pub struct ClaimedTask {
-    /// Shared Valkey client.
-    #[allow(dead_code)]
-    client: Client,
     /// `EngineBackend` the trait-migrated ops forward through.
     ///
     /// **RFC-012 Stage 1b + Round-7.** Today this is always a
@@ -214,15 +219,13 @@ pub struct ClaimedTask {
     _concurrency_permit: Option<OwnedSemaphorePermit>,
 }
 
+#[cfg(feature = "valkey-default")]
 impl ClaimedTask {
     /// Construct a `ClaimedTask` from the results of a successful
     /// `ff_claim_execution` or `ff_claim_resumed_execution` FCALL.
     ///
     /// # Arguments
     ///
-    /// * `client` — shared Valkey client used for subsequent lease
-    ///   renewals, signal delivery, and the final
-    ///   complete/fail/cancel FCALL.
     /// * `partition_config` — partition topology snapshot read at
     ///   `FlowFabricWorker::connect`. Used for key construction on
     ///   the lifetime of this task.
@@ -269,7 +272,6 @@ impl ClaimedTask {
     /// permit — not promoting this constructor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: Client,
         backend: Arc<dyn EngineBackend>,
         partition_config: PartitionConfig,
         execution_id: ExecutionId,
@@ -311,7 +313,6 @@ impl ClaimedTask {
         );
 
         Self {
-            client,
             backend,
             partition_config,
             execution_id,
@@ -1042,6 +1043,7 @@ impl ClaimedTask {
 /// whether to call `stop_renewal()`: yes for landed responses, no
 /// for transport errors so the caller's retry path still sees a
 /// running renewal task.
+#[cfg(feature = "valkey-default")]
 fn fcall_landed<T>(r: &Result<T, crate::EngineError>) -> bool {
     match r {
         Ok(_) => true,
@@ -1057,6 +1059,7 @@ fn fcall_landed<T>(r: &Result<T, crate::EngineError>) -> bool {
 /// Stage 1b forwarder is reclassify a novel category as transient.
 /// Stage 1d (or issue #117) widens `FailureClass` with a
 /// `Custom(String)` arm for exact round-trip.
+#[cfg(feature = "valkey-default")]
 fn error_category_to_class(s: &str) -> ff_core::backend::FailureClass {
     use ff_core::backend::FailureClass;
     match s {
@@ -1106,6 +1109,7 @@ impl Drop for ClaimedTask {
 ///
 /// See `benches/harness/src/bin/long_running.rs` for the bench
 /// consumer that depends on this span naming.
+#[cfg(feature = "valkey-default")]
 #[tracing::instrument(
     name = "renew_lease",
     skip_all,
@@ -1133,6 +1137,7 @@ async fn renew_once(
 /// - `stop_signal` is notified (complete/fail/cancel called)
 /// - Renewal fails with a terminal error (stale_lease, lease_expired, etc.)
 /// - The task handle is aborted (ClaimedTask dropped)
+#[cfg(feature = "valkey-default")]
 fn spawn_renewal_task(
     backend: Arc<dyn EngineBackend>,
     handle: Handle,
@@ -1199,6 +1204,7 @@ fn spawn_renewal_task(
 }
 
 /// Check if an engine error means renewal should stop permanently.
+#[cfg(feature = "valkey-default")]
 #[allow(dead_code)]
 fn is_terminal_renewal_error(err: &crate::EngineError) -> bool {
     use crate::{ContentionKind, EngineError, StateKind};
@@ -1227,6 +1233,7 @@ fn is_terminal_renewal_error(err: &crate::EngineError) -> bool {
 /// parser paired with the producer (the Lua function registered at
 /// `lua/budget.lua:99`, `ff_report_usage_and_check`) is the defence
 /// against silent format drift between producer and consumer.
+#[cfg(feature = "valkey-default")]
 pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
@@ -1291,6 +1298,7 @@ pub fn parse_report_usage_result(raw: &Value) -> Result<ReportUsageResult, SdkEr
     }
 }
 
+#[cfg(feature = "valkey-default")]
 fn usage_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> String {
     match arr.get(index) {
         Some(Ok(Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
@@ -1313,6 +1321,7 @@ fn usage_field_str(arr: &[Result<Value, ferriskey::Error>], index: usize) -> Str
 /// silently coercing to `0` would surface drift as "zero-usage breach"
 /// — arithmetically correct but semantically nonsense. Fail loudly
 /// instead so drift shows up as a parse error at the first call site.
+#[cfg(feature = "valkey-default")]
 fn parse_usage_u64(
     arr: &[Result<Value, ferriskey::Error>],
     index: usize,
@@ -1426,6 +1435,7 @@ fn resume_waitpoint_id_from_suspension(
     Ok(Some(waitpoint_id))
 }
 
+#[cfg(feature = "valkey-default")]
 #[cfg_attr(not(feature = "direct-valkey-claim"), allow(dead_code))]
 pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(), SdkError> {
     let arr = match raw {
@@ -1511,6 +1521,7 @@ pub(crate) fn parse_success_result(raw: &Value, function_name: &str) -> Result<(
 /// Parse ff_deliver_signal result:
 ///   ok(signal_id, effect)
 ///   ok_duplicate(existing_signal_id)
+#[cfg(feature = "valkey-default")]
 pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError> {
     let arr = match raw {
         Value::Array(arr) => arr,
@@ -1622,6 +1633,7 @@ pub(crate) fn parse_signal_result(raw: &Value) -> Result<SignalOutcome, SdkError
 /// Parse ff_fail_execution result:
 ///   ok("retry_scheduled", delay_until)
 ///   ok("terminal_failed")
+#[cfg(feature = "valkey-default")]
 #[allow(dead_code)]
 fn parse_fail_result(raw: &Value) -> Result<FailOutcome, SdkError> {
     let arr = match raw {
@@ -1722,24 +1734,28 @@ pub const MAX_TAIL_BLOCK_MS: u64 = 30_000;
 /// Maximum frames per read/tail call. Mirrors
 /// `ff_core::contracts::STREAM_READ_HARD_CAP` — re-exported here so SDK
 /// callers don't need to import ff-core just to read the bound.
+#[cfg(feature = "valkey-default")]
 pub use ff_core::contracts::STREAM_READ_HARD_CAP;
 
 /// Result of [`read_stream`] / [`tail_stream`] — frames plus the terminal
 /// signal so polling consumers can exit cleanly.
 ///
 /// Re-export of `ff_core::contracts::StreamFrames` for SDK ergonomics.
+#[cfg(feature = "valkey-default")]
 pub use ff_core::contracts::StreamFrames;
 
 /// Opaque cursor for [`read_stream`] / [`tail_stream`] — re-export of
 /// `ff_core::contracts::StreamCursor`. Wire tokens: `"start"`, `"end"`,
 /// `"<ms>"`, `"<ms>-<seq>"`. Bare `-` / `+` are rejected — use
 /// `StreamCursor::Start` / `StreamCursor::End` instead.
+#[cfg(feature = "valkey-default")]
 pub use ff_core::contracts::StreamCursor;
 
 /// Reject `Start` / `End` cursors at the XREAD (`tail_stream`) boundary
 /// — XREAD does not accept the open markers. Pulled out as a bare
 /// function so unit tests can exercise the guard without constructing a
 /// live `ferriskey::Client`.
+#[cfg(feature = "valkey-default")]
 fn validate_tail_cursor(after: &StreamCursor) -> Result<(), SdkError> {
     if !after.is_concrete() {
         return Err(SdkError::Config {
@@ -1754,6 +1770,7 @@ fn validate_tail_cursor(after: &StreamCursor) -> Result<(), SdkError> {
     Ok(())
 }
 
+#[cfg(feature = "valkey-default")]
 fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
     if count_limit == 0 {
         return Err(SdkError::Config {
@@ -1799,6 +1816,7 @@ fn validate_stream_read_count(count_limit: u64) -> Result<(), SdkError> {
 /// FCALLs behind the reply. The REST server isolates reads on its
 /// `tail_client`; direct SDK callers should either use a dedicated
 /// client OR paginate through smaller `count_limit` slices.
+#[cfg(feature = "valkey-default")]
 pub async fn read_stream(
     backend: &dyn EngineBackend,
     execution_id: &ExecutionId,
@@ -1882,6 +1900,7 @@ pub async fn read_stream(
 /// the client was built with a shorter `request_timeout`. No custom client
 /// configuration is required for timeout reasons — only for head-of-line
 /// isolation above.
+#[cfg(feature = "valkey-default")]
 pub async fn tail_stream(
     backend: &dyn EngineBackend,
     execution_id: &ExecutionId,
@@ -1904,6 +1923,7 @@ pub async fn tail_stream(
 
 /// Tail helper with an explicit RFC-015
 /// [`TailVisibility`](ff_core::backend::TailVisibility) filter.
+#[cfg(feature = "valkey-default")]
 pub async fn tail_stream_with_visibility(
     backend: &dyn EngineBackend,
     execution_id: &ExecutionId,
@@ -1939,7 +1959,7 @@ pub async fn tail_stream_with_visibility(
         .await?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "valkey-default"))]
 mod tail_stream_boundary_tests {
     use super::*;
 
@@ -1980,7 +2000,7 @@ mod tail_stream_boundary_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "valkey-default"))]
 mod parse_report_usage_result_tests {
     use super::*;
 
@@ -2129,6 +2149,7 @@ mod parse_report_usage_result_tests {
 /// user-supplied key. Single-waitpoint scoping: all
 /// Single.waitpoint_key / Count.waitpoints[i] in the tree must be
 /// equal; this function returns the first one it encounters.
+#[cfg(feature = "valkey-default")]
 fn composite_first_waitpoint_key(body: &CompositeBody) -> Option<String> {
     match body {
         CompositeBody::AllOf { members } => members.iter().find_map(|m| match m {
@@ -2230,7 +2251,7 @@ mod resume_signals_tests {
     // is exercised by the integration tests in `ff-test`.
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "valkey-default"))]
 mod terminal_replay_parsing_tests {
     //! Unit tests for the SDK's parse path of the enriched
     //! `execution_not_active` error returned on a terminal-op replay.
