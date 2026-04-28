@@ -200,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 1_000,
         max_concurrent_tasks: 1,
+    partition_config: None,
     })
     .await?;
     let snap = sdk

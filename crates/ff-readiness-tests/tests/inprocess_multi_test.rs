@@ -108,6 +108,7 @@ async fn drive_one_execution(tag: &str) {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 4,
+    partition_config: None,
     };
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config)
         .await

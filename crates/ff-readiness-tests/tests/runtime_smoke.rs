@@ -41,6 +41,7 @@ async fn spawn_worker(lane: &str, ns: &str, sfx: &str) -> ff_sdk::FlowFabricWork
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 50,
         max_concurrent_tasks: 4,
+    partition_config: None,
     };
     ff_sdk::FlowFabricWorker::connect(cfg)
         .await
