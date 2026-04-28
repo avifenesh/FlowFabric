@@ -33,18 +33,20 @@ pub enum ClaimResumedExecutionResultPartial {
 impl ClaimResumedExecutionResultPartial {
     pub fn complete(self, execution_id: ExecutionId) -> ClaimResumedExecutionResult {
         match self {
-            Self::Claimed(p) => ClaimResumedExecutionResult::Claimed(ClaimedResumedExecution {
-                execution_id,
-                lease_id: p.lease_id,
-                lease_epoch: p.lease_epoch,
-                attempt_index: p.attempt_index,
-                attempt_id: p.attempt_id,
-                lease_expires_at: p.lease_expires_at,
-                // Handle populated by the backend impl (see
-                // `ff_backend_valkey::claim_resumed_execution_impl`) —
-                // ff-script has no `BackendTag` context here.
-                handle: ff_core::backend::stub_handle_resumed(),
-            }),
+            // Handle populated by the backend impl (see
+            // `ff_backend_valkey::claim_resumed_execution_impl`) —
+            // ff-script has no `BackendTag` context here.
+            Self::Claimed(p) => ClaimResumedExecutionResult::Claimed(
+                ClaimedResumedExecution::new(
+                    execution_id,
+                    p.lease_id,
+                    p.lease_epoch,
+                    p.attempt_index,
+                    p.attempt_id,
+                    p.lease_expires_at,
+                    ff_core::backend::stub_handle_resumed(),
+                ),
+            ),
         }
     }
 }

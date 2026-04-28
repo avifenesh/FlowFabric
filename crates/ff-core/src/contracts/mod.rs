@@ -561,6 +561,7 @@ impl ClaimExecutionArgs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClaimedExecution {
     pub execution_id: ExecutionId,
     pub lease_id: LeaseId,
@@ -576,6 +577,35 @@ pub struct ClaimedExecution {
     /// a stub on those paths.
     #[serde(default = "crate::backend::stub_handle_fresh")]
     pub handle: crate::backend::Handle,
+}
+
+impl ClaimedExecution {
+    /// Construct a `ClaimedExecution`. Added alongside
+    /// `#[non_exhaustive]` per `feedback_non_exhaustive_needs_constructor`
+    /// so consumers (backend impls building a claim outcome) can still
+    /// build the struct after it was sealed for forward-compat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        attempt_index: AttemptIndex,
+        attempt_id: AttemptId,
+        attempt_type: AttemptType,
+        lease_expires_at: TimestampMs,
+        handle: crate::backend::Handle,
+    ) -> Self {
+        Self {
+            execution_id,
+            lease_id,
+            lease_epoch,
+            attempt_index,
+            attempt_id,
+            attempt_type,
+            lease_expires_at,
+            handle,
+        }
+    }
 }
 
 /// Typed outcome of [`crate::engine_backend::EngineBackend::claim_execution`].
@@ -1397,6 +1427,7 @@ pub struct ClaimResumedExecutionArgs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClaimedResumedExecution {
     pub execution_id: ExecutionId,
     pub lease_id: LeaseId,
@@ -1410,6 +1441,33 @@ pub struct ClaimedResumedExecution {
     /// `ff_core::handle_codec::encode`.
     #[serde(default = "crate::backend::stub_handle_resumed")]
     pub handle: crate::backend::Handle,
+}
+
+impl ClaimedResumedExecution {
+    /// Construct a `ClaimedResumedExecution`. Added alongside
+    /// `#[non_exhaustive]` per `feedback_non_exhaustive_needs_constructor`
+    /// so consumers (backend impls building a resumed-claim outcome)
+    /// can still build the struct after it was sealed for forward-compat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        attempt_index: AttemptIndex,
+        attempt_id: AttemptId,
+        lease_expires_at: TimestampMs,
+        handle: crate::backend::Handle,
+    ) -> Self {
+        Self {
+            execution_id,
+            lease_id,
+            lease_epoch,
+            attempt_index,
+            attempt_id,
+            lease_expires_at,
+            handle,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

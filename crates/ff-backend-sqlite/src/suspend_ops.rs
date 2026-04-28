@@ -1080,15 +1080,15 @@ pub(crate) async fn claim_resumed_execution_impl(
         );
 
         Ok::<_, EngineError>((
-            ClaimResumedExecutionResult::Claimed(ClaimedResumedExecution {
-                execution_id: args.execution_id.clone(),
-                lease_id: args.lease_id.clone(),
+            ClaimResumedExecutionResult::Claimed(ClaimedResumedExecution::new(
+                args.execution_id.clone(),
+                args.lease_id.clone(),
                 lease_epoch,
                 attempt_index,
                 attempt_id,
-                lease_expires_at: TimestampMs::from_millis(new_expires),
+                TimestampMs::from_millis(new_expires),
                 handle,
-            }),
+            )),
             lease_event_id,
         ))
     }

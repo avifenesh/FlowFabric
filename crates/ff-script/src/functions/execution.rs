@@ -47,21 +47,21 @@ impl ClaimExecutionResultPartial {
     /// [`ClaimExecutionResult`]. Total match over Partial variants.
     pub fn complete(self, execution_id: ExecutionId) -> ClaimExecutionResult {
         match self {
-            Self::Claimed(p) => ClaimExecutionResult::Claimed(ClaimedExecution {
+            // Handle is populated by the backend impl (see
+            // `ff_backend_valkey::claim_execution_impl`) after the
+            // partial completes — ff-script does not have the
+            // `BackendTag` context to mint one here. Stub until
+            // the backend overwrites it.
+            Self::Claimed(p) => ClaimExecutionResult::Claimed(ClaimedExecution::new(
                 execution_id,
-                lease_id: p.lease_id,
-                lease_epoch: p.lease_epoch,
-                attempt_index: p.attempt_index,
-                attempt_id: p.attempt_id,
-                attempt_type: p.attempt_type,
-                lease_expires_at: p.lease_expires_at,
-                // Handle is populated by the backend impl (see
-                // `ff_backend_valkey::claim_execution_impl`) after the
-                // partial completes — ff-script does not have the
-                // `BackendTag` context to mint one here. Stub until
-                // the backend overwrites it.
-                handle: ff_core::backend::stub_handle_fresh(),
-            }),
+                p.lease_id,
+                p.lease_epoch,
+                p.attempt_index,
+                p.attempt_id,
+                p.attempt_type,
+                p.lease_expires_at,
+                ff_core::backend::stub_handle_fresh(),
+            )),
         }
     }
 }

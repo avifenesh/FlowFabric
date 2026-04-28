@@ -4439,6 +4439,11 @@ async fn claim_resumed_execution_impl(
 /// (`FlowFabricWorker::claim_next` at `ff-sdk/src/worker.rs:~624-637`).
 /// Keep the command shape byte-for-byte identical so bench traces
 /// match pre-PR.
+#[tracing::instrument(
+    name = "ff.scan_eligible_executions",
+    skip_all,
+    fields(backend = "valkey", lane_id = %args.lane_id, limit = args.limit)
+)]
 async fn scan_eligible_executions_impl(
     client: &ferriskey::Client,
     args: ScanEligibleArgs,
@@ -4498,6 +4503,16 @@ async fn scan_eligible_executions_impl(
 /// (`FlowFabricWorker::issue_claim_grant` at
 /// `ff-sdk/src/worker.rs:~763-804`). Wire (KEYS/ARGV) shape is
 /// byte-for-byte identical so bench traces match pre-PR.
+#[tracing::instrument(
+    name = "ff.issue_claim_grant",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        worker_id = %args.worker_id,
+        lane_id = %args.lane_id,
+    )
+)]
 async fn issue_claim_grant_impl(
     client: &ferriskey::Client,
     args: IssueClaimGrantArgs,
@@ -4573,6 +4588,15 @@ async fn issue_claim_grant_impl(
 /// (`FlowFabricWorker::block_route` at
 /// `ff-sdk/src/worker.rs:~818-866`). Wire (KEYS/ARGV) shape is
 /// byte-for-byte identical so bench traces match pre-PR.
+#[tracing::instrument(
+    name = "ff.block_route",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        lane_id = %args.lane_id,
+    )
+)]
 async fn block_route_impl(
     client: &ferriskey::Client,
     args: BlockRouteArgs,
