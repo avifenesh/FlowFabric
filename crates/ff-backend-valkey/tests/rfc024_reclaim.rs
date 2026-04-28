@@ -477,6 +477,61 @@ async fn issue_reclaim_grant_surfaces_server_authoritative_expires_at() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Valkey at 127.0.0.1:6379"]
+async fn reclaim_execution_cap_exceeded_at_argv9_exact_boundary() {
+    // Investigation: per memory project_reclaim_cap_exceeded_investigation.md,
+    // the PR-F (#402) agent observed `lease_reclaim_count=4, max=Some(4)`
+    // returning `Claimed(Handle)` instead of `ReclaimCapExceeded`. This
+    // test exercises the exact boundary with no policy override so the
+    // code path is purely ARGV[9] + Lua `>=` comparison at
+    // `flowfabric.lua:3065`.
+    let eid = new_eid();
+    let raw = setup_lease_expired_reclaimable(&eid).await;
+
+    let partition = partition_for(&eid);
+    let ctx = ExecKeyContext::new(&partition, &eid);
+    let core_key = ctx.core();
+
+    let _: Value = raw
+        .cmd("HSET")
+        .arg(&core_key)
+        .arg("lease_reclaim_count")
+        .arg("4")
+        .execute()
+        .await
+        .expect("HSET lease_reclaim_count");
+
+    let backend = connect_backend().await;
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone()))
+        .await
+        .expect("issue_reclaim_grant");
+
+    let out = backend
+        .reclaim_execution(reclaim_args(eid.clone(), Some(4)))
+        .await
+        .expect("reclaim_execution");
+
+    match out {
+        ReclaimExecutionOutcome::ReclaimCapExceeded {
+            execution_id,
+            reclaim_count,
+        } => {
+            assert_eq!(execution_id, eid);
+            assert_eq!(
+                reclaim_count, 4,
+                "authoritative cap should surface ARGV[9] max=4"
+            );
+        }
+        other => panic!(
+            "expected ReclaimCapExceeded at lease_reclaim_count=max=4 boundary, got {other:?}"
+        ),
+    }
+
+    cleanup_execution(&raw, &eid).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Valkey at 127.0.0.1:6379"]
 async fn reclaim_execution_cap_exceeded_reports_policy_override_not_argv_default() {
     // RFC-024 §4.6 regression: when a per-execution policy override at
     // <core>:policy sets `max_reclaim_count`, the Lua enforces that cap

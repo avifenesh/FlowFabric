@@ -383,6 +383,40 @@ async fn reclaim_execution_cap_exceeded_transitions_terminal() {
 
 #[tokio::test]
 #[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
+async fn reclaim_execution_cap_exceeded_at_argv9_exact_boundary() {
+    // Investigation: per memory project_reclaim_cap_exceeded_investigation.md,
+    // the PR-F (#402) agent observed `lease_reclaim_count=4, max=Some(4)`
+    // returning `Claimed` instead of `ReclaimCapExceeded` on Valkey. This
+    // PG parallel asserts the same exact-boundary scenario enforces the
+    // cap on the SQL backend too. PG reports the post-increment count
+    // (see sibling cap_exceeded_transitions_terminal test at
+    // `lease_reclaim_count=5, max=5 -> reclaim_count=6`), so boundary
+    // `count=4, max=4` -> `reclaim_count=5`.
+    let Some(pool) = setup_or_skip().await else { return; };
+    let lane = format!("lane-rec-cap-exact-{}", Uuid::new_v4());
+    let (part, exec_uuid, lane_id) =
+        seed_exec(&pool, &lane, "lease_expired_reclaimable", "active", 4).await;
+    let backend = backend_from_pool(pool.clone());
+    let eid = exec_id(part, exec_uuid);
+    let _ = backend
+        .issue_reclaim_grant(issue_args(eid.clone(), lane_id.clone(), "w-rec"))
+        .await
+        .unwrap();
+    let outcome = backend
+        .reclaim_execution(reclaim_args(eid.clone(), lane_id.clone(), "w-rec", Some(4)))
+        .await
+        .expect("ok");
+    assert!(
+        matches!(
+            outcome,
+            ReclaimExecutionOutcome::ReclaimCapExceeded { reclaim_count: 5, .. }
+        ),
+        "expected ReclaimCapExceeded at lease_reclaim_count=max=4 boundary, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (FF_PG_TEST_URL)"]
 async fn scheduler_claim_grant_writes_new_table_kind_claim() {
     let Some(pool) = setup_or_skip().await else { return; };
     let lane = format!("lane-sched-tbl-{}", Uuid::new_v4());
