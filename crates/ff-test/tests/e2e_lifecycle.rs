@@ -4379,6 +4379,7 @@ async fn test_max_concurrent_tasks_enforcement() {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 2,
+    partition_config: None,
     };
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 
@@ -4964,6 +4965,7 @@ async fn test_claim_from_grant_rejects_at_capacity() {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 1,
+    partition_config: None,
     };
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 
@@ -5049,6 +5051,7 @@ async fn test_claim_from_grant_rejects_at_capacity() {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 16,
+    partition_config: None,
     };
     let second_worker = ff_sdk::FlowFabricWorker::connect(second_worker_config)
         .await
@@ -5542,6 +5545,7 @@ async fn test_sdk_suspend_signal_resume_reclaim() {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 10,
+    partition_config: None,
     };
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 
@@ -5732,6 +5736,7 @@ async fn test_sdk_all_methods_smoke() {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 10,
+    partition_config: None,
     };
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 
@@ -5821,6 +5826,7 @@ async fn test_sdk_claim_retry_attempt_index() {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 10,
+    partition_config: None,
     };
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 
@@ -8866,6 +8872,7 @@ async fn build_reclaim_test_worker(
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 16,
+    partition_config: None,
     };
     ff_sdk::FlowFabricWorker::connect(config).await.unwrap()
 }
@@ -9243,6 +9250,7 @@ async fn test_claim_from_resume_grant_rejects_at_capacity() {
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 100,
         max_concurrent_tasks: 1,
+    partition_config: None,
     };
     let worker = ff_sdk::FlowFabricWorker::connect(worker_config).await.unwrap();
 

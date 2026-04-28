@@ -538,6 +538,7 @@ async fn echo_worker_loop(
         lease_ttl_ms: 30_000,
         claim_poll_interval_ms: 50,
         max_concurrent_tasks: 1,
+    partition_config: None,
     };
     let worker = FlowFabricWorker::connect(config).await?;
     let _ = AttemptIndex::new(0); // compile-time guard that the SDK type alias still exists

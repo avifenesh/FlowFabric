@@ -1,4 +1,5 @@
 use ff_core::backend::BackendConfig;
+use ff_core::partition::PartitionConfig;
 use ff_core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 
 /// Configuration for a FlowFabric worker.
@@ -38,6 +39,32 @@ pub struct WorkerConfig {
     pub claim_poll_interval_ms: u64,
     /// Maximum concurrent tasks. Default: 1.
     pub max_concurrent_tasks: usize,
+    /// Override for the server-published partition config.
+    ///
+    /// v0.12 PR-6: closes the follow-up flagged in
+    /// [`FlowFabricWorker::connect_with`]'s pre-PR-6 rustdoc
+    /// ("callers needing a non-default `PartitionConfig` under
+    /// non-Valkey backends use `connect` (Valkey) or override
+    /// post-construction through a future `WorkerConfig` field").
+    ///
+    /// * `None` (default) — `connect_with` uses
+    ///   [`PartitionConfig::default()`] (256 / 32 / 32);
+    ///   `connect` ignores this field and reads
+    ///   `ff:config:partitions` from Valkey as before.
+    /// * `Some(cfg)` — `connect_with` binds the worker to `cfg`
+    ///   directly; `connect` still prefers Valkey's published
+    ///   hash (this override is a `connect_with`-only knob, since
+    ///   Valkey's `ff:config:partitions` is authoritative when
+    ///   present).
+    ///
+    /// Consumers using a PG / SQLite backend whose deployment
+    /// uses a non-default `num_flow_partitions` (e.g. 512) must
+    /// set this — otherwise `describe_execution` + partition-
+    /// keyed claim paths compute the wrong partition index and
+    /// silently miss data.
+    ///
+    /// [`FlowFabricWorker::connect_with`]: crate::FlowFabricWorker::connect_with
+    pub partition_config: Option<PartitionConfig>,
 }
 
 impl WorkerConfig {

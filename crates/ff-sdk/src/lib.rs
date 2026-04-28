@@ -33,6 +33,7 @@
 //!         lease_ttl_ms: 30_000,
 //!         claim_poll_interval_ms: 1_000,
 //!         max_concurrent_tasks: 1,
+//!         partition_config: None,
 //!     };
 //!
 //!     let worker = FlowFabricWorker::connect(config).await?;
@@ -75,7 +76,11 @@
 //! [`ClaimGrant`]: crate::ClaimGrant
 //! [`ResumeGrant`]: crate::ResumeGrant
 
-#[cfg(feature = "valkey-default")]
+// v0.12 PR-6: `admin` is always compiled. The one Valkey-typed helper
+// (`rotate_waitpoint_hmac_secret_all_partitions`, which takes a
+// `&ferriskey::Client`) stays item-gated behind `valkey-default`;
+// everything else in the module is transport-agnostic (reqwest +
+// ff-core contracts + serde).
 pub mod admin;
 pub mod config;
 pub mod engine_error;
@@ -86,7 +91,8 @@ pub mod engine_error;
     feature = "layer-circuit-breaker",
 ))]
 pub mod layer;
-#[cfg(feature = "valkey-default")]
+// v0.12 PR-6: `snapshot` is always compiled. Every method routes
+// through `self.backend_ref().*` — no direct ferriskey usage.
 pub mod snapshot;
 // v0.12 PR-2: `task` is always compiled. Items that depend on
 // ferriskey / ff-backend-valkey / ff-core streaming+suspension types
@@ -94,6 +100,11 @@ pub mod snapshot;
 // reachable under `default-features = false, features = ["sqlite"]`
 // so consumers can name `ClaimedTask` as a type.
 pub mod task;
+// v0.12 PR-6: Valkey-specific connect preamble extracted from
+// `FlowFabricWorker::connect`. Gated behind `valkey-default` because
+// the body is all ferriskey `client.cmd(...)` + `client.hgetall(...)`.
+#[cfg(feature = "valkey-default")]
+pub(crate) mod valkey_preamble;
 // RFC-023 Phase 1a (§4.4 item 10): `worker` is always compiled.
 // The ferriskey-dependent methods inside it are `valkey-default`-
 // gated at the item level; the module itself no longer is, so
@@ -101,13 +112,23 @@ pub mod task;
 // are reachable under `default-features = false, features = ["sqlite"]`.
 pub mod worker;
 
-// Re-exports for convenience
-#[cfg(feature = "valkey-default")]
+// Re-exports for convenience.
+//
+// v0.12 PR-6: the transport-agnostic admin surface (HTTP REST client +
+// request/response shapes + `PartitionRotationOutcome`) is reachable
+// under `--no-default-features --features sqlite`.
+// `rotate_waitpoint_hmac_secret_all_partitions` stays `valkey-default`-
+// gated — it takes a `&ferriskey::Client` and calls the
+// `ff_rotate_waitpoint_hmac_secret` FCALL directly. Option 1 of the
+// PR-6 plan: keep the helper in `admin.rs` item-gated to minimize
+// consumer blast radius; relocation to `ff-backend-valkey` is v0.13
+// scope if ever justified.
 pub use admin::{
-    rotate_waitpoint_hmac_secret_all_partitions, FlowFabricAdminClient,
-    IssueReclaimGrantRequest, IssueReclaimGrantResponse, PartitionRotationOutcome,
-    RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
+    FlowFabricAdminClient, IssueReclaimGrantRequest, IssueReclaimGrantResponse,
+    PartitionRotationOutcome, RotateWaitpointSecretRequest, RotateWaitpointSecretResponse,
 };
+#[cfg(feature = "valkey-default")]
+pub use admin::rotate_waitpoint_hmac_secret_all_partitions;
 // RFC-023 Phase 1a: re-export `SqliteBackend` so consumers using
 // `ff-sdk = { default-features = false, features = ["sqlite"] }` can
 // name it as `ff_sdk::SqliteBackend` without pinning the
