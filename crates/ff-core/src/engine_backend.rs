@@ -90,7 +90,9 @@ use crate::contracts::{StreamCursor, StreamFrames};
 use crate::engine_error::EngineError;
 #[cfg(feature = "core")]
 use crate::types::EdgeId;
-use crate::types::{AttemptIndex, BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs};
+use crate::types::{
+    AttemptIndex, BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs, WaitpointId,
+};
 
 /// The engine write surface — a single trait a backend implementation
 /// honours to serve a `FlowFabricWorker`.
@@ -251,6 +253,58 @@ pub trait EngineBackend: Send + Sync + 'static {
         waitpoint_key: &str,
         expires_in: Duration,
     ) -> Result<PendingWaitpoint, EngineError>;
+
+    /// Read the HMAC token stored on a waitpoint record, keyed by
+    /// `(partition, waitpoint_id)`.
+    ///
+    /// Returns `Ok(Some(token))` when the waitpoint exists and carries
+    /// a token, `Ok(None)` when the waitpoint does not exist or no
+    /// token field is present. A missing waitpoint is not an error —
+    /// signals can legitimately arrive after a waitpoint has been
+    /// consumed or expired, and the signal-bridge authenticates on the
+    /// presence of a matching token, not on the waitpoint's liveness.
+    ///
+    /// # Use case
+    ///
+    /// Control-plane signal delivery (cairn signal-bridge): at
+    /// signal-resume time the bridge reads the token off the
+    /// waitpoint hash / row to authenticate the resume request it
+    /// subsequently issues. Previously implemented as direct
+    /// `ferriskey::Client::hget(waitpoint_key, "waitpoint_token")` —
+    /// Valkey-only. This method routes the read through the trait so
+    /// the pattern works on Postgres + SQLite as well.
+    ///
+    /// # Per-backend shape
+    ///
+    /// * **Valkey** — `HGET ff:wp:<tag>:<waitpoint_id> waitpoint_token`
+    ///   on the waitpoint's partition. Empty string / missing field
+    ///   maps to `None`.
+    /// * **Postgres** — `SELECT token FROM ff_waitpoint_pending
+    ///   WHERE partition_key = $1 AND waitpoint_id = $2 LIMIT 1`.
+    ///   Row-absent → `None`; empty `token` → `None`.
+    /// * **SQLite** — same shape as Postgres.
+    ///
+    /// The `partition` argument is the opaque [`PartitionKey`]
+    /// produced by FlowFabric (typically extracted from the
+    /// `Handle` / `ResumeToken` the waitpoint was minted against).
+    ///
+    /// # Default impl
+    ///
+    /// Returns [`EngineError::Unavailable`] with
+    /// `op = "read_waitpoint_token"` so out-of-tree backends and
+    /// in-tree backends not yet overriding this method continue to
+    /// compile. Mirrors the precedent used by
+    /// [`Self::issue_reclaim_grant`] / [`Self::reclaim_execution`].
+    #[cfg(feature = "core")]
+    async fn read_waitpoint_token(
+        &self,
+        _partition: PartitionKey,
+        _waitpoint_id: &WaitpointId,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_waitpoint_token",
+        })
+    }
 
     /// Non-mutating observation of signals that satisfied the handle's
     /// resume condition.

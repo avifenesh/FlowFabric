@@ -526,6 +526,15 @@ impl EngineBackend for PostgresBackend {
         unavailable("pg.create_waitpoint")
     }
 
+    #[tracing::instrument(name = "pg.read_waitpoint_token", skip_all)]
+    async fn read_waitpoint_token(
+        &self,
+        partition: PartitionKey,
+        waitpoint_id: &ff_core::types::WaitpointId,
+    ) -> Result<Option<String>, EngineError> {
+        suspend_ops::read_waitpoint_token_impl(&self.pool, &partition, waitpoint_id).await
+    }
+
     #[tracing::instrument(name = "pg.observe_signals", skip_all)]
     async fn observe_signals(
         &self,

@@ -2679,6 +2679,14 @@ impl EngineBackend for SqliteBackend {
         .await
     }
 
+    async fn read_waitpoint_token(
+        &self,
+        partition: PartitionKey,
+        waitpoint_id: &ff_core::types::WaitpointId,
+    ) -> Result<Option<String>, EngineError> {
+        crate::reads::read_waitpoint_token_impl(&self.inner.pool, &partition, waitpoint_id).await
+    }
+
     async fn observe_signals(&self, handle: &Handle) -> Result<Vec<ResumeSignal>, EngineError> {
         let pool = &self.inner.pool;
         retry_serializable(|| crate::suspend_ops::observe_signals_impl(pool, handle)).await
