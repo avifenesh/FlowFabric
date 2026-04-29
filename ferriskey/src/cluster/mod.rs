@@ -1531,6 +1531,45 @@ impl<C> Future for Request<C> {
                         .into()
                     }
                     RetryMethod::RefreshSlotsAndRetry => {
+                        // FanOut sub-request short-circuit.
+                        //
+                        // A sub-request dispatched by `execute_on_multiple_nodes`
+                        // carries `CmdArg::MultiCmd` with routing
+                        // `InternalSingleNodeRouting::Connection { address, .. }`
+                        // — pinned to the originally-selected node. On READONLY
+                        // (replica rejected a write), `reset_routing` rewrites
+                        // that to `ByAddress(address)` — still the same
+                        // (now-replica) node. Slot refresh therefore cannot
+                        // redirect this sub-request, and local retries burn
+                        // the full `number_of_retries` budget against a
+                        // replica (~30s with default params) before the
+                        // error bubbles up to the aggregator.
+                        //
+                        // That delay exhausts bounded application-level
+                        // wall-clock budgets (e.g. ff-script's 14.5s
+                        // library-load loop) long before the aggregate-level
+                        // READONLY → RefreshSlots + redrive fires
+                        // (`OperationTarget::FanOut` arm above, introduced
+                        // by the #426 fix). Short-circuit here: respond with
+                        // the READONLY error immediately so the aggregator
+                        // observes it on the next `try_join_all` poll and
+                        // can redrive the whole fan-out against the
+                        // refreshed slot map.
+                        if err.kind() == ErrorKind::ReadOnly
+                            && matches!(
+                                this.request.as_ref().unwrap().info.cmd,
+                                CmdArg::MultiCmd { .. }
+                            )
+                        {
+                            warn!(
+                                "FanOut sub-request on {:?} returned READONLY; bubbling up to \
+                                 aggregator for topology-refreshing redrive (no local retry)",
+                                address
+                            );
+                            self.respond(Err(err));
+                            return Next::Done.into();
+                        }
+
                         let mut request = this.request.take().unwrap();
                         request.info.reset_routing();
                         Next::RefreshSlots {
