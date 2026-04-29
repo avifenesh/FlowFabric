@@ -5,6 +5,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Backend-agnostic `FlowFabricAdminClient` facade (SC-10 ergonomics
+  follow-up, v0.13).** `FlowFabricAdminClient` now supports both HTTP
+  (`new` / `with_token` — existing) and embedded
+  (`connect_with(Arc<dyn EngineBackend>)` — new) transports behind
+  one public method surface. `claim_for_worker`,
+  `issue_reclaim_grant`, and `rotate_waitpoint_secret` dispatch to
+  the matching `EngineBackend` trait method on the embedded path.
+  Consumers running under `FF_DEV_MODE=1` + SQLite no longer need to
+  drop down to trait-direct `backend.issue_reclaim_grant(...)` — the
+  full SDK admin surface is reachable without standing up an
+  `ff-server`. `EngineError::Unavailable` from the backend maps to
+  `SdkError::AdminApi { status: 503, kind: Some("unavailable"), ... }`
+  so callers see a uniform admin-error surface regardless of
+  transport. `examples/incident-remediation` updated to drive the
+  supervisor's reclaim path through the facade. See
+  [`docs/CONSUMER_MIGRATION_0.13.md`](docs/CONSUMER_MIGRATION_0.13.md).
+
 ## [0.12.0] - 2026-04-28
 
 ### Changed
