@@ -1676,6 +1676,54 @@ mod sqlite_only_compile_surface_tests {
         }
     }
 
+    /// v0.13 SC-10 compile anchor — the backend-agnostic admin facade
+    /// (`FlowFabricAdminClient::connect_with` + embedded-transport
+    /// methods) MUST be addressable under
+    /// `--no-default-features --features sqlite`. Without this anchor,
+    /// a regression that re-introduces a ferriskey symbol on the
+    /// embedded admin path would only surface on downstream
+    /// sqlite-only consumers.
+    #[test]
+    fn admin_facade_addressable_under_sqlite_only() {
+        use crate::admin::{
+            ClaimForWorkerRequest, ClaimForWorkerResponse, FlowFabricAdminClient,
+            IssueReclaimGrantRequest, IssueReclaimGrantResponse, RotateWaitpointSecretRequest,
+            RotateWaitpointSecretResponse,
+        };
+        use crate::SdkError;
+        use std::sync::Arc;
+
+        // `connect_with` is infallible; fn-pointer coerce pins the
+        // signature under the sqlite-only feature set.
+        let _ctor: fn(Arc<dyn EngineBackend>) -> FlowFabricAdminClient =
+            FlowFabricAdminClient::connect_with;
+
+        // Each async method is generic over `&self` lifetimes under
+        // `#[async_trait]`-style expansion, so pin via a wrapper fn.
+        #[allow(dead_code)]
+        async fn _pin_claim(
+            c: &FlowFabricAdminClient,
+            req: ClaimForWorkerRequest,
+        ) -> Result<Option<ClaimForWorkerResponse>, SdkError> {
+            c.claim_for_worker(req).await
+        }
+        #[allow(dead_code)]
+        async fn _pin_reclaim(
+            c: &FlowFabricAdminClient,
+            id: &str,
+            req: IssueReclaimGrantRequest,
+        ) -> Result<IssueReclaimGrantResponse, SdkError> {
+            c.issue_reclaim_grant(id, req).await
+        }
+        #[allow(dead_code)]
+        async fn _pin_rotate(
+            c: &FlowFabricAdminClient,
+            req: RotateWaitpointSecretRequest,
+        ) -> Result<RotateWaitpointSecretResponse, SdkError> {
+            c.rotate_waitpoint_secret(req).await
+        }
+    }
+
     /// v0.12 PR-3 compile anchor — the new
     /// [`EngineBackend::read_current_attempt_index`] trait method MUST
     /// be addressable under `--no-default-features --features sqlite`.

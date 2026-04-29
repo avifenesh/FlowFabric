@@ -42,13 +42,16 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use ff_core::backend::{BackendConfig, CapabilitySet, ClaimPolicy};
 use ff_core::contracts::{
-    AddExecutionToFlowArgs, CreateExecutionArgs, CreateFlowArgs, IssueReclaimGrantArgs,
-    IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome,
+    AddExecutionToFlowArgs, CreateExecutionArgs, CreateFlowArgs, ReclaimExecutionArgs,
+    ReclaimExecutionOutcome,
 };
 use ff_core::engine_backend::EngineBackend;
 use ff_core::types::{
     AttemptId, AttemptIndex, ExecutionId, FlowId, LaneId, LeaseId, Namespace, TimestampMs,
     WorkerId, WorkerInstanceId,
+};
+use ff_sdk::admin::{
+    FlowFabricAdminClient, IssueReclaimGrantRequest, IssueReclaimGrantResponse,
 };
 use ff_sdk::{FlowFabricWorker, WorkerConfig};
 use tracing::info;
@@ -151,6 +154,13 @@ async fn run_sqlite() -> Result<()> {
         .await
         .context("construct SqliteBackend")?;
     let trait_obj: Arc<dyn EngineBackend> = backend.clone();
+    // v0.13 SC-10 ergonomics: `FlowFabricAdminClient::connect_with`
+    // gives the supervisor the same admin surface it would have under
+    // an HTTP `ff-server`, with no server process required. The
+    // RFC-024 `issue_reclaim_grant` call below used to trait-dispatch
+    // through `backend.issue_reclaim_grant(...)`; with the facade the
+    // supervisor drives the agnostic SDK admin client instead.
+    let admin = FlowFabricAdminClient::connect_with(trait_obj.clone());
     info!(target: "engine", "[engine] SQLite dev backend ready");
 
     // Side-pool mirrors examples/ff-dev — dev-only column surgery the
@@ -248,19 +258,14 @@ async fn run_sqlite() -> Result<()> {
 
     // ── 5. Supervisor issues a reclaim grant (RFC-024 §3.2) ─────────────
     //
-    // NB: in a deployment with `ff-server` reachable, this is
-    // `FlowFabricAdminClient::issue_reclaim_grant` over HTTP. Under
-    // FF_DEV_MODE=1 + SQLite there is no ff-server, so we invoke the
-    // trait method directly — same primitive, no transport round-trip.
-    // See `docs/CONSUMER_MIGRATION_0.12.md` §7 for the HTTP shape.
-    let grant = issue_grant(
-        trait_obj.as_ref(),
-        &exec_id,
-        &lane,
-        "responder-b",
-        "responder-b-instance-1",
-    )
-    .await?;
+    // v0.13 SC-10 ergonomics: `FlowFabricAdminClient::issue_reclaim_grant`
+    // is backend-agnostic — the same method call works whether the
+    // client was built via `connect` (HTTP → `ff-server`) or
+    // `connect_with` (embedded trait-dispatch, as here). Under
+    // `FF_DEV_MODE=1` + SQLite no `ff-server` is running; the facade
+    // handles that. See `docs/CONSUMER_MIGRATION_0.13.md`.
+    let grant = issue_grant(&admin, &exec_id, &lane, "responder-b", "responder-b-instance-1")
+        .await?;
     info!(target: "supervisor", execution = %exec_id, grant = %grant.grant_key, "[supervisor] issued reclaim grant for Responder B");
 
     // ── 6. Responder B consumes the grant via the SDK ───────────────────
@@ -334,7 +339,7 @@ async fn run_sqlite() -> Result<()> {
         info!(target: "engine", round, "[engine] simulating lease expiry + reclaim round");
         force_lease_expired(&side_pool, &escalated).await?;
         let grant = issue_grant(
-            trait_obj.as_ref(),
+            &admin,
             &escalated,
             &lane,
             "responder-b",
@@ -403,30 +408,40 @@ async fn build_worker(
 }
 
 async fn issue_grant(
-    backend: &dyn EngineBackend,
+    admin: &FlowFabricAdminClient,
     exec_id: &ExecutionId,
     lane: &LaneId,
     worker_id: &str,
     worker_instance_id: &str,
 ) -> Result<ff_core::contracts::ReclaimGrant> {
-    let outcome = backend
-        .issue_reclaim_grant(IssueReclaimGrantArgs::new(
-            exec_id.clone(),
-            WorkerId::new(worker_id),
-            WorkerInstanceId::new(worker_instance_id),
-            lane.clone(),
-            None,
-            60_000,
-            None,
-            None,
-            Default::default(),
-            TimestampMs::from_millis(now_ms()),
-        ))
+    let resp = admin
+        .issue_reclaim_grant(
+            exec_id.as_str(),
+            IssueReclaimGrantRequest {
+                worker_id: worker_id.into(),
+                worker_instance_id: worker_instance_id.into(),
+                lane_id: lane.as_str().to_owned(),
+                capability_hash: None,
+                grant_ttl_ms: 60_000,
+                route_snapshot_json: None,
+                admission_summary: None,
+                worker_capabilities: Vec::new(),
+            },
+        )
         .await
-        .context("issue_reclaim_grant")?;
-    match outcome {
-        IssueReclaimGrantOutcome::Granted(g) => Ok(g),
-        other => anyhow::bail!("expected Granted, got {other:?}"),
+        .context("FlowFabricAdminClient::issue_reclaim_grant")?;
+    match resp {
+        IssueReclaimGrantResponse::Granted { .. } => resp
+            .into_grant()
+            .context("into_grant from Granted response"),
+        IssueReclaimGrantResponse::NotReclaimable { detail, .. } => {
+            anyhow::bail!("expected Granted, got NotReclaimable: {detail}")
+        }
+        IssueReclaimGrantResponse::ReclaimCapExceeded { reclaim_count, .. } => {
+            anyhow::bail!(
+                "expected Granted, got ReclaimCapExceeded (reclaim_count={reclaim_count})"
+            )
+        }
     }
 }
 
@@ -454,17 +469,6 @@ fn reclaim_args(
         WorkerInstanceId::new(old_worker_instance_id),
         AttemptIndex::new(current_attempt_index),
     )
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(0)
 }
 
 fn uuid_of(eid: &ExecutionId) -> Uuid {
