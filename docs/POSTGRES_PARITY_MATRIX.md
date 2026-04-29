@@ -418,6 +418,7 @@ scale demands Valkey or Postgres.
 | Subscribe (lease / completion / signal) | `impl` | `impl` | `impl` | **v0.12.** SQLite uses `tokio::sync::broadcast` channels for WAKEUP + outbox tables (migrations 0006 / 0007 / 0010 analogues) for cursor-resume, mirroring the RFC-019 contract. In-process only — cross-process subscribe fan-out is a PG-only property. |
 | `subscribe_instance_tags` | `n/a` | `n/a` | `n/a` | Deferred per #311 (speculative demand; served by `list_executions` + `ScannerFilter::with_instance_tag`). |
 | Admin rotation + seed | `impl` | `impl` | `impl` | — |
+| Tags (`set_execution_tag`, `set_flow_tag`, `get_execution_tag`, `get_flow_tag`) | `impl` | `impl` | `impl` | **v0.12 follow-up (issue #433).** Operator/control-plane point-writes + reads for caller-namespaced tags (e.g. `cairn.session_id`). Valkey routes to `ff_set_{execution,flow}_tags` Lua; PG/SQLite upsert `raw_fields` JSON(B) (`tags.<k>` for exec, top-level `<k>` for flow). Trait-side `ff_core::engine_backend::validate_tag_key` enforces the `^[a-z][a-z0-9_]*\.[^.]` regex on every backend; read-side missing-row collapses to `Ok(None)`. |
 | Cross-cutting (`backend_label`, `ping`, `shutdown_prepare`, `prepare`) | `impl` | `impl` | `impl` | SQLite `prepare` returns `PrepareOutcome::NoOp` (migrations run via `sqlx::migrate!` at pool init); `shutdown_prepare` drains the N=1 scanner supervisor. |
 
 ### SQLite-specific notes

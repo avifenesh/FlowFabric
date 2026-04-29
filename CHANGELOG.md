@@ -23,6 +23,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   transport. `examples/incident-remediation` updated to drive the
   supervisor's reclaim path through the facade. See
   [`docs/CONSUMER_MIGRATION_0.13.md`](docs/CONSUMER_MIGRATION_0.13.md).
+- **`EngineBackend` tag point-writes + reads (issue #433).** Four new
+  trait methods land `set_execution_tag`, `set_flow_tag`,
+  `get_execution_tag`, `get_flow_tag` so operator/control-plane
+  tooling can write caller-namespaced tags (e.g. `cairn.session_id`,
+  `cairn.archived`) through `Arc<dyn EngineBackend>` on any backend
+  instead of downcasting to `ValkeyBackend` + direct `HSET`. Backed by
+  the existing `ff_set_{execution,flow}_tags` Lua contracts on Valkey
+  and `raw_fields` JSON(B) upserts on Postgres/SQLite. New trait-side
+  `ff_core::engine_backend::validate_tag_key` helper enforces the
+  `^[a-z][a-z0-9_]*\.[^.]` namespace regex on every backend so
+  Postgres/SQLite reject the same keys as Valkey. Read-side
+  missing-row collapses to `Ok(None)` (matches Valkey's `HGET`
+  semantics); write-side missing entity surfaces as
+  `EngineError::NotFound`. Cross-backend parity tests live at
+  `crates/ff-test/tests/matrix_engine_backend_tags.rs` (Valkey + PG)
+  and `crates/ff-backend-sqlite/tests/engine_backend_tags.rs`
+  (SQLite). No migrations — existing `raw_fields` JSONB already holds
+  tags on PG/SQLite.
 
 ## [0.12.0] - 2026-04-28
 

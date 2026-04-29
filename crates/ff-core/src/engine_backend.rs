@@ -529,6 +529,149 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Snapshot a flow by id. `Ok(None)` ⇒ no such flow.
     async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError>;
 
+    // ── Namespaced tag point-writes / reads (issue #433) ──
+
+    /// Set a single namespaced tag on an execution. Tag `key` MUST match
+    /// the reserved caller-namespace pattern `^[a-z][a-z0-9_]*\.[^.]` —
+    /// i.e. `<caller>.<field>` — or the call returns
+    /// [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+    /// with the offending key in `detail`. `value` is arbitrary UTF-8.
+    ///
+    /// The namespace prefix is carried inline in `key` (e.g.
+    /// `"cairn.session_id"`) — there is no separate `namespace` arg.
+    /// This matches the existing `ff_set_execution_tags` wire shape and
+    /// the flow-tag projection in [`ExecutionSnapshot::tags`].
+    ///
+    /// Validation is performed trait-side via [`validate_tag_key`]
+    /// **before** reaching the backend so PG / SQLite / Valkey reject
+    /// the same set of keys. Backends MAY additionally validate on the
+    /// storage tier (Valkey's Lua path does).
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `ff_set_execution_tags` FCALL with a single
+    ///   `{key → value}` pair. Routes through the existing Lua
+    ///   contract (no new wire format).
+    /// * **Postgres** — `UPDATE ff_exec_core SET raw_fields = jsonb_set(
+    ///   coalesce(raw_fields, '{}'::jsonb), '{tags,<key>}', to_jsonb($value))
+    ///   WHERE (partition_key, execution_id) = ...`. Same storage shape
+    ///   read by [`Self::describe_execution`] / [`Self::read_execution_context`].
+    /// * **SQLite** — `UPDATE ff_exec_core SET raw_fields = json_set(
+    ///   coalesce(raw_fields, '{}'), '$.tags.<key>', $value) WHERE ...`.
+    ///   Same `raw_fields.tags` shape as PG.
+    ///
+    /// Missing execution surfaces as
+    /// [`EngineError::NotFound { entity: "execution" }`](crate::engine_error::EngineError::NotFound)
+    /// — matches the Valkey FCALL's `execution_not_found` mapping and
+    /// the existing `ScriptError::ExecutionNotFound` → `EngineError`
+    /// conversion (`ff_script::engine_error_ext`).
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so the
+    /// trait addition is non-breaking for out-of-tree backends.
+    async fn set_execution_tag(
+        &self,
+        _execution_id: &ExecutionId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "set_execution_tag",
+        })
+    }
+
+    /// Set a single namespaced tag on a flow. Same namespace rule as
+    /// [`Self::set_execution_tag`]: `key` MUST match
+    /// `^[a-z][a-z0-9_]*\.[^.]`.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `ff_set_flow_tags` FCALL with a single pair.
+    ///   Inherits the Lua side's lazy migration of any pre-58.4
+    ///   inline-on-`flow_core` tags to the dedicated `:tags` key.
+    /// * **Postgres** — `UPDATE ff_flow_core SET raw_fields =
+    ///   jsonb_set(..., '{<key>}', ...)` — flow tags are stored as
+    ///   top-level `raw_fields` keys (matches
+    ///   `ff_backend_postgres::flow::extract_tags`). No `tags` nesting
+    ///   on flows, which diverges from the execution shape.
+    /// * **SQLite** — mirrors PG: `UPDATE ff_flow_core SET raw_fields =
+    ///   json_set(..., '$.<key>', $value) WHERE ...`.
+    ///
+    /// Missing flow surfaces as
+    /// [`EngineError::NotFound { entity: "flow" }`](crate::engine_error::EngineError::NotFound)
+    /// (matches the Valkey FCALL's `flow_not_found` mapping).
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn set_flow_tag(
+        &self,
+        _flow_id: &FlowId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "set_flow_tag",
+        })
+    }
+
+    /// Read a single namespaced execution tag. Returns `Ok(None)` when
+    /// the tag is absent **or** the execution row does not exist —
+    /// the two cases are not distinguished on the read path. Callers
+    /// that need to distinguish should call [`Self::describe_execution`]
+    /// first (an `Ok(None)` from that method proves the execution is
+    /// absent). This matches Valkey's native `HGET` semantics and
+    /// keeps the read path at a single round-trip on every backend.
+    ///
+    /// `key` must pass [`validate_tag_key`] — a malformed key can
+    /// never be present in storage so the call short-circuits with
+    /// [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+    /// rather than round-tripping.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET :tags <key>` on the execution's partition.
+    /// * **Postgres** — `SELECT raw_fields->'tags'->><key> FROM ff_exec_core
+    ///   WHERE ...` with `fetch_optional` → missing row collapses to `None`.
+    /// * **SQLite** — `SELECT json_extract(raw_fields, '$.tags.<key>')
+    ///   FROM ff_exec_core WHERE ...` with the same collapse.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn get_execution_tag(
+        &self,
+        _execution_id: &ExecutionId,
+        _key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_execution_tag",
+        })
+    }
+
+    /// Read a single namespaced flow tag. Returns `Ok(None)` when
+    /// the tag is absent **or** the flow row does not exist (same
+    /// collapse semantics as [`Self::get_execution_tag`]). Symmetry
+    /// partner — consumers like cairn read `cairn.session_id` off
+    /// flows for archival.
+    ///
+    /// `key` must pass [`validate_tag_key`].
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET :tags <key>` on the flow's partition.
+    /// * **Postgres** — `SELECT raw_fields->><key> FROM ff_flow_core
+    ///   WHERE ...` (top-level `raw_fields` key, matches the flow-tag
+    ///   storage shape).
+    /// * **SQLite** — `SELECT json_extract(raw_fields, '$.<key>')
+    ///   FROM ff_flow_core WHERE ...`.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn get_flow_tag(
+        &self,
+        _flow_id: &FlowId,
+        _key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_flow_tag",
+        })
+    }
+
     /// List dependency edges adjacent to an execution. Read-only; the
     /// backend resolves the subject execution's flow, reads the
     /// direction-specific adjacency SET, and decodes each member's
@@ -1779,6 +1922,55 @@ pub fn cancel_flow_wait_deadline(wait: CancelFlowWait) -> Option<Duration> {
     }
 }
 
+/// Validate a caller-namespaced tag key against the regex
+/// `^[a-z][a-z0-9_]*\.[^.]` — the same pattern the Valkey Lua contracts
+/// (`ff_set_execution_tags` / `ff_set_flow_tags`) enforce server-side.
+///
+/// A key passes iff:
+///
+/// * it begins with an ASCII lowercase letter;
+/// * all characters up to the first `.` are lowercase alnum or `_`;
+/// * the first `.` is followed by at least one non-`.` character
+///   (so `cairn.` and `cairn..x` fail — the `<field>` must be non-empty).
+///
+/// Shared entry point for [`EngineBackend::set_execution_tag`] /
+/// [`EngineBackend::set_flow_tag`] / [`EngineBackend::get_execution_tag`] /
+/// [`EngineBackend::get_flow_tag`] so every backend rejects the same
+/// keyspace. On rejection, returns
+/// [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+/// with the offending key in `detail`.
+pub fn validate_tag_key(key: &str) -> Result<(), EngineError> {
+    use crate::engine_error::ValidationKind;
+
+    let bad = || EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("invalid tag key: {key:?} (must match ^[a-z][a-z0-9_]*\\.[^.])"),
+    };
+
+    let mut chars = key.chars();
+    let first = chars.next().ok_or_else(bad)?;
+    if !first.is_ascii_lowercase() {
+        return Err(bad());
+    }
+    let mut saw_dot = false;
+    for c in chars.by_ref() {
+        if c == '.' {
+            saw_dot = true;
+            break;
+        }
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return Err(bad());
+        }
+    }
+    if !saw_dot {
+        return Err(bad());
+    }
+    match chars.next() {
+        Some(c) if c != '.' => Ok(()),
+        _ => Err(bad()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,5 +2246,47 @@ mod tests {
         assert_eq!(caps.identity.rfc017_stage, "unknown");
         // Every field false on the default (matches `Supports::none()`).
         assert_eq!(caps.supports, crate::capability::Supports::none());
+    }
+
+    // ── validate_tag_key (issue #433) ──
+
+    #[test]
+    fn validate_tag_key_accepts_valid() {
+        for k in [
+            "cairn.session_id",
+            "cairn.project",
+            "a.b",
+            "a1_2.x",
+            "app.sub.field",
+            "x.y_z",
+        ] {
+            validate_tag_key(k).unwrap_or_else(|e| panic!("{k:?} should pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_tag_key_rejects_invalid() {
+        for k in [
+            "",             // empty
+            "Cairn.x",      // uppercase first
+            "1cairn.x",     // leading digit
+            "cairn",        // no dot
+            "cairn.",       // empty suffix
+            "cairn..x",     // dot immediately after first dot
+            ".cairn",       // leading dot
+            "cair n.x",     // space before dot
+            "ca-irn.x",     // hyphen in prefix
+        ] {
+            let err = validate_tag_key(k)
+                .err()
+                .unwrap_or_else(|| panic!("{k:?} should fail"));
+            match err {
+                EngineError::Validation {
+                    kind: crate::engine_error::ValidationKind::InvalidInput,
+                    ..
+                } => {}
+                other => panic!("{k:?}: unexpected err {other:?}"),
+            }
+        }
     }
 }

@@ -637,6 +637,48 @@ impl EngineBackend for PostgresBackend {
         flow::describe_flow(&self.pool, &self.partition_config, id).await
     }
 
+    #[tracing::instrument(name = "pg.set_execution_tag", skip_all)]
+    async fn set_execution_tag(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        exec_core::set_execution_tag_impl(&self.pool, execution_id, key, value).await
+    }
+
+    #[tracing::instrument(name = "pg.set_flow_tag", skip_all)]
+    async fn set_flow_tag(
+        &self,
+        flow_id: &FlowId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        flow::set_flow_tag_impl(&self.pool, &self.partition_config, flow_id, key, value).await
+    }
+
+    #[tracing::instrument(name = "pg.get_execution_tag", skip_all)]
+    async fn get_execution_tag(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        exec_core::get_execution_tag_impl(&self.pool, execution_id, key).await
+    }
+
+    #[tracing::instrument(name = "pg.get_flow_tag", skip_all)]
+    async fn get_flow_tag(
+        &self,
+        flow_id: &FlowId,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        flow::get_flow_tag_impl(&self.pool, &self.partition_config, flow_id, key).await
+    }
+
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.list_edges", skip_all)]
     async fn list_edges(

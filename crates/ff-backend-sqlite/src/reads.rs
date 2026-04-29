@@ -520,3 +520,144 @@ pub(crate) async fn read_waitpoint_token_impl(
     .map_err(map_sqlx_error)?;
     Ok(row.map(|(t,)| t).filter(|s| !s.is_empty()))
 }
+
+
+// ─── set_execution_tag / set_flow_tag / get_execution_tag / get_flow_tag (issue #433) ──
+//
+// Execution tags live under `raw_fields.tags.<key>` (matching the PG
+// shape + the projector in `read_execution_context_impl`).
+// Flow tags live as *top-level* `raw_fields.<key>` entries (matching
+// `ff-backend-postgres::flow::extract_tags` — namespaced keys at the
+// top level are the canonical flow-tag projection).
+//
+// Callers are expected to pre-validate keys via
+// `ff_core::engine_backend::validate_tag_key`; the backend does not
+// re-validate (no SQLite-side `CHECK` on the JSON path).
+
+pub(crate) async fn set_execution_tag_impl(
+    pool: &SqlitePool,
+    id: &ExecutionId,
+    key: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    let (part, exec_uuid) = split_exec_id(id)?;
+    // json_set path parameters aren't bindable — splice the key into
+    // the SQL fragment. Pre-validation in `validate_tag_key` limits
+    // `key` to `[a-z0-9_.]`, so there's no SQL-injection surface.
+    let path = format!("$.tags.{key}");
+
+    let result = sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET raw_fields = json_set(COALESCE(raw_fields, '{}'), ?3, ?4)
+         WHERE partition_key = ?1 AND execution_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(&path)
+    .bind(value)
+    .execute(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(EngineError::NotFound {
+            entity: "execution",
+        });
+    }
+    Ok(())
+}
+
+pub(crate) async fn set_flow_tag_impl(
+    pool: &SqlitePool,
+    flow_id: &ff_core::types::FlowId,
+    key: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    let part: i64 = 0;
+    let flow_uuid: Uuid = flow_id.0;
+    let path = format!("$.{key}");
+
+    let result = sqlx::query(
+        r#"
+        UPDATE ff_flow_core
+           SET raw_fields = json_set(COALESCE(raw_fields, '{}'), ?3, ?4)
+         WHERE partition_key = ?1 AND flow_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(flow_uuid)
+    .bind(&path)
+    .bind(value)
+    .execute(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(EngineError::NotFound { entity: "flow" });
+    }
+    Ok(())
+}
+
+pub(crate) async fn get_execution_tag_impl(
+    pool: &SqlitePool,
+    id: &ExecutionId,
+    key: &str,
+) -> Result<Option<String>, EngineError> {
+    let (part, exec_uuid) = split_exec_id(id)?;
+    let path = format!("$.tags.{key}");
+
+    let row = sqlx::query(
+        r#"
+        SELECT json_extract(raw_fields, ?3) AS tag_value
+          FROM ff_exec_core
+         WHERE partition_key = ?1 AND execution_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(&path)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // Missing-row collapses to Ok(None) — matches Valkey's HGET semantics
+    // (see `EngineBackend::get_execution_tag` rustdoc).
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let tag: Option<String> = row.try_get("tag_value").map_err(map_sqlx_error)?;
+    Ok(tag)
+}
+
+pub(crate) async fn get_flow_tag_impl(
+    pool: &SqlitePool,
+    flow_id: &ff_core::types::FlowId,
+    key: &str,
+) -> Result<Option<String>, EngineError> {
+    let part: i64 = 0;
+    let flow_uuid: Uuid = flow_id.0;
+    let path = format!("$.{key}");
+
+    let row = sqlx::query(
+        r#"
+        SELECT json_extract(raw_fields, ?3) AS tag_value
+          FROM ff_flow_core
+         WHERE partition_key = ?1 AND flow_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(flow_uuid)
+    .bind(&path)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // Missing-row collapses to Ok(None) — see get_execution_tag_impl.
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let tag: Option<String> = row.try_get("tag_value").map_err(map_sqlx_error)?;
+    Ok(tag)
+}
