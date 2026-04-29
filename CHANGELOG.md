@@ -7,6 +7,29 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **PR-7b Cluster 3: cancel-family scanners trait-routed (cairn #436).**
+  Two new `EngineBackend` trait methods plus the
+  `SiblingCancelReconcileAction` enum on
+  `ff_core::engine_backend`: `drain_sibling_cancel_group` (RFC-016
+  Stage C — atomic SREM + HDEL for a drained sibling-cancel tuple)
+  and `reconcile_sibling_cancel_group` (RFC-016 Stage D — the
+  three-way Invariant-Q6 disposition). Valkey wires both to the
+  existing `ff_drain_sibling_cancel_group` and
+  `ff_reconcile_sibling_cancel_group` FCALLs; Postgres + SQLite
+  default to `Unavailable` (PG's
+  `reconcilers::edge_cancel_{dispatcher,reconciler}::*_tick`
+  already owns the equivalent batched SQL path; the Valkey-shaped
+  per-tuple call is not a cairn-consumer surface). The three
+  cancel-family scanners — `cancel_reconciler`,
+  `edge_cancel_dispatcher`, `edge_cancel_reconciler` — now route
+  their FCALL bodies through `EngineBackend::cancel_execution` +
+  `ack_cancel_member` (verified semantic match: both existing trait
+  methods already FCALL the same Lua fns with byte-identical
+  KEYS/ARGV as the scanner internals) plus the two new
+  sibling-cancel methods. Legacy direct-FCALL paths remain as a
+  fallback for construction sites that do not supply a backend
+  (test harnesses + `EdgeCancelDispatcher::new` /
+  `EdgeCancelReconciler::new`).
 - **PR-7b Cluster 1: foundation scanner operations on `EngineBackend`
   (cairn #436).** Five new trait methods + `ExpirePhase` enum on
   `ff_core::engine_backend::EngineBackend` for the six simple-expiry

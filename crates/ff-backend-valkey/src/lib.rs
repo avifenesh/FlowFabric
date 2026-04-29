@@ -56,7 +56,7 @@ use ff_core::contracts::{
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
-use ff_core::engine_backend::{EngineBackend, ExpirePhase};
+use ff_core::engine_backend::{EngineBackend, ExpirePhase, SiblingCancelReconcileAction};
 use ff_core::engine_error::EngineError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
@@ -8200,6 +8200,96 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(transport_fk)?;
         Ok(())
+    }
+
+    /// PR-7b Cluster 3: route `edge_cancel_dispatcher::drain_group`
+    /// through the trait. Wraps `FCALL ff_drain_sibling_cancel_group`
+    /// with the same `(pending_cancel_groups, edgegroup)` KEYS and
+    /// `(flow_id, downstream_eid)` ARGV the Valkey scanner body used.
+    async fn drain_sibling_cancel_group(
+        &self,
+        flow_partition: Partition,
+        flow_id: &FlowId,
+        downstream_eid: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        let fctx = FlowKeyContext::new(&flow_partition, flow_id);
+        let fidx = FlowIndexKeys::new(&flow_partition);
+        let pending_key = fidx.pending_cancel_groups();
+        let edgegroup_key = fctx.edgegroup(downstream_eid);
+        let flow_id_str = flow_id.to_string();
+        let downstream_eid_str = downstream_eid.to_string();
+        let keys = [pending_key.as_str(), edgegroup_key.as_str()];
+        let argv = [flow_id_str.as_str(), downstream_eid_str.as_str()];
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_drain_sibling_cancel_group", &keys, &argv)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "drain_sibling_cancel_group: FCALL ff_drain_sibling_cancel_group",
+                )
+            })?;
+        Ok(())
+    }
+
+    /// PR-7b Cluster 3: route `edge_cancel_reconciler::reconcile_one_group`
+    /// through the trait. Wraps `FCALL ff_reconcile_sibling_cancel_group`
+    /// and decodes the Lua `{1, "OK", <action>, ...}` reply shape into
+    /// the typed [`SiblingCancelReconcileAction`].
+    async fn reconcile_sibling_cancel_group(
+        &self,
+        flow_partition: Partition,
+        flow_id: &FlowId,
+        downstream_eid: &ExecutionId,
+    ) -> Result<SiblingCancelReconcileAction, EngineError> {
+        let fctx = FlowKeyContext::new(&flow_partition, flow_id);
+        let fidx = FlowIndexKeys::new(&flow_partition);
+        let pending_key = fidx.pending_cancel_groups();
+        let edgegroup_key = fctx.edgegroup(downstream_eid);
+        let flow_id_str = flow_id.to_string();
+        let downstream_eid_str = downstream_eid.to_string();
+        let keys = [pending_key.as_str(), edgegroup_key.as_str()];
+        let argv = [flow_id_str.as_str(), downstream_eid_str.as_str()];
+        let val: ferriskey::Value = self
+            .client
+            .fcall("ff_reconcile_sibling_cancel_group", &keys, &argv)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "reconcile_sibling_cancel_group: \
+                     FCALL ff_reconcile_sibling_cancel_group",
+                )
+            })?;
+
+        // Lua shape: `{1, "OK", <action>, <detail?>}`. Extract index 2.
+        let action_str = match &val {
+            ferriskey::Value::Array(arr) => arr
+                .get(2)
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|v| match v {
+                    ferriskey::Value::BulkString(b) => {
+                        Some(String::from_utf8_lossy(b).into_owned())
+                    }
+                    ferriskey::Value::SimpleString(s) => Some(s.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
+
+        match action_str.as_deref() {
+            Some("sremmed_stale") => Ok(SiblingCancelReconcileAction::SremmedStale),
+            Some("completed_drain") => Ok(SiblingCancelReconcileAction::CompletedDrain),
+            Some("no_op") => Ok(SiblingCancelReconcileAction::NoOp),
+            _ => Err(EngineError::Transport {
+                backend: "valkey",
+                source: "reconcile_sibling_cancel_group: unparsable FCALL \
+                         reply (expected [..,..,action,..])"
+                    .to_owned()
+                    .into(),
+            }),
+        }
     }
 }
 

@@ -25,12 +25,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::contracts::CancelExecutionArgs;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{
     execution_partition, Partition, PartitionConfig, PartitionFamily,
 };
-use ff_core::types::{AttemptIndex, ExecutionId, FlowId, LaneId, WaitpointId, WorkerInstanceId};
+use ff_core::types::{
+    AttemptIndex, CancelSource, ExecutionId, FlowId, LaneId, TimestampMs, WaitpointId,
+    WorkerInstanceId,
+};
 
 use super::{should_skip_candidate, ScanResult, Scanner};
 
@@ -329,37 +333,55 @@ impl Scanner for CancelReconciler {
                     continue;
                 }
 
-                if cancel_member(
-                    client,
-                    &self.partition_config,
-                    &execution_id,
-                    &reason,
-                )
-                .await
+                if self
+                    .cancel_member(client, &execution_id, &reason)
+                    .await
                 {
-                    // ACK via FCALL so SREM + conditional backlog ZREM
-                    // are one atomic unit on the flow partition. If the
-                    // ack itself fails transiently the member stays in
-                    // pending_cancels and the next cycle retries; count
-                    // it as an error so scanner stats reflect real
+                    // ACK: SREM + conditional backlog ZREM as one
+                    // atomic unit on the flow partition. Prefer the
+                    // trait's `ack_cancel_member` when a backend is
+                    // wired; fall back to the direct FCALL otherwise.
+                    // A transient ack failure leaves the member in
+                    // pending_cancels for next-cycle retry; count it
+                    // as an error so scanner stats reflect real
                     // progress (Copilot feedback).
-                    let flow_id_str = flow_id.to_string();
-                    let ack_keys = [pending_key.as_str(), backlog_key.as_str()];
-                    let ack_args = [eid_str.as_str(), flow_id_str.as_str()];
-                    match client
-                        .fcall::<ferriskey::Value>("ff_ack_cancel_member", &ack_keys, &ack_args)
-                        .await
-                    {
-                        Ok(_) => processed += 1,
-                        Err(e) => {
-                            tracing::debug!(
-                                flow_id = %flow_id,
-                                execution_id = %eid_str,
-                                error = %e,
-                                "cancel_reconciler: ack failed; retry next cycle"
-                            );
-                            errors += 1;
+                    let ack_ok = if let Some(backend) = self.backend.as_ref() {
+                        match backend.ack_cancel_member(&flow_id, &execution_id).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::debug!(
+                                    flow_id = %flow_id,
+                                    execution_id = %eid_str,
+                                    error = %e,
+                                    "cancel_reconciler: ack (trait) failed; retry next cycle"
+                                );
+                                false
+                            }
                         }
+                    } else {
+                        let flow_id_str = flow_id.to_string();
+                        let ack_keys = [pending_key.as_str(), backlog_key.as_str()];
+                        let ack_args = [eid_str.as_str(), flow_id_str.as_str()];
+                        match client
+                            .fcall::<ferriskey::Value>("ff_ack_cancel_member", &ack_keys, &ack_args)
+                            .await
+                        {
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::debug!(
+                                    flow_id = %flow_id,
+                                    execution_id = %eid_str,
+                                    error = %e,
+                                    "cancel_reconciler: ack failed; retry next cycle"
+                                );
+                                false
+                            }
+                        }
+                    };
+                    if ack_ok {
+                        processed += 1;
+                    } else {
+                        errors += 1;
                     }
                 } else {
                     errors += 1;
@@ -371,20 +393,83 @@ impl Scanner for CancelReconciler {
     }
 }
 
-/// Issue a single operator-override cancel on the member's partition.
-/// Returns true on "ack-worthy" (success OR already-terminal OR
-/// non-retryable transport error we don't want to poison the queue
-/// with). Returns false on transient transport errors; the next
-/// reconciler cycle will retry.
+impl CancelReconciler {
+    /// PR-7b Cluster 3: prefer the backend trait's
+    /// [`EngineBackend::cancel_execution`] when a backend is wired;
+    /// fall back to the legacy direct-FCALL path otherwise.
+    ///
+    /// "Ack-worthy" semantics preserved:
+    /// - success: true
+    /// - already-terminal / not-found: true (no point retrying)
+    /// - transient transport: false (retry next cycle)
+    async fn cancel_member(
+        &self,
+        client: &ferriskey::Client,
+        execution_id: &ExecutionId,
+        reason: &str,
+    ) -> bool {
+        if let Some(backend) = self.backend.as_ref() {
+            let args = CancelExecutionArgs {
+                execution_id: execution_id.clone(),
+                reason: reason.to_owned(),
+                source: CancelSource::OperatorOverride,
+                lease_id: None,
+                lease_epoch: None,
+                attempt_id: None,
+                now: TimestampMs::now(),
+            };
+            return match backend.cancel_execution(args).await {
+                Ok(_) => true,
+                // Lua `execution_not_active` maps to
+                // `Contention(ExecutionNotActive)` — the member is
+                // already terminal; ack to avoid re-issue. All other
+                // `Contention` variants are genuinely transient so
+                // match only the exact `ExecutionNotActive` kind.
+                Err(ff_core::engine_error::EngineError::Contention(
+                    ff_core::engine_error::ContentionKind::ExecutionNotActive { .. },
+                )) => true,
+                // Lua `execution_not_found` → already gone; ack.
+                Err(ff_core::engine_error::EngineError::NotFound { .. }) => true,
+                // Validation / bug: re-issuing won't converge; ack to
+                // avoid poison. Log at warn so operators notice.
+                Err(ref e @ ff_core::engine_error::EngineError::Validation { .. })
+                | Err(ref e @ ff_core::engine_error::EngineError::Bug(_)) => {
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "cancel_reconciler: non-transient trait error; ack to avoid poison"
+                    );
+                    true
+                }
+                // Transport / other contention / resource-exhausted
+                // / state / unavailable are transient: leave member
+                // for next cycle.
+                Err(e) => {
+                    tracing::debug!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "cancel_reconciler: transient trait error; retry next cycle"
+                    );
+                    false
+                }
+            };
+        }
+
+        cancel_member_fcall(client, &self.partition_config, execution_id, reason).await
+    }
+}
+
+/// Legacy direct-FCALL path — kept as a fallback for construction
+/// paths that do not supply an `EngineBackend` (test harnesses +
+/// legacy `new` / `with_filter` call sites). Returns true on
+/// "ack-worthy" (success OR already-terminal OR non-retryable
+/// transport error we don't want to poison the queue with).
 ///
 /// Mirrors ff-server's `build_cancel_execution_fcall` exactly:
 /// pre-reads `lane_id`, `current_attempt_index`, `current_waitpoint_id`,
 /// `current_worker_instance_id` from exec_core so the 21-KEY list
-/// touches the REAL lane/worker indexes. Hardcoding those (first
-/// draft) would leave stale entries in lane_eligible / worker_leases /
-/// etc for any non-default-lane member — flagged by Copilot + Cursor
-/// Bugbot on PR #56.
-async fn cancel_member(
+/// touches the REAL lane/worker indexes.
+async fn cancel_member_fcall(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
     execution_id: &ExecutionId,
