@@ -1449,7 +1449,41 @@ impl<C> Future for Request<C> {
                     OperationTarget::FanOut => {
                         trace!("Request error `{}` multi-node request", err);
 
-                        // Fanout operation are retried per internal request, and don't need additional retries.
+                        // Fanout sub-requests normally retry per-node inside the
+                        // state machine, so the aggregate layer does not need an
+                        // extra retry loop for most error kinds.
+                        //
+                        // Exception: `ErrorKind::ReadOnly` (replica rejected a
+                        // write).  The sub-request path handles this via
+                        // `RetryMethod::RefreshSlotsAndRetry`, but after
+                        // `reset_routing` the sub-request is pinned to
+                        // `ByAddress(original_address)` — i.e. back to the same
+                        // (now-replica) node.  A slot-map refresh therefore
+                        // cannot redirect the retry, and the sub-request fails
+                        // out of its retry budget against a replica forever.
+                        //
+                        // For this case we trigger a topology refresh and
+                        // redrive the entire fan-out from the top, so the
+                        // refreshed slot map can pick the new primary.  We
+                        // piggy-back on the outer `request.retry` counter
+                        // (already incremented above) so the bound is the same
+                        // as for single-node commands.
+                        if err.kind() == ErrorKind::ReadOnly {
+                            warn!(
+                                "FanOut sub-request returned READONLY; scheduling slot refresh and \
+                                 redriving fan-out (attempt {})",
+                                request.retry
+                            );
+                            let mut request = this.request.take().unwrap();
+                            request.info.reset_routing();
+                            return Next::RefreshSlots {
+                                request: Some(request),
+                                sleep_duration: Some(sleep_duration),
+                                moved_redirect: None,
+                            }
+                            .into();
+                        }
+
                         self.respond(Err(err));
                         return Next::Done.into();
                     }
