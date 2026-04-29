@@ -1392,8 +1392,8 @@ impl EngineBackend for PostgresBackend {
         partition: Partition,
         execution_id: &ExecutionId,
     ) -> Result<(), EngineError> {
-        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
-        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
         reconcilers::lease_expiry::release_for_execution(&self.pool, partition_key, exec_uuid)
             .await
     }
@@ -1406,8 +1406,8 @@ impl EngineBackend for PostgresBackend {
         execution_id: &ExecutionId,
         now_ms: TimestampMs,
     ) -> Result<(), EngineError> {
-        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
-        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
         // `lane` is ignored: lane is authoritative on `ff_exec_core`
         // already (it was used only to locate the Valkey ZSET). The
         // candidate selection in `promote_for_execution` re-checks
@@ -1435,7 +1435,7 @@ impl EngineBackend for PostgresBackend {
         // only needs the waitpoint row (which carries `execution_id`
         // + `waitpoint_key`). Partition is authoritative from the
         // caller.
-        let partition_key = i16::try_from(partition.index).unwrap_or(0);
+        let partition_key = partition_index_to_i16(partition)?;
         let waitpoint_uuid = uuid::Uuid::parse_str(waitpoint_id).map_err(|e| {
             EngineError::Validation {
                 kind: ff_core::engine_error::ValidationKind::InvalidInput,
@@ -1459,8 +1459,8 @@ impl EngineBackend for PostgresBackend {
         phase: ExpirePhase,
         now_ms: TimestampMs,
     ) -> Result<(), EngineError> {
-        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
-        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
         match phase {
             ExpirePhase::AttemptTimeout => {
                 reconcilers::attempt_timeout::expire_for_execution(
@@ -1489,8 +1489,8 @@ impl EngineBackend for PostgresBackend {
         execution_id: &ExecutionId,
         _now_ms: TimestampMs,
     ) -> Result<(), EngineError> {
-        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
-        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
         reconcilers::suspension_timeout::expire_for_execution(
             &self.pool,
             partition_key,
@@ -1498,6 +1498,25 @@ impl EngineBackend for PostgresBackend {
         )
         .await
     }
+}
+
+/// Narrow a `Partition`'s `u16` index into the `i16` the Postgres
+/// schema uses as its partition-key column. FlowFabric partitions
+/// max out well below `i16::MAX` in practice (production deployments
+/// run a few hundred partitions per family), but the conversion is
+/// still fallible at the type level. Surface overflow as
+/// `ValidationKind::InvalidInput` rather than silently substituting a
+/// fallback — a silently mis-routed reconciler would
+/// corrupt-by-omission without diagnostics.
+fn partition_index_to_i16(partition: Partition) -> Result<i16, EngineError> {
+    i16::try_from(partition.index).map_err(|_| EngineError::Validation {
+        kind: ff_core::engine_error::ValidationKind::InvalidInput,
+        detail: format!(
+            "partition index {} exceeds i16 range (max {})",
+            partition.index,
+            i16::MAX
+        ),
+    })
 }
 
 /// Minimum recommended `max_locks_per_transaction`. Partition-heavy
@@ -1581,5 +1600,46 @@ mod max_locks_tests {
     #[test]
     fn silent_for_unparseable_raw() {
         assert_eq!(max_locks_warn_value("not-a-number"), None);
+    }
+}
+
+#[cfg(test)]
+mod partition_index_tests {
+    use super::partition_index_to_i16;
+    use ff_core::engine_error::{EngineError, ValidationKind};
+    use ff_core::partition::{Partition, PartitionFamily};
+
+    #[test]
+    fn accepts_values_within_i16_range() {
+        let p = Partition { family: PartitionFamily::Flow, index: 0 };
+        assert_eq!(partition_index_to_i16(p).unwrap(), 0);
+
+        let p = Partition { family: PartitionFamily::Flow, index: 255 };
+        assert_eq!(partition_index_to_i16(p).unwrap(), 255);
+
+        let p = Partition { family: PartitionFamily::Budget, index: i16::MAX as u16 };
+        assert_eq!(partition_index_to_i16(p).unwrap(), i16::MAX);
+    }
+
+    #[test]
+    fn rejects_overflow_above_i16_max() {
+        let p = Partition { family: PartitionFamily::Flow, index: (i16::MAX as u16) + 1 };
+        let err = partition_index_to_i16(p).unwrap_err();
+        match err {
+            EngineError::Validation { kind, detail } => {
+                assert_eq!(kind, ValidationKind::InvalidInput);
+                assert!(detail.contains("exceeds i16 range"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_u16_max() {
+        let p = Partition { family: PartitionFamily::Quota, index: u16::MAX };
+        assert!(matches!(
+            partition_index_to_i16(p),
+            Err(EngineError::Validation { kind: ValidationKind::InvalidInput, .. })
+        ));
     }
 }
