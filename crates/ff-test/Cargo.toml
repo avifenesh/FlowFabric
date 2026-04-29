@@ -38,6 +38,15 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# PR #429 follow-up: install a process-wide tracing subscriber at
+# integration-test startup so diagnostic `warn!` / `debug!` traces
+# from ferriskey + ff-script reach CI logs when `RUST_LOG` is set.
+# Observability shipped in #426/#427/#429 was silently dropped
+# because no test binary installed a subscriber.
+# `fmt` = stdout formatter; `env-filter` = `RUST_LOG`-driven filtering;
+# `registry` stays for the scoped-subscriber pattern in
+# `engine_backend_observability.rs`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "registry"] }
 
 [dev-dependencies]
 # RFC-016 Stage E asserts metric emission end-to-end. The `observability`
@@ -51,9 +60,6 @@ serial_test = "3"
 axum = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures = { workspace = true }
-# Issue #154 — tracing span capture in the observability wiring test.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
-
 [features]
 # RFC-017 Wave 8 Stage E1: gate the `http_postgres_smoke` integration
 # test behind a feature so workspace-default `cargo test` does not

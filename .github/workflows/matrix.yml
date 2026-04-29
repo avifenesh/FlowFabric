@@ -285,8 +285,18 @@ jobs:
           FF_HOST: 127.0.0.1
           FF_PORT: ${{ matrix.mode == 'cluster' && '7000' || '6379' }}
           FF_CLUSTER: ${{ matrix.mode == 'cluster' && '1' || '0' }}
+          # PR #429 follow-up: on cluster cells, route ferriskey +
+          # ff-script diagnostic traces to the test log surface via
+          # the `ff-test` fmt subscriber installed by
+          # `init_test_tracing()`. Standalone + mac cells leave
+          # `RUST_LOG` unset so the subscriber is a no-op (keeps
+          # passing-cell logs noise-free). `ferriskey=warn` is the
+          # level at which slot-refresh + READONLY retry observability
+          # shipped in #426/#427/#429; `ff_script=debug` picks up the
+          # loader retry loop.
+          RUST_LOG: ${{ matrix.mode == 'cluster' && 'ferriskey=warn,ff_script=debug' || '' }}
         run: |
-          cargo test -p ff-test -- --test-threads=1
+          cargo test -p ff-test -- --test-threads=1 --nocapture
 
       # ── Diagnostics on failure ────────────────────────────────────
 
