@@ -526,6 +526,7 @@ impl EngineBackend for PostgresBackend {
         unavailable("pg.create_waitpoint")
     }
 
+    #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.read_waitpoint_token", skip_all)]
     async fn read_waitpoint_token(
         &self,

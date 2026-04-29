@@ -2679,6 +2679,7 @@ impl EngineBackend for SqliteBackend {
         .await
     }
 
+    #[cfg(feature = "core")]
     async fn read_waitpoint_token(
         &self,
         partition: PartitionKey,
