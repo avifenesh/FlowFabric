@@ -542,10 +542,15 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// This matches the existing `ff_set_execution_tags` wire shape and
     /// the flow-tag projection in [`ExecutionSnapshot::tags`].
     ///
-    /// Validation is performed trait-side via [`validate_tag_key`]
-    /// **before** reaching the backend so PG / SQLite / Valkey reject
-    /// the same set of keys. Backends MAY additionally validate on the
-    /// storage tier (Valkey's Lua path does).
+    /// Validation is performed by each overriding backend impl via
+    /// [`validate_tag_key`] **before** the wire hop so PG / SQLite /
+    /// Valkey reject the same set of keys. The default trait impl
+    /// returns [`EngineError::Unavailable`] without running validation
+    /// — there is no meaningful storage to validate against on an
+    /// unsupported backend, and surfacing `Unavailable` before
+    /// `Validation` matches the precedence used elsewhere on the trait.
+    /// Backends MAY additionally validate on the storage tier (Valkey's
+    /// Lua path does, with a more permissive prefix-only check).
     ///
     /// Per-backend shape:
     ///
@@ -1950,8 +1955,16 @@ pub fn cancel_flow_wait_deadline(wait: CancelFlowWait) -> Option<Duration> {
 }
 
 /// Validate a caller-namespaced tag key against the regex
-/// `^[a-z][a-z0-9_]*\.[a-z0-9_][a-z0-9_.]*$` — the same pattern the Valkey Lua contracts
-/// (`ff_set_execution_tags` / `ff_set_flow_tags`) enforce server-side.
+/// `^[a-z][a-z0-9_]*\.[a-z0-9_][a-z0-9_.]*$`.
+///
+/// The Rust trait-side check is **stricter than the Valkey Lua
+/// contracts** (`ff_set_execution_tags` / `ff_set_flow_tags`), which
+/// only check `^[a-z][a-z0-9_]*%.[^.]` — namespace prefix + first
+/// suffix char, with the rest of the suffix unvalidated. Every
+/// backend-side impl (`ff-backend-{valkey,postgres,sqlite}`) calls
+/// this helper **before** the wire hop so the effective parity
+/// contract is this full-key regex; Valkey's Lua is an additional,
+/// more permissive server-side guard, not the parity-of-record.
 ///
 /// A key passes iff:
 ///
