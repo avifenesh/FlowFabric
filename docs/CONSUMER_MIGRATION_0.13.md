@@ -136,9 +136,28 @@ let admin = FlowFabricAdminClient::connect_with(trait_obj.clone());
   transport.
 - Other `EngineError` variants surface as `SdkError::Engine(..)`
   unchanged.
-- Request-body validation mirrors `ff-server`'s handler so consumers
-  see the same `SdkError::Config` field-level rejections on the
-  embedded path.
+- Request-body validation **rules** mirror `ff-server`'s handler so
+  the embedded transport rejects the same inputs the HTTP transport
+  does. The exact `SdkError` variant differs — embedded-path
+  rejections surface as `SdkError::Config` (no HTTP round-trip) while
+  HTTP surfaces `SdkError::AdminApi` with status `400`. Match on
+  `SdkError::is_retryable` or on `Config | AdminApi` together if you
+  need transport-independence.
+
+## Divergence from the HTTP transport
+
+The embedded transport has no ff-server config surface to read from,
+so two behaviours are pinned to documented defaults rather than
+per-deployment values:
+
+- `rotate_waitpoint_secret` forwards `EMBEDDED_WAITPOINT_HMAC_GRACE_MS`
+  (24 h, matching `ff-server`'s default `FF_WAITPOINT_HMAC_GRACE_MS`)
+  as the per-partition grace window. Operators who need a non-default
+  grace should use the HTTP transport against an `ff-server` with
+  `FF_WAITPOINT_HMAC_GRACE_MS` set.
+- No single-writer admin semaphore, no audit-log emission. These are
+  `ff-server` responsibilities; embedded consumers wanting them bring
+  their own gate.
 
 ## Not in scope
 

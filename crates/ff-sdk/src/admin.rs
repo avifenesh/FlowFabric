@@ -40,6 +40,22 @@ use crate::SdkError;
 /// than a client-side timeout error.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(130);
 
+/// Grace window in ms that the embedded `rotate_waitpoint_secret`
+/// path forwards to the backend primitive. Matches `ff-server`'s
+/// default `FF_WAITPOINT_HMAC_GRACE_MS` (24 h) so tokens signed by
+/// the outgoing kid remain valid for a full day after rotation
+/// without the embedded-path hard-killing in-flight flows. HTTP
+/// callers get whatever the server was configured with; embedded
+/// callers get this pinned default.
+pub const EMBEDDED_WAITPOINT_HMAC_GRACE_MS: u64 = 86_400_000;
+
+/// Maximum grant TTL (ms) the embedded admin path accepts on
+/// `claim_for_worker` / `issue_reclaim_grant`. Matches
+/// `ff-server`'s `CLAIM_GRANT_TTL_MS_MAX` / `RECLAIM_GRANT_TTL_MS_MAX`
+/// so the embedded transport rejects the same range the HTTP
+/// transport does.
+const EMBEDDED_GRANT_TTL_MS_MAX: u64 = 60_000;
+
 /// Client for FlowFabric admin primitives — backend-agnostic facade
 /// (v0.13 SC-10 ergonomics).
 ///
@@ -125,15 +141,34 @@ impl FlowFabricAdminClient {
     ///
     /// Each method on [`FlowFabricAdminClient`] dispatches to the
     /// equivalent `EngineBackend` trait method (see the RFC-024 /
-    /// RFC-017 admin surfaces). Validation + request-body translation
-    /// mirror the server-side handler in `ff-server` so consumers see
-    /// the same error shape regardless of transport.
+    /// RFC-017 admin surfaces). Validation **rules** + request-body
+    /// translation mirror the server-side handler in `ff-server` so
+    /// callers get the same accept / reject behaviour across
+    /// transports. Note: the exact [`SdkError`] variant differs —
+    /// embedded-path validation rejects surface as [`SdkError::Config`]
+    /// (no HTTP round-trip) while HTTP returns [`SdkError::AdminApi`]
+    /// with status `400`. Callers that need to distinguish a 4xx from
+    /// a transport fault should use [`SdkError::is_retryable`] or
+    /// match on `Config` + `AdminApi` together rather than relying on
+    /// a single variant.
     ///
     /// `EngineError::Unavailable` from the backend — emitted by
     /// backends that have not implemented a given method — is mapped
     /// to [`SdkError::AdminApi`] with `status = 503` and
     /// `kind = Some("unavailable")` so callers see a uniform
     /// admin-error surface across transports.
+    ///
+    /// # Divergence from the HTTP transport
+    ///
+    /// * `rotate_waitpoint_secret` forwards
+    ///   [`EMBEDDED_WAITPOINT_HMAC_GRACE_MS`] (24 h, matching
+    ///   `ff-server`'s default `FF_WAITPOINT_HMAC_GRACE_MS`) as the
+    ///   per-partition grace window. The HTTP transport reads the
+    ///   server's env-configured value; the embedded client has no
+    ///   config surface so it pins the documented default.
+    /// * No single-writer admin semaphore, no audit-log emission.
+    ///   These are `ff-server` responsibilities; embedded consumers
+    ///   wanting them bring their own gate.
     pub fn connect_with(backend: Arc<dyn EngineBackend>) -> Self {
         Self {
             transport: AdminTransport::Embedded(backend),
@@ -539,6 +574,54 @@ async fn issue_reclaim_grant_http(
 // `contracts::*` types lives here so consumers get identical
 // surfaces across transports.
 
+/// Validate a free-form identifier the same way `ff-server`'s
+/// `validate_identifier` does: non-empty, ≤256 bytes, no whitespace
+/// or control chars. Embedded-transport callers hit this before the
+/// request reaches the backend so invalid identifiers cannot leak
+/// past the SDK's parity guarantee.
+fn validate_admin_identifier(
+    op: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), SdkError> {
+    if value.is_empty() {
+        return Err(SdkError::Config {
+            context: format!("admin_client: {op}"),
+            field: Some(field.into()),
+            message: "must not be empty".into(),
+        });
+    }
+    if value.len() > 256 {
+        return Err(SdkError::Config {
+            context: format!("admin_client: {op}"),
+            field: Some(field.into()),
+            message: format!("exceeds 256 bytes (got {})", value.len()),
+        });
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(SdkError::Config {
+            context: format!("admin_client: {op}"),
+            field: Some(field.into()),
+            message: "must not contain whitespace or control characters".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Bounded grant-TTL check mirroring `ff-server`'s
+/// `1..=CLAIM_GRANT_TTL_MS_MAX`. Shared between `claim_for_worker`
+/// and `issue_reclaim_grant` embedded paths.
+fn validate_admin_grant_ttl(op: &'static str, grant_ttl_ms: u64) -> Result<(), SdkError> {
+    if grant_ttl_ms == 0 || grant_ttl_ms > EMBEDDED_GRANT_TTL_MS_MAX {
+        return Err(SdkError::Config {
+            context: format!("admin_client: {op}"),
+            field: Some("grant_ttl_ms".into()),
+            message: format!("must be in 1..={EMBEDDED_GRANT_TTL_MS_MAX}"),
+        });
+    }
+    Ok(())
+}
+
 /// Map an `EngineError` from a backend call into the `SdkError::AdminApi`
 /// surface so embedded and HTTP transports emit the same shape. `Unavailable`
 /// becomes 503 with kind `"unavailable"`; every other engine error bubbles
@@ -570,27 +653,13 @@ async fn claim_for_worker_embedded(
         field: Some("lane_id".into()),
         message: e.to_string(),
     })?;
-    if req.worker_id.trim().is_empty() {
-        return Err(SdkError::Config {
-            context: "admin_client: claim_for_worker".into(),
-            field: Some("worker_id".into()),
-            message: "must be non-empty".into(),
-        });
-    }
-    if req.worker_instance_id.trim().is_empty() {
-        return Err(SdkError::Config {
-            context: "admin_client: claim_for_worker".into(),
-            field: Some("worker_instance_id".into()),
-            message: "must be non-empty".into(),
-        });
-    }
-    if req.grant_ttl_ms == 0 {
-        return Err(SdkError::Config {
-            context: "admin_client: claim_for_worker".into(),
-            field: Some("grant_ttl_ms".into()),
-            message: "must be > 0".into(),
-        });
-    }
+    validate_admin_identifier("claim_for_worker", "worker_id", &req.worker_id)?;
+    validate_admin_identifier(
+        "claim_for_worker",
+        "worker_instance_id",
+        &req.worker_instance_id,
+    )?;
+    validate_admin_grant_ttl("claim_for_worker", req.grant_ttl_ms)?;
     let caps: std::collections::BTreeSet<String> = req.capabilities.into_iter().collect();
     let args = ff_core::contracts::ClaimForWorkerArgs::new(
         lane_id,
@@ -640,27 +709,13 @@ async fn issue_reclaim_grant_embedded(
         field: Some("lane_id".into()),
         message: e.to_string(),
     })?;
-    if req.worker_id.trim().is_empty() {
-        return Err(SdkError::Config {
-            context: "admin_client: issue_reclaim_grant".into(),
-            field: Some("worker_id".into()),
-            message: "must be non-empty".into(),
-        });
-    }
-    if req.worker_instance_id.trim().is_empty() {
-        return Err(SdkError::Config {
-            context: "admin_client: issue_reclaim_grant".into(),
-            field: Some("worker_instance_id".into()),
-            message: "must be non-empty".into(),
-        });
-    }
-    if req.grant_ttl_ms == 0 {
-        return Err(SdkError::Config {
-            context: "admin_client: issue_reclaim_grant".into(),
-            field: Some("grant_ttl_ms".into()),
-            message: "must be > 0".into(),
-        });
-    }
+    validate_admin_identifier("issue_reclaim_grant", "worker_id", &req.worker_id)?;
+    validate_admin_identifier(
+        "issue_reclaim_grant",
+        "worker_instance_id",
+        &req.worker_instance_id,
+    )?;
+    validate_admin_grant_ttl("issue_reclaim_grant", req.grant_ttl_ms)?;
     let caps: std::collections::BTreeSet<String> = req.worker_capabilities.into_iter().collect();
     let args = ff_core::contracts::IssueReclaimGrantArgs::new(
         exec_id,
@@ -715,20 +770,40 @@ async fn rotate_waitpoint_secret_embedded(
     backend: &dyn EngineBackend,
     req: RotateWaitpointSecretRequest,
 ) -> Result<RotateWaitpointSecretResponse, SdkError> {
-    // Note: unlike the HTTP handler, this path does not enforce the
-    // 120s end-to-end timeout (there is no HTTP deadline to honour)
-    // and does not emit the `audit`-target `waitpoint_hmac_rotation_*`
-    // events (those are server-owned operator-audit signals). The
-    // rotation itself is idempotent on the same (new_kid,
-    // new_secret_hex) pair, so retries are safe.
-    //
-    // `grace_ms = 0` mirrors the server's `rotate_waitpoint_secret`
-    // which does not forward a grace window to the backend primitive —
-    // backends provision grace from their own configuration.
+    // Validation mirrors `ff-server::Server::rotate_waitpoint_secret`
+    // so the embedded and HTTP transports reject the same invalid
+    // inputs.
+    if req.new_kid.is_empty() || req.new_kid.contains(':') {
+        return Err(SdkError::Config {
+            context: "admin_client: rotate_waitpoint_secret".into(),
+            field: Some("new_kid".into()),
+            message: "must be non-empty and must not contain ':'".into(),
+        });
+    }
+    if req.new_secret_hex.is_empty()
+        || !req.new_secret_hex.len().is_multiple_of(2)
+        || !req.new_secret_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(SdkError::Config {
+            context: "admin_client: rotate_waitpoint_secret".into(),
+            field: Some("new_secret_hex".into()),
+            message: "must be a non-empty even-length hex string".into(),
+        });
+    }
+    // Embedded consumers have no config surface from which to read
+    // the per-deployment grace window, so pin the documented default
+    // matching `ff-server`'s `FF_WAITPOINT_HMAC_GRACE_MS` (24 h). See
+    // `EMBEDDED_WAITPOINT_HMAC_GRACE_MS` + the `connect_with` rustdoc
+    // for the rationale and divergence-from-HTTP notes. Unlike the
+    // HTTP handler, this path does not enforce the 120 s end-to-end
+    // timeout (no HTTP deadline to honour) and does not emit the
+    // `audit`-target `waitpoint_hmac_rotation_*` events (those are
+    // server-owned operator signals). Rotation is idempotent on the
+    // same (new_kid, new_secret_hex) pair, so retries remain safe.
     let args = ff_core::contracts::RotateWaitpointHmacSecretAllArgs::new(
         req.new_kid.clone(),
         req.new_secret_hex,
-        0,
+        EMBEDDED_WAITPOINT_HMAC_GRACE_MS,
     );
     let result = backend
         .rotate_waitpoint_hmac_secret_all(args)
