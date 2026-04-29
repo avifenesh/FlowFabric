@@ -2485,6 +2485,10 @@ where
     }
 
     // Query a node to discover slot-> master mappings with retries
+
+    // (helper `decide_should_refresh` lives at module scope below, so it
+    // can be unit-tested without spinning up an `InnerCore<C>`.)
+
     async fn refresh_slots_and_subscriptions_with_retries(
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
@@ -2512,25 +2516,29 @@ where
         {
             return Ok(());
         }
-        let mut should_refresh_slots = true;
-        if *policy == RefreshPolicy::Throttable {
-            // Check if the current slot refresh is triggered before the wait duration has passed
+        let should_refresh_slots = {
             let last_run_rlock = last_run.read().await;
-            if let Some(last_run_time) = *last_run_rlock {
-                // `saturating_duration_since` returns `Duration::ZERO` rather
-                // than panicking if the monotonic clock appears to go backward
-                // (platform-specific anomaly). A zero elapsed time forces a
-                // refresh, which matches the prior `SystemTime`-fallback
-                // behavior.
-                let passed_time = Instant::now().saturating_duration_since(last_run_time);
-                let wait_duration = rate_limiter.wait_duration();
-                if passed_time <= wait_duration {
-                    debug!("Skipping slot refresh as the wait duration hasn't yet passed. Passed time = {:?},
-                            Wait duration = {:?}", passed_time, wait_duration);
-                    should_refresh_slots = false;
-                }
+            let decision = decide_should_refresh(
+                policy,
+                *last_run_rlock,
+                Instant::now(),
+                rate_limiter.wait_duration(),
+            );
+            if let RefreshDecision::Skip { passed, window } = decision {
+                // Emit at `warn!` so the skip is visible in production
+                // traces. Silent throttle suppression previously masked a
+                // READONLY-driven refresh bug for three debugging attempts.
+                // Include the trigger, throttle window, and elapsed time
+                // so operators can correlate with observed stale-topology
+                // symptoms.
+                warn!(
+                    "Throttled slot refresh skipped (trigger={:?}); \
+                     time since last refresh = {:?}, throttle window = {:?}",
+                    trigger, passed, window
+                );
             }
-        }
+            decision.should_refresh()
+        };
 
         let mut res = Ok(());
         if should_refresh_slots {
@@ -3698,10 +3706,17 @@ where
                             );
                             return Poll::Ready(Err(e));
                         } else {
-                            // Retry refresh
+                            // Retry refresh.
+                            //
+                            // A previous refresh just failed with a non-
+                            // `AllConnectionsUnavailable` engine error. This
+                            // retry is still error-driven recovery, not a
+                            // periodic poll — use `NotThrottable` so the retry
+                            // is not suppressed by the just-failed attempt's
+                            // `last_run` timestamp updating the throttle window.
                             let new_handle = Self::spawn_refresh_slots_task(
                                 self.inner.clone(),
-                                &RefreshPolicy::Throttable,
+                                &RefreshPolicy::NotThrottable,
                             );
                             self.state = ConnectionState::Recover(RecoverFuture::RefreshingSlots(
                                 new_handle,
@@ -4072,10 +4087,19 @@ where
             match ready!(self.poll_complete(cx)) {
                 PollFlushAction::None => return Poll::Ready(Ok(())),
                 PollFlushAction::RebuildSlots => {
-                    // Spawn refresh task
+                    // Spawn refresh task.
+                    //
+                    // Use `NotThrottable` so an error-driven refresh (READONLY,
+                    // MOVED-without-target-known, etc. surfaced via
+                    // `Next::RefreshSlots`) always runs, even if a prior
+                    // refresh happened inside the throttle window. A stale
+                    // topology is the reason we are here; throttling would
+                    // leave the client stuck re-observing the same error
+                    // until the window elapses. Periodic (time-driven) refreshes
+                    // remain `Throttable` — see `periodic_topology_check`.
                     let task_handle = ClusterConnInner::spawn_refresh_slots_task(
                         self.inner.clone(),
-                        &RefreshPolicy::Throttable,
+                        &RefreshPolicy::NotThrottable,
                     );
 
                     // Update state
@@ -4571,6 +4595,211 @@ impl Connect for MultiplexedConnection {
             .await?
         }
         .boxed()
+    }
+}
+
+/// Outcome of the slot-refresh throttle decision.
+///
+/// Kept as an enum (rather than a bool) so the `Skip` variant can carry
+/// the elapsed time and throttle window for the caller's observability
+/// log without the helper having to do I/O itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshDecision {
+    Refresh,
+    Skip {
+        passed: Duration,
+        window: Duration,
+    },
+}
+
+impl RefreshDecision {
+    pub(crate) fn should_refresh(&self) -> bool {
+        matches!(self, RefreshDecision::Refresh)
+    }
+}
+
+/// Decide whether a slot refresh should proceed, given the refresh policy,
+/// the last refresh timestamp, the current time, and the throttle window.
+///
+/// Pure function (no I/O, no locks) so it can be unit-tested without
+/// standing up an `InnerCore<C>`. The caller is responsible for emitting
+/// any observability log for the `Skip` outcome.
+///
+/// Contract:
+/// - `NotThrottable` policy always returns `Refresh`, regardless of
+///   `last_run`. This is the error-driven refresh path: the caller just
+///   observed a server signal (READONLY, MOVED, TRYAGAIN, ...) that
+///   invalidates the current topology, so suppressing the refresh would
+///   leave the client stuck re-observing the same error for the remainder
+///   of the throttle window.
+/// - `Throttable` policy returns `Skip` iff a prior refresh occurred and
+///   the elapsed time is `<= window`. First-ever refresh (`last_run =
+///   None`) always proceeds.
+pub(crate) fn decide_should_refresh(
+    policy: &RefreshPolicy,
+    last_run: Option<Instant>,
+    now: Instant,
+    window: Duration,
+) -> RefreshDecision {
+    if *policy == RefreshPolicy::NotThrottable {
+        return RefreshDecision::Refresh;
+    }
+    let Some(last) = last_run else {
+        return RefreshDecision::Refresh;
+    };
+    // Backward-clock guard: if `now < last`, the monotonic clock appears to
+    // have gone backward (platform-specific anomaly) or `last_run` holds a
+    // future stamp from a prior skewed read. `Instant::checked_duration_since`
+    // returns `None` iff `self < earlier`, so `now.checked_duration_since(last)`
+    // gives `Some(passed)` on a forward clock and `None` on backward.
+    // On backward clock, force a refresh — trusting a stale/future `last_run`
+    // would silently suppress the fail-safe refresh, matching the intent of
+    // the prior `SystemTime`-fallback behavior.
+    let Some(passed) = now.checked_duration_since(last) else {
+        return RefreshDecision::Refresh;
+    };
+    if passed <= window {
+        RefreshDecision::Skip { passed, window }
+    } else {
+        RefreshDecision::Refresh
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    //! Pin the throttle-decision contract.
+    //!
+    //! Regression guard: error-driven refresh (READONLY, MOVED,
+    //! TRYAGAIN, ...) uses `NotThrottable` so the refresh runs even if
+    //! a prior refresh just fired. Previously two call sites used
+    //! `Throttable`, which silently suppressed READONLY-driven refreshes
+    //! inside the 15s window and left the client stuck in a stale-topology
+    //! loop.
+    use super::{RefreshDecision, RefreshPolicy, decide_should_refresh};
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn not_throttable_always_refreshes_even_right_after_prior() {
+        let now = Instant::now();
+        // Prior refresh happened 1ms ago — deep inside the throttle window.
+        let last = now - Duration::from_millis(1);
+        let decision = decide_should_refresh(
+            &RefreshPolicy::NotThrottable,
+            Some(last),
+            now,
+            WINDOW,
+        );
+        assert_eq!(
+            decision,
+            RefreshDecision::Refresh,
+            "NotThrottable must bypass the throttle — error-driven refresh is \
+             the caller's signal that topology is already known-stale"
+        );
+    }
+
+    #[test]
+    fn not_throttable_with_no_prior_run_refreshes() {
+        let decision = decide_should_refresh(
+            &RefreshPolicy::NotThrottable,
+            None,
+            Instant::now(),
+            WINDOW,
+        );
+        assert_eq!(decision, RefreshDecision::Refresh);
+    }
+
+    #[test]
+    fn throttable_skips_inside_window() {
+        let now = Instant::now();
+        let last = now - Duration::from_secs(5);
+        let decision = decide_should_refresh(
+            &RefreshPolicy::Throttable,
+            Some(last),
+            now,
+            WINDOW,
+        );
+        match decision {
+            RefreshDecision::Skip { passed, window } => {
+                assert_eq!(window, WINDOW);
+                assert!(passed >= Duration::from_secs(5));
+            }
+            RefreshDecision::Refresh => panic!("expected Skip, got Refresh"),
+        }
+    }
+
+    #[test]
+    fn throttable_refreshes_past_window() {
+        let now = Instant::now();
+        let last = now - (WINDOW + Duration::from_secs(1));
+        let decision = decide_should_refresh(
+            &RefreshPolicy::Throttable,
+            Some(last),
+            now,
+            WINDOW,
+        );
+        assert_eq!(decision, RefreshDecision::Refresh);
+    }
+
+    #[test]
+    fn throttable_with_no_prior_run_refreshes() {
+        let decision = decide_should_refresh(
+            &RefreshPolicy::Throttable,
+            None,
+            Instant::now(),
+            WINDOW,
+        );
+        assert_eq!(decision, RefreshDecision::Refresh);
+    }
+
+    #[test]
+    fn throttable_with_backward_clock_forces_refresh() {
+        // Backward clock is untrusted; fail-safe is to refresh rather than
+        // trust a stale `last_run` that may be from the future per a skewed
+        // clock. `now < last` is detected via `now.checked_duration_since(last)`
+        // returning `None`.
+        let now = Instant::now();
+        let last = now + Duration::from_secs(1); // "future" last_run
+        let decision = decide_should_refresh(
+            &RefreshPolicy::Throttable,
+            Some(last),
+            now,
+            WINDOW,
+        );
+        assert_eq!(
+            decision,
+            RefreshDecision::Refresh,
+            "backward clock (now < last) must force refresh — trusting a \
+             future `last_run` would silently suppress the fail-safe refresh"
+        );
+    }
+
+    #[test]
+    fn throttable_with_zero_elapsed_forward_clock_still_skips() {
+        // Edge case: `now == last` means zero elapsed time but the clock has
+        // NOT gone backward (`now.checked_duration_since(last)` returns
+        // `Some(ZERO)`, not `None`). Under a forward clock with
+        // `passed = 0 <= window`, the throttle must still skip. This pins
+        // that the backward-clock fix does not over-trigger on the
+        // legitimate `now == last` boundary.
+        let now = Instant::now();
+        let last = now;
+        let decision = decide_should_refresh(
+            &RefreshPolicy::Throttable,
+            Some(last),
+            now,
+            WINDOW,
+        );
+        match decision {
+            RefreshDecision::Skip { passed, window } => {
+                assert_eq!(passed, Duration::ZERO);
+                assert_eq!(window, WINDOW);
+            }
+            RefreshDecision::Refresh => {
+                panic!("expected Skip — `now == last` is a forward clock with zero elapsed")
+            }
+        }
     }
 }
 

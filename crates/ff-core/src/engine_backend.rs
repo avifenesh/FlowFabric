@@ -50,8 +50,14 @@ use async_trait::async_trait;
 use crate::backend::{
     AppendFrameOutcome, CancelFlowPolicy, CancelFlowWait, CapabilitySet, ClaimPolicy,
     FailOutcome, FailureClass, FailureReason, Frame, Handle, LeaseRenewal, PendingWaitpoint,
-    PrepareOutcome, ResumeSignal, ResumeToken, SummaryDocument, TailVisibility,
+    PrepareOutcome, ResumeSignal, ResumeToken,
 };
+// `SummaryDocument` and `TailVisibility` are referenced only inside
+// `#[cfg(feature = "streaming")]` trait methods below, so the imports
+// must be gated to avoid an unused-imports warning on the non-streaming
+// build.
+#[cfg(feature = "streaming")]
+use crate::backend::{SummaryDocument, TailVisibility};
 use crate::contracts::{
     CancelFlowResult, ExecutionContext, ExecutionSnapshot, FlowSnapshot, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReportUsageResult,
