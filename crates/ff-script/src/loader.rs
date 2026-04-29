@@ -60,14 +60,19 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
     // rejects with `READONLY: You can't write against a read only
     // replica.`
     //
-    // Mitigation: before each retry, force an unthrottled cluster
-    // slot-map refresh via ferriskey, then back off briefly. Each
-    // retry is productive (fresh topology), so the total window is
-    // ~14.5s (500ms + 1s + 2s + 4s + 7s between 6 attempts) instead
-    // of the earlier ~39s blind-sleep window.
+    // As of v0.12 the underlying race is handled inside ferriskey:
+    // `FanOut + AllSucceeded` now triggers a topology refresh and
+    // redrives the fan-out when a sub-request returns `READONLY`
+    // (ferriskey/src/cluster/mod.rs, `OperationTarget::FanOut` arm).
+    // That fix alone is sufficient for the tested cluster cells.
     //
-    // A deeper fix — ferriskey auto-refreshing on `READONLY` inside
-    // its cluster dispatch — is tracked as a follow-up to #290.
+    // This loader-side loop is kept for v0.12 as defense-in-depth:
+    // the aggregate ferriskey retry bound is finite, and legitimate
+    // cold-start topology churn can outlive it. It is scheduled to
+    // be simplified/removed in v0.13 once the ferriskey fix has
+    // proven sufficient across more CI runs. Each retry is still
+    // productive (fresh topology), so the total window is ~14.5s
+    // (500ms + 1s + 2s + 4s + 7s between 6 attempts).
     const MAX_ATTEMPTS: u32 = 6;
     let backoff_ms: [u64; 5] = [500, 1_000, 2_000, 4_000, 7_000];
     let mut last_err = None;
