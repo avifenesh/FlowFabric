@@ -1123,3 +1123,187 @@ async fn read_waitpoint_token_returns_some_for_existing_and_none_for_missing() {
     let _ = fx.lane;
     let _ = fx.pool;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Cairn #435 — create_waitpoint (explicit, caller-initiated).
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn create_waitpoint_mints_token_and_row() {
+    let Some(fx) = setup_exec_or_skip().await else {
+        return;
+    };
+
+    let pending = fx
+        .backend
+        .create_waitpoint(&fx.handle, "wpk:cw-1", std::time::Duration::from_secs(60))
+        .await
+        .expect("create_waitpoint ok");
+
+    // Token shape: `<kid>:<hex>` (same format suspend produces). Don't
+    // print the full token on failure — it's a live HMAC credential.
+    let tok = pending.hmac_token.as_str();
+    let (kid, body) = tok
+        .split_once(':')
+        .expect("token has `<kid>:<body>` shape");
+    assert_eq!(kid, "kid-suspend-1", "token should embed active kid");
+    assert!(!body.is_empty(), "token body missing (len={})", body.len());
+
+    // Row landed with state='pending' and the expected (exec, key).
+    let wp_u = Uuid::parse_str(&pending.waitpoint_id.to_string()).unwrap();
+    let row: (String, String, Uuid, Option<i64>) = sqlx::query_as(
+        "SELECT state, waitpoint_key, execution_id, expires_at_ms \
+           FROM ff_waitpoint_pending \
+          WHERE partition_key = $1 AND waitpoint_id = $2",
+    )
+    .bind(fx.part)
+    .bind(wp_u)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("waitpoint row present");
+    assert_eq!(row.0, "pending");
+    assert_eq!(row.1, "wpk:cw-1");
+    assert_eq!(row.2, fx.exec_uuid);
+    assert!(row.3.is_some(), "expires_at_ms should be set");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn create_waitpoint_token_hmac_verifies() {
+    let Some(fx) = setup_exec_or_skip().await else {
+        return;
+    };
+
+    let pending = fx
+        .backend
+        .create_waitpoint(&fx.handle, "wpk:cw-verify", std::time::Duration::from_secs(30))
+        .await
+        .expect("create_waitpoint ok");
+
+    // Parse `<kid>:<hex>` and verify against the active secret via
+    // the same primitive deliver_signal uses.
+    let tok = pending.hmac_token.as_str();
+    let (kid, _) = tok.split_once(':').expect("token has <kid>:<hex> shape");
+    let secret = ff_backend_postgres::signal::fetch_kid(&fx.pool, kid)
+        .await
+        .expect("fetch_kid ok")
+        .expect("kid present in keystore");
+    let msg = format!("{}:{}", fx.exec_id, pending.waitpoint_id);
+    match hmac_verify(&secret, kid, msg.as_bytes(), tok) {
+        Ok(()) => {}
+        Err(HmacVerifyError::WrongKid { .. }) => {
+            panic!("unexpected wrong-kid from create_waitpoint token")
+        }
+        Err(e) => panic!("hmac_verify failed: {e:?}"),
+    }
+    // Tamper: flipping a byte must reject.
+    let mut bad = tok.to_owned();
+    let last = bad.pop().unwrap();
+    bad.push(if last == '0' { '1' } else { '0' });
+    assert!(
+        hmac_verify(&secret, kid, msg.as_bytes(), &bad).is_err(),
+        "tampered token must fail verify"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn create_waitpoint_distinct_ids_per_call() {
+    let Some(fx) = setup_exec_or_skip().await else {
+        return;
+    };
+
+    // Parity with Valkey + SQLite: `waitpoint_key` is not an
+    // idempotency key — every call mints a fresh WaitpointId.
+    let a = fx
+        .backend
+        .create_waitpoint(&fx.handle, "wpk:cw-same", std::time::Duration::from_secs(60))
+        .await
+        .expect("first create");
+    let b = fx
+        .backend
+        .create_waitpoint(&fx.handle, "wpk:cw-same", std::time::Duration::from_secs(60))
+        .await
+        .expect("second create");
+    assert_ne!(
+        a.waitpoint_id, b.waitpoint_id,
+        "each call must mint a fresh WaitpointId"
+    );
+    assert_ne!(
+        a.hmac_token.as_str(),
+        b.hmac_token.as_str(),
+        "tokens are per-(exec, waitpoint_id) — distinct ids ⇒ distinct tokens"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn create_waitpoint_without_seeded_kid_errors() {
+    // Fresh schema, no rotate/seed — the keystore is empty.
+    let Some(pool) = setup_or_skip().await else {
+        return;
+    };
+
+    // Minimal exec + attempt, matching `setup_exec_or_skip` sans the
+    // hmac rotate.
+    let lane = LaneId::new("default");
+    let exec_id = ExecutionId::solo(&lane, &PartitionConfig::default());
+    let part = exec_id.partition() as i16;
+    let exec_uuid = Uuid::parse_str(exec_id.as_str().split_once("}:").unwrap().1).unwrap();
+    let now = TimestampMs::now().0;
+    sqlx::query(
+        "INSERT INTO ff_exec_core \
+           (partition_key, execution_id, lane_id, attempt_index, \
+            lifecycle_phase, ownership_state, eligibility_state, \
+            public_state, attempt_state, created_at_ms) \
+         VALUES ($1, $2, $3, 0, 'active', 'leased', 'not_applicable', \
+                 'running', 'running_attempt', $4)",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(lane.as_str())
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ff_attempt \
+           (partition_key, execution_id, attempt_index, worker_id, \
+            worker_instance_id, lease_epoch, lease_expires_at_ms, started_at_ms) \
+         VALUES ($1, $2, 0, 'w1', 'wi1', 1, $3, $4)",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(now + 30_000)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let payload = HandlePayload::new(
+        exec_id,
+        AttemptIndex::new(0),
+        AttemptId::new(),
+        LeaseId::new(),
+        LeaseEpoch(1),
+        30_000,
+        lane,
+        WorkerInstanceId::new("wi1"),
+    );
+    let handle = Handle::new(
+        BackendTag::Postgres,
+        HandleKind::Fresh,
+        encode_opaque(BackendTag::Postgres, &payload),
+    );
+    let backend = PostgresBackend::from_pool(pool, PartitionConfig::default())
+        as std::sync::Arc<dyn EngineBackend>;
+
+    let err = backend
+        .create_waitpoint(&handle, "wpk:no-kid", std::time::Duration::from_secs(10))
+        .await
+        .expect_err("keystore empty must fail");
+    assert!(
+        matches!(err, EngineError::Validation { .. }),
+        "expected Validation (no active kid), got {err:?}"
+    );
+}

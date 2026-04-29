@@ -23,6 +23,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   transport. `examples/incident-remediation` updated to drive the
   supervisor's reclaim path through the facade. See
   [`docs/CONSUMER_MIGRATION_0.13.md`](docs/CONSUMER_MIGRATION_0.13.md).
+- **`ff-backend-postgres`: `EngineBackend::create_waitpoint` implemented.**
+  Completes cairn #435 — the previously stubbed (`EngineError::Unavailable`)
+  caller-initiated waitpoint path now mints a fresh `WaitpointId`, signs
+  a token under the active HMAC kid, and INSERTs a `pending` row into
+  `ff_waitpoint_pending`. Behaviour mirrors `ff-backend-sqlite`'s
+  `create_waitpoint_impl` and Valkey's `ff_create_pending_waitpoint`:
+  state stays `pending` (only `suspend` activates); tokens bind to
+  `"{execution_id}:{waitpoint_id}"` so the existing `deliver_signal`
+  verify path accepts them unchanged; `waitpoint_key` is not an
+  idempotency key — every call mints a distinct `WaitpointId`. Unblocks
+  approval-flow control-plane paths on Postgres deployments.
 - **`EngineBackend` tag point-writes + reads (issue #433).** Four new
   trait methods land `set_execution_tag`, `set_flow_tag`,
   `get_execution_tag`, `get_flow_tag` so operator/control-plane
