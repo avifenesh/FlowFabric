@@ -90,9 +90,9 @@ use crate::contracts::{StreamCursor, StreamFrames};
 use crate::engine_error::EngineError;
 #[cfg(feature = "core")]
 use crate::types::EdgeId;
-use crate::types::{
-    AttemptIndex, BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs, WaitpointId,
-};
+#[cfg(feature = "core")]
+use crate::types::WaitpointId;
+use crate::types::{AttemptIndex, BudgetId, ExecutionId, FlowId, LaneId, LeaseFence, TimestampMs};
 
 /// The engine write surface — a single trait a backend implementation
 /// honours to serve a `FlowFabricWorker`.
