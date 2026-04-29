@@ -71,14 +71,19 @@ use crate::contracts::{
     CancelFlowArgs, ChangePriorityArgs, ChangePriorityResult, ClaimExecutionArgs,
     ClaimExecutionResult, ClaimForWorkerArgs, ClaimForWorkerOutcome, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult,
-    BlockRouteArgs, BlockRouteOutcome, CreateBudgetArgs, CreateBudgetResult,
+    BlockRouteArgs, BlockRouteOutcome, CheckAdmissionArgs, CheckAdmissionResult,
+    CompleteExecutionArgs, CompleteExecutionResult, CreateBudgetArgs, CreateBudgetResult,
     CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
     CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
-    DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot, ExecutionInfo,
+    DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
+    EvaluateFlowEligibilityArgs, EvaluateFlowEligibilityResult, ExecutionInfo,
+    FailExecutionArgs, FailExecutionResult,
     IssueClaimGrantArgs, IssueClaimGrantOutcome, ScanEligibleArgs,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
-    ListPendingWaitpointsResult, ListSuspendedPage, ReplayExecutionArgs, ReplayExecutionResult,
-    ReportUsageAdminArgs, ResetBudgetArgs, ResetBudgetResult, RevokeLeaseArgs, RevokeLeaseResult,
+    ListPendingWaitpointsResult, ListSuspendedPage, RenewLeaseArgs, RenewLeaseResult,
+    ReplayExecutionArgs, ReplayExecutionResult,
+    ReportUsageAdminArgs, ResetBudgetArgs, ResetBudgetResult, ResumeExecutionArgs,
+    ResumeExecutionResult, RevokeLeaseArgs, RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
 #[cfg(feature = "core")]
@@ -1466,6 +1471,111 @@ pub trait EngineBackend: Send + Sync + 'static {
         Err(EngineError::Unavailable { op: "revoke_lease" })
     }
 
+    // ── cairn #389 — service-layer typed FCALL surface ────────────
+    //
+    // These methods mirror `complete`/`fail`/`renew` (which take a
+    // worker [`Handle`]) but dispatch against `(execution_id, fence)`
+    // tuples supplied directly. Service-layer callers (cairn's
+    // `valkey_control_plane_impl.rs`, future consumers that hold a
+    // run/lease descriptor without a `Handle`) use these to avoid
+    // going through the raw `ferriskey::Value` FCALL escape hatch.
+    //
+    // Same shape / same precedent as `suspend_by_triple` (cairn #322).
+    //
+    // Default impl returns [`EngineError::Unavailable`] so the trait
+    // addition is non-breaking for out-of-tree backends. The in-tree
+    // Valkey backend overrides; Postgres + SQLite keep the default
+    // until follow-up parity work lands (consistent with
+    // `issue_reclaim_grant` / `reclaim_execution` precedent).
+
+    /// Service-layer `complete_execution` — peer of [`Self::complete`]
+    /// that takes a fence triple instead of a worker [`Handle`]. See
+    /// the group preamble above for cairn-migration context.
+    #[cfg(feature = "core")]
+    async fn complete_execution(
+        &self,
+        _args: CompleteExecutionArgs,
+    ) -> Result<CompleteExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "complete_execution",
+        })
+    }
+
+    /// Service-layer `fail_execution` — peer of [`Self::fail`] that
+    /// takes a fence triple instead of a worker [`Handle`].
+    #[cfg(feature = "core")]
+    async fn fail_execution(
+        &self,
+        _args: FailExecutionArgs,
+    ) -> Result<FailExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "fail_execution",
+        })
+    }
+
+    /// Service-layer `renew_lease` — peer of [`Self::renew`] that
+    /// takes a fence triple instead of a worker [`Handle`].
+    #[cfg(feature = "core")]
+    async fn renew_lease(
+        &self,
+        _args: RenewLeaseArgs,
+    ) -> Result<RenewLeaseResult, EngineError> {
+        Err(EngineError::Unavailable { op: "renew_lease" })
+    }
+
+    /// Service-layer `resume_execution` — transitions a suspended
+    /// execution back to runnable. Distinct from
+    /// [`Self::claim_from_resume_grant`] (which mints a worker handle
+    /// against an already-eligible resumed execution): this method is
+    /// the lifecycle transition primitive the control plane calls
+    /// when an operator / auto-resume policy moves a suspended
+    /// execution forward.
+    ///
+    /// The Valkey impl pre-reads `current_waitpoint_id` + `lane_id`
+    /// from `exec_core` so callers only need the execution id + the
+    /// trigger type — same ergonomics as `revoke_lease` reading
+    /// `current_worker_instance_id` when callers omit it.
+    #[cfg(feature = "core")]
+    async fn resume_execution(
+        &self,
+        _args: ResumeExecutionArgs,
+    ) -> Result<ResumeExecutionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "resume_execution",
+        })
+    }
+
+    /// Service-layer `check_admission_and_record` — atomic admission
+    /// check against a quota policy. Callers supply the policy id via
+    /// [`CheckAdmissionArgs::quota_policy_id`]; backends return
+    /// [`EngineError::Validation`] (`InvalidInput`) when it is `None`
+    /// because the policy scope cannot be derived from the execution
+    /// id alone (quota keys live on their own `{q:…}` partition).
+    #[cfg(feature = "core")]
+    async fn check_admission(
+        &self,
+        _args: CheckAdmissionArgs,
+    ) -> Result<CheckAdmissionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "check_admission",
+        })
+    }
+
+    /// Service-layer `evaluate_flow_eligibility` — read-only check
+    /// that returns the execution's current eligibility state
+    /// (`eligible`, `blocked_by_dependencies`, or a backend-specific
+    /// status string). Called by cairn's dependency-resolution path
+    /// to decide whether a downstream execution can proceed.
+    #[cfg(feature = "core")]
+    async fn evaluate_flow_eligibility(
+        &self,
+        _args: EvaluateFlowEligibilityArgs,
+    ) -> Result<EvaluateFlowEligibilityResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "evaluate_flow_eligibility",
+        })
+    }
+
     // ── RFC-017 Stage A — Budget + quota admin (5) ─────────────
 
     /// Create a budget definition (row 6).
@@ -2371,6 +2481,134 @@ mod tests {
                 } => {}
                 other => panic!("{k:?}: unexpected err {other:?}"),
             }
+        }
+    }
+
+    // ── cairn #389: service-layer FCALL trait-method defaults ──
+    //
+    // Each method MUST return `EngineError::Unavailable { op: "<name>" }`
+    // on backends that haven't overridden it, so out-of-tree backends
+    // keep compiling and consumers get a terminal-classified error
+    // rather than a panic. Mirrors the precedent used by
+    // `issue_reclaim_grant` / `reclaim_execution` / `suspend_by_triple`.
+
+    #[tokio::test]
+    async fn default_complete_execution_is_unavailable() {
+        use crate::contracts::CompleteExecutionArgs;
+        use crate::types::{ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = CompleteExecutionArgs {
+            execution_id: eid,
+            fence: None,
+            attempt_index: AttemptIndex::new(0),
+            result_payload: None,
+            result_encoding: None,
+            source: crate::types::CancelSource::default(),
+            now: TimestampMs::from_millis(0),
+        };
+        match b.complete_execution(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "complete_execution"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_fail_execution_is_unavailable() {
+        use crate::contracts::FailExecutionArgs;
+        use crate::types::{ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = FailExecutionArgs {
+            execution_id: eid,
+            fence: None,
+            attempt_index: AttemptIndex::new(0),
+            failure_reason: String::new(),
+            failure_category: String::new(),
+            retry_policy_json: String::new(),
+            next_attempt_policy_json: String::new(),
+            source: crate::types::CancelSource::default(),
+        };
+        match b.fail_execution(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "fail_execution"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_renew_lease_is_unavailable() {
+        use crate::contracts::RenewLeaseArgs;
+        use crate::types::{ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = RenewLeaseArgs {
+            execution_id: eid,
+            attempt_index: AttemptIndex::new(0),
+            fence: None,
+            lease_ttl_ms: 1_000,
+            lease_history_grace_ms: 60_000,
+        };
+        match b.renew_lease(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "renew_lease"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_resume_execution_is_unavailable() {
+        use crate::contracts::ResumeExecutionArgs;
+        use crate::types::{ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = ResumeExecutionArgs {
+            execution_id: eid,
+            trigger_type: "signal".to_owned(),
+            resume_delay_ms: 0,
+        };
+        match b.resume_execution(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "resume_execution"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_check_admission_is_unavailable() {
+        use crate::contracts::CheckAdmissionArgs;
+        use crate::types::{ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = CheckAdmissionArgs {
+            execution_id: eid,
+            now: TimestampMs::from_millis(0),
+            window_seconds: 60,
+            rate_limit: 10,
+            concurrency_cap: 1,
+            jitter_ms: None,
+            quota_policy_id: None,
+            dimension: None,
+        };
+        match b.check_admission(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "check_admission"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_evaluate_flow_eligibility_is_unavailable() {
+        use crate::contracts::EvaluateFlowEligibilityArgs;
+        use crate::types::{ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = EvaluateFlowEligibilityArgs { execution_id: eid };
+        match b.evaluate_flow_eligibility(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "evaluate_flow_eligibility"),
+            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 }

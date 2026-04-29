@@ -478,3 +478,32 @@ the trait defaults in `crates/ff-core/src/engine_backend.rs`.
 Consumer-facing limitations for this surface live in
 [`CONSUMER_MIGRATION_0.12.md`](CONSUMER_MIGRATION_0.12.md) §Known
 limitations.
+
+### cairn #389 — service-layer typed FCALL surface (v0.13)
+
+Six `EngineBackend` methods that mirror existing Handle-taking peers
+(`complete` / `fail` / `renew`) but accept `(execution_id, fence)`
+tuples — lets control-plane callers (cairn's
+`valkey_control_plane_impl.rs`, future non-Handle consumers) drop
+the raw `ferriskey::Value` + `check_fcall_success` + `parse_*`
+pattern. Args/Result types already existed in `ff_core::contracts`;
+this landing adds the trait-method surface.
+
+Valkey ships bodies at landing; PG + SQLite inherit
+`EngineError::Unavailable` until follow-up parity work — same
+staging as RFC-024 reclaim primitives + `claim_execution` above.
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `complete_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `complete(handle)`. Valkey pre-reads `lane_id` + `current_worker_instance_id` from `exec_core` then delegates to `ff_complete_execution`. |
+| `fail_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `fail(handle, …)`. Same `exec_core` pre-read pattern; delegates to `ff_fail_execution`. |
+| `renew_lease` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `renew(handle)`. No pre-read needed — `ExecKeyContext` suffices. Delegates to `ff_renew_lease`. |
+| `resume_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Lifecycle transition from suspended to runnable. Valkey pre-reads `lane_id` + `current_waitpoint_id` from `exec_core` then delegates to `ff_resume_execution`. |
+| `check_admission` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Atomic admission check against a quota policy. Requires `CheckAdmissionArgs::quota_policy_id` — quota keys live on the `{q:<policy>}` partition and cannot be derived from `execution_id`. Returns `Validation { InvalidInput }` when absent. Delegates to `ff_check_admission_and_record`. |
+| `evaluate_flow_eligibility` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Read-only eligibility status (`eligible`, `blocked_by_dependencies`, …). Delegates to `ff_evaluate_flow_eligibility`. |
+
+PG + SQLite parity for this surface is the v0.13 follow-up scope.
+Until the bodies land, consumers compiling against those backends
+receive `EngineError::Unavailable { op: "<name>" }` on dispatch — a
+terminal, non-retryable classification the `ErrorClass` mapping
+already handles.

@@ -7,6 +7,28 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`EngineBackend` service-layer typed FCALL surface (cairn #389).**
+  Six new trait methods let control-plane consumers (cairn et al.)
+  dispatch against `(execution_id, fence)` tuples instead of requiring
+  a worker `Handle`, eliminating the raw `ferriskey::Value` +
+  `check_fcall_success` + `parse_*` pattern cairn had on 15+ sites in
+  `valkey_control_plane_impl.rs`:
+  `complete_execution`, `fail_execution`, `renew_lease`,
+  `resume_execution`, `check_admission`, `evaluate_flow_eligibility`.
+  Args/Result types already existed in `ff_core::contracts`; the gap
+  was the trait-method surface that lets cairn drop its direct
+  `ferriskey` dep and unblock the Postgres-backend migration. Each
+  method defaults to `EngineError::Unavailable` so out-of-tree
+  backends keep compiling; Valkey overrides all six with thin
+  delegates to the existing `ff_script::functions::*` wrappers.
+  `CheckAdmissionArgs` gains optional `quota_policy_id` + `dimension`
+  fields (`#[serde(default)]`, non-breaking on wire) — the trait
+  method returns `EngineError::Validation` when `quota_policy_id` is
+  absent since quota keys live on the `{q:<policy>}` partition and
+  cannot be derived from `execution_id`. Postgres + SQLite keep the
+  `Unavailable` default pending follow-up parity work (tracked in
+  `POSTGRES_PARITY_MATRIX.md`); same staging precedent as
+  `issue_reclaim_grant` / `reclaim_execution`.
 - **Backend-agnostic `FlowFabricAdminClient` facade (SC-10 ergonomics
   follow-up, v0.13).** `FlowFabricAdminClient` now supports both HTTP
   (`new` / `with_token` — existing) and embedded

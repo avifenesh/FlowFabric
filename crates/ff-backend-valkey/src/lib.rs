@@ -68,13 +68,16 @@ use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
 use ff_script::functions::execution::{
     CancelExecutionResultPartial, ClaimExecutionResultPartial, ExecOpKeys, ff_claim_execution,
-    ff_create_execution,
+    ff_complete_execution, ff_create_execution, ff_fail_execution,
 };
 use ff_script::functions::flow::{
     DepOpKeys, FlowStructOpKeys, ff_add_execution_to_flow, ff_apply_dependency_to_child,
-    ff_cancel_flow, ff_create_flow, ff_replay_execution, ff_stage_dependency_edge,
+    ff_cancel_flow, ff_create_flow, ff_evaluate_flow_eligibility, ff_replay_execution,
+    ff_stage_dependency_edge,
 };
-use ff_script::functions::lease::ff_revoke_lease;
+use ff_script::functions::lease::{ff_renew_lease, ff_revoke_lease};
+use ff_script::functions::suspension::{ResumeOpKeys, ff_resume_execution};
+use ff_script::functions::quota::ff_check_admission_and_record;
 use ff_script::functions::scheduling::{
     ChangePriorityResultPartial, SchedOpKeys, ff_change_priority,
 };
@@ -6992,6 +6995,253 @@ impl EngineBackend for ValkeyBackend {
             .map_err(|e| ff_core::engine_error::backend_context(
                 transport_script(e),
                 "revoke_lease: FCALL ff_revoke_lease",
+            ))
+    }
+
+    // ── cairn #389 — service-layer typed FCALL surface ────────────
+    //
+    // Each method mirrors the corresponding `ff_*` Lua primitive and
+    // pre-reads `lane_id` / `current_worker_instance_id` /
+    // `current_waitpoint_id` from `exec_core` when the args don't
+    // already carry them. Same pattern as `cancel_execution` above.
+
+    async fn complete_execution(
+        &self,
+        args: ff_core::contracts::CompleteExecutionArgs,
+    ) -> Result<ff_core::contracts::CompleteExecutionResult, EngineError> {
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // Pre-read lane_id + current_worker_instance_id so callers
+        // only supply execution_id + fence + attempt_index (same
+        // ergonomics as `revoke_lease`'s WIID auto-resolution).
+        let dyn_fields: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(ctx.core())
+            .arg("lane_id")
+            .arg("current_worker_instance_id")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "complete_execution: HMGET exec_core",
+            ))?;
+        let lane = LaneId::new(
+            dyn_fields
+                .first()
+                .and_then(|v| v.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "default".to_owned()),
+        );
+        let wiid = WorkerInstanceId::new(
+            dyn_fields
+                .get(1)
+                .and_then(|v| v.as_ref())
+                .map(String::as_str)
+                .unwrap_or(""),
+        );
+
+        let keys = ExecOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &lane,
+            worker_instance_id: &wiid,
+        };
+        let partial = ff_complete_execution(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "complete_execution: FCALL ff_complete_execution",
+            ))?;
+        Ok(partial.complete(args.execution_id))
+    }
+
+    async fn fail_execution(
+        &self,
+        args: ff_core::contracts::FailExecutionArgs,
+    ) -> Result<ff_core::contracts::FailExecutionResult, EngineError> {
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        let dyn_fields: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(ctx.core())
+            .arg("lane_id")
+            .arg("current_worker_instance_id")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "fail_execution: HMGET exec_core",
+            ))?;
+        let lane = LaneId::new(
+            dyn_fields
+                .first()
+                .and_then(|v| v.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "default".to_owned()),
+        );
+        let wiid = WorkerInstanceId::new(
+            dyn_fields
+                .get(1)
+                .and_then(|v| v.as_ref())
+                .map(String::as_str)
+                .unwrap_or(""),
+        );
+
+        let keys = ExecOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &lane,
+            worker_instance_id: &wiid,
+        };
+        ff_fail_execution(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "fail_execution: FCALL ff_fail_execution",
+            ))
+    }
+
+    async fn renew_lease(
+        &self,
+        args: ff_core::contracts::RenewLeaseArgs,
+    ) -> Result<ff_core::contracts::RenewLeaseResult, EngineError> {
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        ff_renew_lease(&self.client, &ctx, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "renew_lease: FCALL ff_renew_lease",
+            ))
+    }
+
+    async fn resume_execution(
+        &self,
+        args: ff_core::contracts::ResumeExecutionArgs,
+    ) -> Result<ff_core::contracts::ResumeExecutionResult, EngineError> {
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+
+        // Authoritative pre-read: lane_id + current_waitpoint_id live
+        // on `exec_core`. Cairn's pre-migration code did the same
+        // HGET before dispatching the raw FCALL — same semantics,
+        // different routing (trait method instead of raw fcall()).
+        let dyn_fields: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(ctx.core())
+            .arg("lane_id")
+            .arg("current_waitpoint_id")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "resume_execution: HMGET exec_core",
+            ))?;
+        let lane = LaneId::new(
+            dyn_fields
+                .first()
+                .and_then(|v| v.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "default".to_owned()),
+        );
+        let wp_id_str = dyn_fields
+            .get(1)
+            .and_then(|v| v.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let wp_id = if wp_id_str.is_empty() {
+            WaitpointId::new()
+        } else {
+            WaitpointId::parse(&wp_id_str).unwrap_or_else(|_| WaitpointId::new())
+        };
+
+        let keys = ResumeOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &lane,
+            waitpoint_id: &wp_id,
+        };
+        ff_resume_execution(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "resume_execution: FCALL ff_resume_execution",
+            ))
+    }
+
+    async fn check_admission(
+        &self,
+        args: ff_core::contracts::CheckAdmissionArgs,
+    ) -> Result<ff_core::contracts::CheckAdmissionResult, EngineError> {
+        let quota_policy_id = args.quota_policy_id.as_ref().ok_or_else(|| {
+            EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail:
+                    "check_admission: quota_policy_id is required (quota keys live on {q:<policy>} partition)"
+                        .to_owned(),
+            }
+        })?;
+        let dimension = args.dimension.as_deref().unwrap_or("default").to_owned();
+
+        let partition = ff_core::partition::quota_partition(
+            quota_policy_id,
+            &self.partition_config,
+        );
+        let qctx = ff_core::keys::QuotaKeyContext::new(&partition, quota_policy_id);
+        let keys = QuotaOpKeys {
+            ctx: &qctx,
+            dimension: dimension.as_str(),
+            execution_id: &args.execution_id,
+        };
+        ff_check_admission_and_record(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "check_admission: FCALL ff_check_admission_and_record",
+            ))
+    }
+
+    async fn evaluate_flow_eligibility(
+        &self,
+        args: ff_core::contracts::EvaluateFlowEligibilityArgs,
+    ) -> Result<ff_core::contracts::EvaluateFlowEligibilityResult, EngineError> {
+        // `ff_evaluate_flow_eligibility` reads KEYS (exec_core,
+        // deps_meta) only — the `DepOpKeys` struct carries extra
+        // `idx`/`lane_id`/`flow_ctx`/`downstream_eid` fields the Lua
+        // never reads, but the key-context type is shared across the
+        // dependency ops. Build with zero-valued dummies for the
+        // unused fields to satisfy the type.
+        let partition = execution_partition(&args.execution_id, &self.partition_config);
+        let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+        let idx = IndexKeys::new(&partition);
+        // Dummy flow context — `ff_evaluate_flow_eligibility` does
+        // not touch `flow_ctx.edgegroup()` in its KEYS (lua source at
+        // `flowfabric.lua:8422` confirms KEYS[1..2] only). A fresh
+        // FlowId with any partition is safe because the key is unused.
+        let flow_id = FlowId::new();
+        let flow_partition_k = flow_partition(&flow_id, &self.partition_config);
+        let flow_ctx = FlowKeyContext::new(&flow_partition_k, &flow_id);
+        let lane = LaneId::new("default".to_owned());
+        let keys = DepOpKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &lane,
+            flow_ctx: &flow_ctx,
+            downstream_eid: &args.execution_id,
+        };
+        ff_evaluate_flow_eligibility(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "evaluate_flow_eligibility: FCALL ff_evaluate_flow_eligibility",
             ))
     }
 
