@@ -1200,3 +1200,38 @@ pub(crate) async fn list_pending_waitpoints_impl(
     }
     Ok(result)
 }
+
+/// Point-read of a waitpoint's HMAC token from `ff_waitpoint_pending`
+/// keyed by `(partition_key, waitpoint_id)`. Used by cairn's
+/// signal-bridge to authenticate signal-resume requests on Postgres
+/// deployments.
+///
+/// Missing row → `Ok(None)` (signal may legitimately arrive after
+/// the waitpoint has been consumed or expired). Empty `token` →
+/// `Ok(None)` for parity with the Valkey HGET mapping, even though
+/// the column is `NOT NULL` and Postgres writers always populate it.
+pub(crate) async fn read_waitpoint_token_impl(
+    pool: &PgPool,
+    partition: &ff_core::partition::PartitionKey,
+    waitpoint_id: &WaitpointId,
+) -> Result<Option<String>, EngineError> {
+    let part: i16 = partition
+        .parse()
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("partition_key: {e}"),
+        })?
+        .index as i16;
+    let wp_uuid = wp_uuid(waitpoint_id)?;
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT token FROM ff_waitpoint_pending \
+         WHERE partition_key = $1 AND waitpoint_id = $2 \
+         LIMIT 1",
+    )
+    .bind(part)
+    .bind(wp_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    Ok(row.map(|(t,)| t).filter(|s| !s.is_empty()))
+}

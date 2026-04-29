@@ -59,6 +59,13 @@ pub const SELECT_WAITPOINT_KEY_BY_ID_SQL: &str =
     "SELECT waitpoint_key FROM ff_waitpoint_pending \
      WHERE partition_key = ?1 AND waitpoint_id = ?2";
 
+/// Point-read of a waitpoint's HMAC token, used by the signal-bridge
+/// to authenticate signal-resume requests on SQLite deployments.
+/// Binds: 1=partition_key (i64), 2=waitpoint_id (BLOB).
+pub const SELECT_WAITPOINT_TOKEN_BY_ID_SQL: &str =
+    "SELECT token FROM ff_waitpoint_pending \
+     WHERE partition_key = ?1 AND waitpoint_id = ?2 LIMIT 1";
+
 /// For deliver_signal: read kid + token + wp_key + bound execution.
 /// Returns (token_kid, token, waitpoint_key, execution_id).
 pub const SELECT_WAITPOINT_FOR_DELIVER_SQL: &str =

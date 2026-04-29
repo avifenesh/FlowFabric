@@ -300,3 +300,40 @@ async fn list_pending_waitpoints_filters_closed_state() {
         "remaining entry is the non-closed one"
     );
 }
+
+/// Issue #434 — `EngineBackend::read_waitpoint_token` happy path on
+/// SQLite. Suspend creates a waitpoint row with a HMAC token;
+/// reading it back through the trait returns `Ok(Some(token))`.
+/// A fresh `WaitpointId` that was never written returns `Ok(None)`.
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn read_waitpoint_token_returns_some_for_existing_and_none_for_missing() {
+    let b = fresh_backend().await;
+    let (_exec_id, handle) = create_and_claim(&b).await;
+    let seeded = suspend_n(&b, &handle, 1).await;
+    let wp_id = seeded[0].0.clone();
+
+    let partition = ff_core::partition::PartitionKey::from(
+        &ff_core::partition::Partition {
+            family: ff_core::partition::PartitionFamily::Flow,
+            index: 0,
+        },
+    );
+
+    let token = b
+        .read_waitpoint_token(partition.clone(), &wp_id)
+        .await
+        .expect("read_waitpoint_token ok");
+    let token = token.expect("waitpoint row exists → token populated");
+    assert!(
+        !token.is_empty() && token.contains(':'),
+        "stored token should be kid-prefixed hex, got {token:?}"
+    );
+
+    // Missing waitpoint → Ok(None).
+    let missing = b
+        .read_waitpoint_token(partition, &WaitpointId::new())
+        .await
+        .expect("read_waitpoint_token ok for missing");
+    assert!(missing.is_none(), "missing waitpoint should read back None");
+}
