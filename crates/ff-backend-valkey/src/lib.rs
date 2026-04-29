@@ -71,8 +71,9 @@ use ff_script::functions::execution::{
     ff_complete_execution, ff_create_execution, ff_fail_execution,
 };
 use ff_script::functions::flow::{
-    DepOpKeys, FlowStructOpKeys, ff_add_execution_to_flow, ff_apply_dependency_to_child,
-    ff_cancel_flow, ff_create_flow, ff_evaluate_flow_eligibility, ff_replay_execution,
+    DepOpKeys, FlowStructOpKeys, ResolveDependencyKeys, ff_add_execution_to_flow,
+    ff_apply_dependency_to_child, ff_cancel_flow, ff_create_flow,
+    ff_evaluate_flow_eligibility, ff_replay_execution, ff_resolve_dependency,
     ff_stage_dependency_edge,
 };
 use ff_script::functions::lease::{ff_renew_lease, ff_revoke_lease};
@@ -2633,6 +2634,17 @@ async fn append_frame_impl(
     Ok(outcome)
 }
 
+/// Compute `expires_at_ms` for a pending waitpoint, clamping overflow to
+/// `i64::MAX` to match the PG + SQLite `create_waitpoint` behaviour
+/// (see `ff-backend-postgres::suspend_ops::create_waitpoint` ~L722-730 and
+/// `ff-backend-sqlite::suspend_ops::create_waitpoint_impl`). A stricter
+/// "overflow => Validation" contract would require a one-shot trait-docs +
+/// all-three-backends change; keep parity until then.
+fn waitpoint_expires_at_ms(now_ms: i64, expires_in: Duration) -> i64 {
+    let expires_in_ms = i64::try_from(expires_in.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_add(expires_in_ms)
+}
+
 /// Round-7 — `create_waitpoint` FCALL body. Migrated from
 /// `ff_sdk::task::ClaimedTask::create_pending_waitpoint`. 4 KEYS, 5
 /// ARGV. Mints a fresh `WaitpointId` client-side and returns the
@@ -2659,8 +2671,10 @@ async fn create_waitpoint_impl(
     let idx = IndexKeys::new(&partition);
 
     let waitpoint_id = WaitpointId::new();
-    let expires_at =
-        TimestampMs::from_millis(now_ms_timestamp().0 + expires_in.as_millis() as i64);
+    let expires_at = TimestampMs::from_millis(waitpoint_expires_at_ms(
+        now_ms_timestamp().0,
+        expires_in,
+    ));
 
     let keys: Vec<String> = vec![
         ctx.core(),
@@ -6188,6 +6202,42 @@ impl EngineBackend for ValkeyBackend {
     }
 
     // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    //
+    // PR-7b Step 0: wraps `ff_resolve_dependency` (RFC-016 Stage C
+    // signature). Both the dep_reconciler scanner and the post-
+    // completion dispatch loop route through this trait method.
+    async fn resolve_dependency(
+        &self,
+        args: ff_core::contracts::ResolveDependencyArgs,
+    ) -> Result<ff_core::contracts::ResolveDependencyOutcome, EngineError> {
+        let ctx = ExecKeyContext::new(&args.partition, &args.downstream_execution_id);
+        let idx = IndexKeys::new(&args.partition);
+        let upstream_ctx = ExecKeyContext::new(&args.partition, &args.upstream_execution_id);
+        // Flow partition co-locates with the exec partition under
+        // `{fp:N}` via RFC-011 flow-affinity; use the same partition
+        // so the FCALL remains single-slot.
+        let flow_ctx = FlowKeyContext::new(&args.partition, &args.flow_id);
+        let flow_idx = ff_core::keys::FlowIndexKeys::new(&args.partition);
+        let keys = ResolveDependencyKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &args.lane_id,
+            upstream_ctx: &upstream_ctx,
+            flow_ctx: &flow_ctx,
+            flow_idx: &flow_idx,
+            downstream_eid: &args.downstream_execution_id,
+            current_attempt_index: args.current_attempt_index,
+        };
+        let result = ff_resolve_dependency(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "resolve_dependency: FCALL ff_resolve_dependency",
+            ))?;
+        Ok(result.into())
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
     async fn create_budget(
         &self,
         args: ff_core::contracts::CreateBudgetArgs,
@@ -8713,6 +8763,21 @@ mod tests {
             cancel_policy_to_str(CancelFlowPolicy::CancelPending),
             "cancel_pending"
         );
+    }
+
+    /// `Duration::MAX.as_millis()` overflows `i64`. The pre-fix code used
+    /// `as i64` which silently truncates and can wrap NEGATIVE. Post-fix
+    /// should clamp to `i64::MAX` (via `saturating_add`) to match the PG +
+    /// SQLite `create_waitpoint` behaviour.
+    #[test]
+    fn create_waitpoint_expires_in_max_clamps_instead_of_wrapping() {
+        let now_ms: i64 = 1_700_000_000_000; // arbitrary positive "now"
+        let got = waitpoint_expires_at_ms(now_ms, Duration::MAX);
+        assert!(
+            got > 0,
+            "expires_at must not wrap negative on oversized expires_in (got {got})"
+        );
+        assert_eq!(got, i64::MAX, "expires_at must clamp to i64::MAX");
     }
 
     #[test]
