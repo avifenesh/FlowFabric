@@ -409,6 +409,7 @@ impl PostgresBackend {
 /// (rather than a macro) so rust-analyzer / IDE jumps show a single
 /// definition site for the Wave 0 stub pattern.
 #[inline]
+#[cfg_attr(feature = "streaming", allow(dead_code))]
 fn unavailable<T>(op: &'static str) -> Result<T, EngineError> {
     Err(EngineError::Unavailable { op })
 }
@@ -519,11 +520,11 @@ impl EngineBackend for PostgresBackend {
     #[tracing::instrument(name = "pg.create_waitpoint", skip_all)]
     async fn create_waitpoint(
         &self,
-        _handle: &Handle,
-        _waitpoint_key: &str,
-        _expires_in: Duration,
+        handle: &Handle,
+        waitpoint_key: &str,
+        expires_in: Duration,
     ) -> Result<PendingWaitpoint, EngineError> {
-        unavailable("pg.create_waitpoint")
+        suspend_ops::create_waitpoint_impl(&self.pool, handle, waitpoint_key, expires_in).await
     }
 
     #[cfg(feature = "core")]
