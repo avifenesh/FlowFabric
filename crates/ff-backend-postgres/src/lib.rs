@@ -1367,18 +1367,19 @@ impl EngineBackend for PostgresBackend {
 
     // ── PR-7b Cluster 1 — Foundation scanner operations ─────────
     //
-    // Per-execution wrappers around the existing batch reconcilers in
-    // `crate::reconcilers::*`. The reconcilers' per-row tx logic
-    // (`release_one`, `expire_one`, `expire_one` for suspension) is
-    // exposed through a `_for_execution` helper per module and invoked
-    // here. This lets the engine-side scanner trait-dispatch hit the
-    // same SQL the batch path uses, without duplicating either.
+    // Per-execution wrappers around the reconcilers in
+    // `crate::reconcilers::*`. Each reconciler exposes a
+    // `*_for_execution` / `*_for_*` helper mirroring the batch
+    // `scan_tick` path's per-row tx logic so the engine-side scanner
+    // trait-dispatch and the batch reconciler share one SQL code
+    // path.
     //
-    // `promote_delayed`, `close_waitpoint`, and `expire_execution` on
-    // the `ExecutionDeadline` phase are intentionally left at their
-    // trait defaults (`EngineError::Unavailable`) — the PG schema for
-    // delay/waitpoint-expiry reconciliation is RFC-020 Wave 9 scope
-    // (see coordination note in `/tmp/pr-7b-coordination.md`).
+    // All 5 scanner-op methods run real SQL on Postgres; both phases
+    // of `expire_execution` (`AttemptTimeout` + `ExecutionDeadline`)
+    // are covered. The Wave-9-minimal delivery (this commit) adds
+    // `delayed_promoter`, `pending_wp_expiry`, and
+    // `execution_deadline` reconcilers on top of the Wave 6c
+    // reconcilers shipped with PR-7b/1.
 
     async fn mark_lease_expired_if_due(
         &self,
@@ -1391,12 +1392,63 @@ impl EngineBackend for PostgresBackend {
             .await
     }
 
+    async fn promote_delayed(
+        &self,
+        partition: Partition,
+        _lane: &LaneId,
+        execution_id: &ExecutionId,
+        now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        // `lane` is ignored: lane is authoritative on `ff_exec_core`
+        // already (it was used only to locate the Valkey ZSET). The
+        // candidate selection in `promote_for_execution` re-checks
+        // the (lifecycle_phase, eligibility_state, deadline_at_ms)
+        // tuple that `attempt::delay()` writes.
+        reconcilers::delayed_promoter::promote_for_execution(
+            &self.pool,
+            partition_key,
+            exec_uuid,
+            now_ms.0,
+        )
+        .await
+    }
+
+    async fn close_waitpoint(
+        &self,
+        partition: Partition,
+        _execution_id: &ExecutionId,
+        waitpoint_id: &str,
+        now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        // The scanner resolves (waitpoint_id → owning execution_id)
+        // separately for filter application; the close action itself
+        // only needs the waitpoint row (which carries `execution_id`
+        // + `waitpoint_key`). Partition is authoritative from the
+        // caller.
+        let partition_key = i16::try_from(partition.index).unwrap_or(0);
+        let waitpoint_uuid = uuid::Uuid::parse_str(waitpoint_id).map_err(|e| {
+            EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: format!("waitpoint_id not a UUID: {e}"),
+            }
+        })?;
+        reconcilers::pending_wp_expiry::close_for_execution(
+            &self.pool,
+            partition_key,
+            waitpoint_uuid,
+            now_ms.0,
+        )
+        .await
+    }
+
     async fn expire_execution(
         &self,
         partition: Partition,
         execution_id: &ExecutionId,
         phase: ExpirePhase,
-        _now_ms: TimestampMs,
+        now_ms: TimestampMs,
     ) -> Result<(), EngineError> {
         let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
         let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
@@ -1410,15 +1462,13 @@ impl EngineBackend for PostgresBackend {
                 .await
             }
             ExpirePhase::ExecutionDeadline => {
-                // RFC-020 Wave 9 scope: `ff_exec_core.deadline_at_ms`
-                // wall-clock execution deadline reconciler shares the
-                // attempt-timeout terminal flip but needs a distinct
-                // candidate-selection query (`deadline_at_ms` not
-                // `lease_expires_at_ms`). Left at Unavailable pending
-                // Wave 9 owner call on whether to collapse the two.
-                Err(EngineError::Unavailable {
-                    op: "expire_execution:execution_deadline",
-                })
+                reconcilers::execution_deadline::expire_for_execution(
+                    &self.pool,
+                    partition_key,
+                    exec_uuid,
+                    now_ms.0,
+                )
+                .await
             }
         }
     }

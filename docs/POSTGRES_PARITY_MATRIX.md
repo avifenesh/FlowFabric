@@ -478,3 +478,25 @@ the trait defaults in `crates/ff-core/src/engine_backend.rs`.
 Consumer-facing limitations for this surface live in
 [`CONSUMER_MIGRATION_0.12.md`](CONSUMER_MIGRATION_0.12.md) §Known
 limitations.
+
+### PR-7b Cluster 1 — Foundation scanner operations (cairn #436)
+
+Per-execution write hooks invoked by the engine scanner loop. Each
+method is per-row tx on Postgres, mirroring the Valkey `FCALL`
+semantic. SQLite hosts its own reconciler supervisor (RFC-023
+Phase 3.5 §4.1) and inherits the trait default — these hooks are
+never invoked under SQLite's N=1 topology.
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `mark_lease_expired_if_due` | `impl` | `impl` | `Unavailable` (default, intentional) | Valkey: `FCALL ff_mark_lease_expired_if_due`. Postgres: `reconcilers::lease_expiry::release_for_execution` (per-row tx on `ff_attempt` + `ff_exec_core`). |
+| `promote_delayed` | `impl` | `impl` | `Unavailable` (default, intentional) | Valkey: `FCALL ff_promote_delayed`. Postgres: `reconcilers::delayed_promoter::promote_for_execution` — re-checks `(lifecycle_phase='runnable', eligibility_state='not_eligible_until_time', deadline_at_ms <= now)` and flips `eligibility_state → 'eligible_now'` + clears `deadline_at_ms` under `FOR UPDATE`. `deadline_at_ms` is overloaded with the `execution_deadline` scanner on Postgres; the `(lifecycle_phase, eligibility_state)` tuple disambiguates. A dedicated `delay_until_ms` column is a post-v0.12 additive cleanup. |
+| `close_waitpoint` | `impl` | `impl` | `Unavailable` (default, intentional) | Valkey: `FCALL ff_close_waitpoint` (ARGV `[waitpoint_id, "never_committed"]`). Postgres: `reconcilers::pending_wp_expiry::close_for_execution` — DELETE on `ff_waitpoint_pending` + append `{"status":"never_committed",...}` marker into `ff_suspension_current.member_map[waitpoint_key]` so the composite-condition evaluator sees the failure at resume time. |
+| `expire_execution` (`AttemptTimeout`) | `impl` | `impl` | `Unavailable` (default, intentional) | Valkey: `FCALL ff_expire_execution` (ARGV `[eid, "attempt_timeout"]`). Postgres: `reconcilers::attempt_timeout::expire_for_execution` — per-row tx terminates or retries per `policy.retry_policy.max_retries` + emits `ff_completion_event` on terminal + `ff_lease_event` outbox. |
+| `expire_execution` (`ExecutionDeadline`) | `impl` | `impl` | `Unavailable` (default, intentional) | Valkey: `FCALL ff_expire_execution` (ARGV `[eid, "execution_deadline"]`). Postgres: `reconcilers::execution_deadline::expire_for_execution` — per-row tx flips `ff_exec_core.lifecycle_phase='terminal'` with `last_failure_message='execution_deadline'` + clears active attempt lease + emits `ff_completion_event{outcome='expired'}` + `ff_lease_event` outbox. Candidate selection scopes by `lifecycle_phase='active'` to disambiguate from `promote_delayed`'s `deadline_at_ms` overload. |
+| `expire_suspension` | `impl` | `impl` | `Unavailable` (default, intentional) | Valkey: `FCALL ff_expire_suspension`. Postgres: `reconcilers::suspension_timeout::expire_for_execution` — per-row tx honors `TimeoutBehavior` (Fail/Cancel/Expire/Escalate → terminal; AutoResumeWithTimeoutSignal → synthetic signal in `member_map[__timeout__]`). |
+
+All five foundation-scanner ops land real SQL on Postgres as of
+PR-7b Cluster 1 + Wave-9-minimal (this row). Consumer deployments
+switching from Valkey to Postgres no longer see `Unavailable` for
+scanner-op writes.

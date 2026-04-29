@@ -10,10 +10,13 @@
 
 pub mod attempt_timeout;
 pub mod budget_reset;
+pub mod delayed_promoter;
 pub mod dependency;
 pub mod edge_cancel_dispatcher;
 pub mod edge_cancel_reconciler;
+pub mod execution_deadline;
 pub mod lease_expiry;
+pub mod pending_wp_expiry;
 pub mod suspension_timeout;
 
 /// Result of scanning one partition. Mirrors
