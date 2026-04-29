@@ -106,6 +106,28 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `ferriskey` (cluster): error-driven slot-refresh sites now use
+  `RefreshPolicy::NotThrottable`. Previously, the `PollFlushAction::
+  RebuildSlots` path (triggered by server-side signals such as
+  `READONLY`, `MOVED`, `TRYAGAIN`) and the post-failure retry path in
+  `poll_recover` both used `Throttable`, so a refresh that fired inside
+  the 15s throttle window was silently skipped — leaving the client
+  stuck re-observing the same server error until the window elapsed.
+  Periodic (time-driven) refreshes remain `Throttable`. The throttle
+  skip is now logged at `warn!` (was `debug!`) with the trigger,
+  throttle window, and time-since-last-refresh, so production traces
+  make this state visible without a log-level bump. New pure helper
+  `decide_should_refresh` + `throttle_tests` pin the contract.
+- `ff-script`: unit tests pin `is_permanent_load_error` classification
+  for the transient server-directed error families (`READONLY`,
+  `MOVED`, `TRYAGAIN`, `CLUSTERDOWN`) — all four must remain transient
+  so the loader's retry path keeps working on replica-claim races and
+  resharding. Regression guard against substring-match drift in the
+  permanent-vs-transient classifier.
+- `ff-core`: `engine_backend.rs` imports of `SummaryDocument` and
+  `TailVisibility` are now `#[cfg(feature = "streaming")]`-gated to
+  match the trait methods that reference them — removes a
+  `-D warnings` failure on the default (non-streaming) build.
 - `ff-backend-sqlite`: `backend.rs` `:memory:` URI rewrite comment
   corrected to match the code (`file::memory:?cache=shared` — no
   `uri=true` query param; sqlx infers URI mode from the `file:`

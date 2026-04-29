@@ -167,3 +167,69 @@ async fn get_version_string(client: &Client) -> Result<String, ferriskey::Error>
         .await?;
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pin the classification of `is_permanent_load_error` against
+    //! substring-match regressions. A previous debugging pass (see
+    //! `feedback_verify_read_path_premises.md`) traced a production
+    //! symptom to a near-miss in this family of classifiers. These tests
+    //! lock in that transient server-directed errors (READONLY, MOVED,
+    //! TRYAGAIN, CLUSTERDOWN) are NOT classified as permanent, so the
+    //! loader retry path keeps working.
+    use super::is_permanent_load_error;
+    use ferriskey::{Error, ErrorKind};
+
+    fn server_err(kind: ErrorKind, detail: &str) -> Error {
+        // Matches the shape produced by ferriskey's RESP parser for
+        // recognised server-error codes (see `protocol/parser.rs`
+        // `parse_redis_error`). `server error` is the literal used
+        // there.
+        Error::from((kind, "server error", detail.to_string()))
+    }
+
+    #[test]
+    fn readonly_is_not_permanent() {
+        let e = server_err(
+            ErrorKind::ReadOnly,
+            "You can't write against a read only replica.",
+        );
+        assert!(
+            !is_permanent_load_error(&e),
+            "READONLY must be transient so loader retries on replica-claim races; \
+             got permanent for {e}"
+        );
+    }
+
+    #[test]
+    fn moved_is_not_permanent() {
+        let e = server_err(ErrorKind::Moved, "3999 127.0.0.1:7002");
+        assert!(!is_permanent_load_error(&e), "MOVED must be transient; got {e}");
+    }
+
+    #[test]
+    fn tryagain_is_not_permanent() {
+        let e = server_err(ErrorKind::TryAgain, "resharding in progress");
+        assert!(!is_permanent_load_error(&e), "TRYAGAIN must be transient; got {e}");
+    }
+
+    #[test]
+    fn clusterdown_is_not_permanent() {
+        let e = server_err(ErrorKind::ClusterDown, "The cluster is down");
+        assert!(!is_permanent_load_error(&e), "CLUSTERDOWN must be transient; got {e}");
+    }
+
+    #[test]
+    fn lua_syntax_error_is_permanent() {
+        // Sanity check the positive side so we don't accidentally regress
+        // the classifier to "always transient".
+        let e = server_err(
+            ErrorKind::ResponseError,
+            "Error compiling function: user_script:12: syntax error near 'end'",
+        );
+        assert!(
+            is_permanent_load_error(&e),
+            "Lua compilation failure must be permanent; got transient for {e}"
+        );
+    }
+}
