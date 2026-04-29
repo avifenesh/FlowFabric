@@ -126,6 +126,30 @@ jobs:
             mode: standalone
 
     steps:
+      # Free ~22 GB on ubuntu-latest before the cargo-test link stage.
+      # The ff-test integration binaries (serial_test + reqwest + axum +
+      # many static-linked deps) otherwise exhaust the runner's ~14 GB
+      # usable disk during sequential linking, producing deterministic
+      # `No space left on device` failures on the ubuntu-latest x
+      # valkey-8 x {standalone,cluster} cells. ARM + macOS runners have
+      # enough disk — the step is gated to x86_64 ubuntu-latest only to
+      # avoid paying the ~60-90s cost on hosts that don't need it.
+      # Removes: tool-cache (~6.5 GB), Android SDK (~14 GB), .NET (~2 GB),
+      # Haskell (~5.5 GB), swap file (~4 GB). Keeps docker-images (service
+      # containers: valkey, postgres) and large apt packages (preserves
+      # apt-get speed for the redis-tools install downstream).
+      - name: Free disk space (ubuntu-latest)
+        if: matrix.host.os == 'ubuntu-latest'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
       # Third-party actions pinned to commit SHAs (CodeQL
       # security-and-quality rule + supply-chain hardening). Tag
       # comments name the version each SHA points at; refresh by
@@ -327,6 +351,20 @@ jobs:
       # naming works without editing the test harness.
       FF_PG_TEST_URL: postgres://postgres:postgres@localhost:5432/ff_smoke
     steps:
+      # Free ~22 GB before cargo-test link stages. See the rationale on
+      # the `matrix` job's free-disk step. Unconditional here (job is
+      # pinned to ubuntu-latest).
+      - name: Free disk space (ubuntu-latest)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
@@ -655,6 +693,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # Free ~22 GB — same rationale as the `matrix` job's free-disk
+      # step. The ff-dev smoke builds enough of the workspace to hit
+      # the same link-stage disk pressure.
+      - name: Free disk space (ubuntu-latest)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable branch, 2026-03-27
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0  # v2.8.0
