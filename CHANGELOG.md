@@ -21,11 +21,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   method defaults to `EngineError::Unavailable` so out-of-tree
   backends keep compiling; Valkey overrides all six with thin
   delegates to the existing `ff_script::functions::*` wrappers.
-  `CheckAdmissionArgs` gains optional `quota_policy_id` + `dimension`
-  fields (`#[serde(default)]`, non-breaking on wire) — the trait
-  method returns `EngineError::Validation` when `quota_policy_id` is
-  absent since quota keys live on the `{q:<policy>}` partition and
-  cannot be derived from `execution_id`. Postgres + SQLite keep the
+  `check_admission` takes `quota_policy_id: &QuotaPolicyId` and
+  `dimension: &str` as trait-method arguments alongside
+  `CheckAdmissionArgs` — quota keys live on the `{q:<policy>}`
+  partition that cannot be derived from `execution_id`, and
+  widening the `CheckAdmissionArgs` struct would have been a semver
+  break for existing struct-literal callers. Empty `dimension` falls
+  back to `"default"` to match cairn's pre-migration default.
+  Postgres + SQLite keep the
   `Unavailable` default pending follow-up parity work (tracked in
   `POSTGRES_PARITY_MATRIX.md`); same staging precedent as
   `issue_reclaim_grant` / `reclaim_execution`.

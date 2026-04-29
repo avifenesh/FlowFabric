@@ -7179,17 +7179,15 @@ impl EngineBackend for ValkeyBackend {
 
     async fn check_admission(
         &self,
+        quota_policy_id: &ff_core::types::QuotaPolicyId,
+        dimension: &str,
         args: ff_core::contracts::CheckAdmissionArgs,
     ) -> Result<ff_core::contracts::CheckAdmissionResult, EngineError> {
-        let quota_policy_id = args.quota_policy_id.as_ref().ok_or_else(|| {
-            EngineError::Validation {
-                kind: ValidationKind::InvalidInput,
-                detail:
-                    "check_admission: quota_policy_id is required (quota keys live on {q:<policy>} partition)"
-                        .to_owned(),
-            }
-        })?;
-        let dimension = args.dimension.as_deref().unwrap_or("default").to_owned();
+        let effective_dimension = if dimension.is_empty() {
+            "default"
+        } else {
+            dimension
+        };
 
         let partition = ff_core::partition::quota_partition(
             quota_policy_id,
@@ -7198,7 +7196,7 @@ impl EngineBackend for ValkeyBackend {
         let qctx = ff_core::keys::QuotaKeyContext::new(&partition, quota_policy_id);
         let keys = QuotaOpKeys {
             ctx: &qctx,
-            dimension: dimension.as_str(),
+            dimension: effective_dimension,
             execution_id: &args.execution_id,
         };
         ff_check_admission_and_record(&self.client, &keys, &args)

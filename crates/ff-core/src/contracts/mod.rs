@@ -2016,20 +2016,6 @@ pub struct CheckAdmissionArgs {
     pub concurrency_cap: u64,
     #[serde(default)]
     pub jitter_ms: Option<u64>,
-    /// Quota policy to charge the admission check against. Required by
-    /// [`crate::engine_backend::EngineBackend::check_admission`] — the
-    /// quota keys live on the `{q:<policy>}` partition and cannot be
-    /// derived from `execution_id`. Optional at the wire boundary so
-    /// existing Lua-direct callers (ff-test e2e, cairn pre-migration)
-    /// keep compiling; the trait method returns `Validation` when
-    /// this is `None`.
-    #[serde(default)]
-    pub quota_policy_id: Option<crate::types::QuotaPolicyId>,
-    /// Quota dimension key (the inner `dimension` bucket the policy
-    /// windows against). Defaults to `"default"` at the trait method
-    /// when omitted — matches cairn's pre-migration default.
-    #[serde(default)]
-    pub dimension: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

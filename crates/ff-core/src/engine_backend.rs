@@ -1546,14 +1546,17 @@ pub trait EngineBackend: Send + Sync + 'static {
     }
 
     /// Service-layer `check_admission_and_record` — atomic admission
-    /// check against a quota policy. Callers supply the policy id via
-    /// [`CheckAdmissionArgs::quota_policy_id`]; backends return
-    /// [`EngineError::Validation`] (`InvalidInput`) when it is `None`
-    /// because the policy scope cannot be derived from the execution
-    /// id alone (quota keys live on their own `{q:…}` partition).
+    /// check against a quota policy. Callers supply the policy id +
+    /// dimension (quota keys live on their own `{q:<policy>}`
+    /// partition that cannot be derived from `execution_id`, so these
+    /// travel outside [`CheckAdmissionArgs`]). `dimension` defaults
+    /// to `"default"` inside the Valkey body when the caller passes
+    /// an empty string — matches cairn's pre-migration default.
     #[cfg(feature = "core")]
     async fn check_admission(
         &self,
+        _quota_policy_id: &crate::types::QuotaPolicyId,
+        _dimension: &str,
         _args: CheckAdmissionArgs,
     ) -> Result<CheckAdmissionResult, EngineError> {
         Err(EngineError::Unavailable {
@@ -2578,7 +2581,7 @@ mod tests {
     #[tokio::test]
     async fn default_check_admission_is_unavailable() {
         use crate::contracts::CheckAdmissionArgs;
-        use crate::types::{ExecutionId, FlowId};
+        use crate::types::{ExecutionId, FlowId, QuotaPolicyId};
         let b = DefaultBackend;
         let config = crate::partition::PartitionConfig::default();
         let eid = ExecutionId::for_flow(&FlowId::new(), &config);
@@ -2589,10 +2592,13 @@ mod tests {
             rate_limit: 10,
             concurrency_cap: 1,
             jitter_ms: None,
-            quota_policy_id: None,
-            dimension: None,
         };
-        match b.check_admission(args).await.unwrap_err() {
+        let qid = QuotaPolicyId::new();
+        match b
+            .check_admission(&qid, "default", args)
+            .await
+            .unwrap_err()
+        {
             EngineError::Unavailable { op } => assert_eq!(op, "check_admission"),
             other => panic!("expected Unavailable, got {other:?}"),
         }
