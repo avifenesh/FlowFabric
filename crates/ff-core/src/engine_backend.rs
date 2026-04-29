@@ -529,6 +529,189 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Snapshot a flow by id. `Ok(None)` ⇒ no such flow.
     async fn describe_flow(&self, id: &FlowId) -> Result<Option<FlowSnapshot>, EngineError>;
 
+    // ── Namespaced tag point-writes / reads (issue #433) ──
+
+    /// Set a single namespaced tag on an execution. Tag `key` MUST match
+    /// the reserved caller-namespace pattern `^[a-z][a-z0-9_]*\.[a-z0-9_][a-z0-9_.]*$` —
+    /// i.e. `<caller>.<field>` — or the call returns
+    /// [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+    /// with the offending key in `detail`. `value` is arbitrary UTF-8.
+    ///
+    /// The namespace prefix is carried inline in `key` (e.g.
+    /// `"cairn.session_id"`) — there is no separate `namespace` arg.
+    /// This matches the existing `ff_set_execution_tags` wire shape and
+    /// the flow-tag projection in [`ExecutionSnapshot::tags`].
+    ///
+    /// Validation is performed by each overriding backend impl via
+    /// [`validate_tag_key`] **before** the wire hop so PG / SQLite /
+    /// Valkey reject the same set of keys. The default trait impl
+    /// returns [`EngineError::Unavailable`] without running validation
+    /// — there is no meaningful storage to validate against on an
+    /// unsupported backend, and surfacing `Unavailable` before
+    /// `Validation` matches the precedence used elsewhere on the trait.
+    /// Backends MAY additionally validate on the storage tier (Valkey's
+    /// Lua path does, with a more permissive prefix-only check).
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `ff_set_execution_tags` FCALL with a single
+    ///   `{key → value}` pair. Routes through the existing Lua
+    ///   contract (no new wire format).
+    /// * **Postgres** — `UPDATE ff_exec_core SET raw_fields = jsonb_set(
+    ///   coalesce(raw_fields, '{}'::jsonb), '{tags,<key>}', to_jsonb($value))
+    ///   WHERE (partition_key, execution_id) = ...`. Same storage shape
+    ///   read by [`Self::describe_execution`] / [`Self::read_execution_context`].
+    /// * **SQLite** — `UPDATE ff_exec_core SET raw_fields = json_set(
+    ///   coalesce(raw_fields, '{}'), '$.tags."<key>"', $value) WHERE ...`.
+    ///   The key is quoted in the JSON path so dots inside the
+    ///   namespaced key (e.g. `cairn.session_id`) are treated as a
+    ///   single literal member name rather than JSON-path separators —
+    ///   yielding the same flat `raw_fields.tags` shape as PG.
+    ///
+    /// Missing execution surfaces as
+    /// [`EngineError::NotFound { entity: "execution" }`](crate::engine_error::EngineError::NotFound)
+    /// — matches the Valkey FCALL's `execution_not_found` mapping and
+    /// the existing `ScriptError::ExecutionNotFound` → `EngineError`
+    /// conversion (`ff_script::engine_error_ext`).
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so the
+    /// trait addition is non-breaking for out-of-tree backends.
+    async fn set_execution_tag(
+        &self,
+        _execution_id: &ExecutionId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "set_execution_tag",
+        })
+    }
+
+    /// Set a single namespaced tag on a flow. Same namespace rule as
+    /// [`Self::set_execution_tag`]: `key` MUST match
+    /// `^[a-z][a-z0-9_]*\.[a-z0-9_][a-z0-9_.]*$`.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `ff_set_flow_tags` FCALL with a single pair.
+    ///   Tags land on the dedicated `ff:flow:{fp:N}:<flow_id>:tags`
+    ///   hash, not on the `flow_core` hash (diverges from the
+    ///   execution shape — execution tags live on `ff:exec:...:tags`
+    ///   by the same split). **Lazy migration on first write**: the
+    ///   Lua (`ff_script::flowfabric.lua`, `ff_set_flow_tags`) scans
+    ///   `flow_core` once per flow for pre-58.4 inline namespaced
+    ///   fields (anything matching `^[a-z][a-z0-9_]*\.`), HSETs them
+    ///   onto `:tags`, HDELs them from `flow_core`, and stamps
+    ///   `tags_migrated=1` on `flow_core` so subsequent calls
+    ///   short-circuit to O(1). This heals flows created before
+    ///   RFC-058.4 landed; well-formed flows pay the migration cost
+    ///   only on their very first tag write. Callers MUST read tags
+    ///   via [`Self::get_flow_tag`] (`HGET :tags <key>`) — direct
+    ///   `HGETALL` against `flow_core` will not see post-migration
+    ///   values.
+    ///
+    ///   **Cross-backend parity caveat on `describe_flow`**: the
+    ///   pre-existing `ValkeyBackend::describe_flow` /
+    ///   `FlowSnapshot::tags` read path snapshots `flow_core` fields
+    ///   only and does NOT today merge the `:tags` sub-hash, whereas
+    ///   Postgres `describe_flow` DOES surface flow tags via
+    ///   `ff_backend_postgres::flow::extract_tags` (which reads them
+    ///   off `raw_fields` — the same store `set_flow_tag` writes on
+    ///   PG). Trait consumers MUST NOT assume a tag written here
+    ///   will be visible via `describe_flow` on every backend: on
+    ///   Valkey, callers that need the full tag set should
+    ///   complement the snapshot with per-key [`Self::get_flow_tag`]
+    ///   reads. Extending Valkey `describe_flow` to merge `:tags`
+    ///   is additive and out of scope for this trait addition.
+    /// * **Postgres** — `UPDATE ff_flow_core SET raw_fields =
+    ///   jsonb_set(..., '{<key>}', ...)` — flow tags are stored as
+    ///   top-level `raw_fields` keys (matches
+    ///   `ff_backend_postgres::flow::extract_tags`). No `tags` nesting
+    ///   on flows, which diverges from the execution shape.
+    /// * **SQLite** — mirrors PG: `UPDATE ff_flow_core SET raw_fields =
+    ///   json_set(..., '$."<key>"', $value) WHERE ...`. The key is
+    ///   quoted so the dotted namespaced key lands as a single flat
+    ///   top-level member of `raw_fields`.
+    ///
+    /// Missing flow surfaces as
+    /// [`EngineError::NotFound { entity: "flow" }`](crate::engine_error::EngineError::NotFound)
+    /// (matches the Valkey FCALL's `flow_not_found` mapping).
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn set_flow_tag(
+        &self,
+        _flow_id: &FlowId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "set_flow_tag",
+        })
+    }
+
+    /// Read a single namespaced execution tag. Returns `Ok(None)` when
+    /// the tag is absent **or** the execution row does not exist —
+    /// the two cases are not distinguished on the read path. Callers
+    /// that need to distinguish should call [`Self::describe_execution`]
+    /// first (an `Ok(None)` from that method proves the execution is
+    /// absent). This matches Valkey's native `HGET` semantics and
+    /// keeps the read path at a single round-trip on every backend.
+    ///
+    /// `key` must pass [`validate_tag_key`] — a malformed key can
+    /// never be present in storage so the call short-circuits with
+    /// [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+    /// rather than round-tripping.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET :tags <key>` on the execution's partition.
+    /// * **Postgres** — `SELECT raw_fields->'tags'->><key> FROM ff_exec_core
+    ///   WHERE ...` with `fetch_optional` → missing row collapses to `None`.
+    /// * **SQLite** — `SELECT json_extract(raw_fields, '$.tags."<key>"')
+    ///   FROM ff_exec_core WHERE ...` with the same collapse. The key is
+    ///   quoted in the JSON path so dotted namespaced keys resolve to
+    ///   the flat literal member written by `set_execution_tag`.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn get_execution_tag(
+        &self,
+        _execution_id: &ExecutionId,
+        _key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_execution_tag",
+        })
+    }
+
+    /// Read a single namespaced flow tag. Returns `Ok(None)` when
+    /// the tag is absent **or** the flow row does not exist (same
+    /// collapse semantics as [`Self::get_execution_tag`]). Symmetry
+    /// partner — consumers like cairn read `cairn.session_id` off
+    /// flows for archival.
+    ///
+    /// `key` must pass [`validate_tag_key`].
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET :tags <key>` on the flow's partition.
+    /// * **Postgres** — `SELECT raw_fields->><key> FROM ff_flow_core
+    ///   WHERE ...` (top-level `raw_fields` key, matches the flow-tag
+    ///   storage shape).
+    /// * **SQLite** — `SELECT json_extract(raw_fields, '$."<key>"')
+    ///   FROM ff_flow_core WHERE ...` (quoted key — see
+    ///   `set_flow_tag`).
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn get_flow_tag(
+        &self,
+        _flow_id: &FlowId,
+        _key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_flow_tag",
+        })
+    }
+
     /// List dependency edges adjacent to an execution. Read-only; the
     /// backend resolves the subject execution's flow, reads the
     /// direction-specific adjacency SET, and decodes each member's
@@ -1779,6 +1962,93 @@ pub fn cancel_flow_wait_deadline(wait: CancelFlowWait) -> Option<Duration> {
     }
 }
 
+/// Validate a caller-namespaced tag key against the regex
+/// `^[a-z][a-z0-9_]*\.[a-z0-9_][a-z0-9_.]*$`.
+///
+/// The Rust trait-side check is **stricter than the Valkey Lua
+/// contracts** (`ff_set_execution_tags` / `ff_set_flow_tags`), which
+/// only check `^[a-z][a-z0-9_]*%.[^.]` — namespace prefix + first
+/// suffix char, with the rest of the suffix unvalidated. Every
+/// backend-side impl (`ff-backend-{valkey,postgres,sqlite}`) calls
+/// this helper **before** the wire hop so the effective parity
+/// contract is this full-key regex; Valkey's Lua is an additional,
+/// more permissive server-side guard, not the parity-of-record.
+///
+/// A key passes iff:
+///
+/// * it begins with an ASCII lowercase letter;
+/// * all characters up to the first `.` are lowercase alnum or `_`;
+/// * the first `.` is followed by at least one non-`.` character
+///   (so `cairn.` and `cairn..x` fail — the `<field>` must be non-empty).
+///
+/// Shared entry point for [`EngineBackend::set_execution_tag`] /
+/// [`EngineBackend::set_flow_tag`] / [`EngineBackend::get_execution_tag`] /
+/// [`EngineBackend::get_flow_tag`] so every backend rejects the same
+/// keyspace. On rejection, returns
+/// [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
+/// with the offending key in `detail`.
+///
+/// `#[allow(clippy::result_large_err)]` — `EngineError` is the uniform
+/// error across the whole `EngineBackend` trait surface (see trait method
+/// signatures above); boxing it here alone would introduce a
+/// gratuitous signature deviation. Clippy 1.95 flags free functions but
+/// not trait methods; this function mirrors the trait-method convention.
+#[allow(clippy::result_large_err)]
+pub fn validate_tag_key(key: &str) -> Result<(), EngineError> {
+    use crate::engine_error::ValidationKind;
+
+    let bad = || EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!(
+            "invalid tag key: {key:?} (must match ^[a-z][a-z0-9_]*\\.[a-z0-9_][a-z0-9_.]*$)"
+        ),
+    };
+
+    let mut chars = key.chars();
+    let first = chars.next().ok_or_else(bad)?;
+    if !first.is_ascii_lowercase() {
+        return Err(bad());
+    }
+    // Phase 1: consume the namespace prefix up to (but not including) the first `.`.
+    // Chars must be `[a-z0-9_]`.
+    let mut saw_dot = false;
+    for c in chars.by_ref() {
+        if c == '.' {
+            saw_dot = true;
+            break;
+        }
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return Err(bad());
+        }
+    }
+    if !saw_dot {
+        return Err(bad());
+    }
+    // Phase 2: the first char after the first `.` must exist and be a
+    // non-dot member char `[a-z0-9_]` (matches Valkey's Lua regex
+    // `^[a-z][a-z0-9_]*%.[^.]` — a second consecutive dot is rejected).
+    let second = chars.next().ok_or_else(bad)?;
+    if !(second.is_ascii_lowercase() || second.is_ascii_digit() || second == '_') {
+        return Err(bad());
+    }
+    // Phase 3 (Finding 2 tightening): every remaining char MUST be
+    // `[a-z0-9_.]`. Before this, the suffix was unvalidated beyond
+    // its first char — so `cairn.foo bar`, `cairn.Foo`,
+    // `cairn.foo"bar`, `cairn.foo-bar` all passed trait-side validation
+    // even though they would break SQLite JSON-path quoting, the Lua
+    // HSET field-name conventions, or consumer grep patterns. Valkey's
+    // Lua prefix regex is identically permissive on the suffix; this
+    // tightens both layers from the Rust side. Dots in the suffix
+    // remain legal (`app.sub.field` is valid) to preserve the existing
+    // accepted shape.
+    for c in chars {
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.') {
+            return Err(bad());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,5 +2324,53 @@ mod tests {
         assert_eq!(caps.identity.rfc017_stage, "unknown");
         // Every field false on the default (matches `Supports::none()`).
         assert_eq!(caps.supports, crate::capability::Supports::none());
+    }
+
+    // ── validate_tag_key (issue #433) ──
+
+    #[test]
+    fn validate_tag_key_accepts_valid() {
+        for k in [
+            "cairn.session_id",
+            "cairn.project",
+            "a.b",
+            "a1_2.x",
+            "app.sub.field",
+            "x.y_z",
+        ] {
+            validate_tag_key(k).unwrap_or_else(|e| panic!("{k:?} should pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_tag_key_rejects_invalid() {
+        for k in [
+            "",                // empty
+            "Cairn.x",         // uppercase first
+            "1cairn.x",        // leading digit
+            "cairn",           // no dot
+            "cairn.",          // empty suffix
+            "cairn..x",        // dot immediately after first dot
+            ".cairn",          // leading dot
+            "cair n.x",        // space before dot
+            "ca-irn.x",        // hyphen in prefix
+            // Finding 2 tightening — suffix now fully validated.
+            "cairn.Foo",       // uppercase in suffix
+            "cairn.foo bar",   // space in suffix
+            "cairn.foo\"bar",  // double-quote in suffix (would break SQLite JSON-path quoting)
+            "cairn.foo-bar",   // hyphen in suffix
+            "cairn.foo\\bar",  // backslash in suffix
+        ] {
+            let err = validate_tag_key(k)
+                .err()
+                .unwrap_or_else(|| panic!("{k:?} should fail"));
+            match err {
+                EngineError::Validation {
+                    kind: crate::engine_error::ValidationKind::InvalidInput,
+                    ..
+                } => {}
+                other => panic!("{k:?}: unexpected err {other:?}"),
+            }
+        }
     }
 }

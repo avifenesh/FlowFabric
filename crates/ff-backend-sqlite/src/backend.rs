@@ -2758,6 +2758,44 @@ impl EngineBackend for SqliteBackend {
         unavailable("sqlite.describe_flow")
     }
 
+    async fn set_execution_tag(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        crate::reads::set_execution_tag_impl(&self.inner.pool, execution_id, key, value).await
+    }
+
+    async fn set_flow_tag(
+        &self,
+        flow_id: &FlowId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        crate::reads::set_flow_tag_impl(&self.inner.pool, flow_id, key, value).await
+    }
+
+    async fn get_execution_tag(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        crate::reads::get_execution_tag_impl(&self.inner.pool, execution_id, key).await
+    }
+
+    async fn get_flow_tag(
+        &self,
+        flow_id: &FlowId,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        crate::reads::get_flow_tag_impl(&self.inner.pool, flow_id, key).await
+    }
+
     #[cfg(feature = "core")]
     async fn list_edges(
         &self,

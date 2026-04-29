@@ -1078,3 +1078,76 @@ pub(super) async fn get_execution_result_impl(
     }
 }
 
+
+// ─── set_execution_tag / get_execution_tag (issue #433) ──────────
+
+/// Upsert a single namespaced tag into `raw_fields->'tags'->><key>`.
+/// Matches the `EngineBackend::set_execution_tag` wire semantics: key
+/// is assumed pre-validated by `ff_core::engine_backend::validate_tag_key`.
+///
+/// Missing execution → `EngineError::NotFound { entity: "execution" }`
+/// (mirrors Valkey's `execution_not_found` FCALL mapping).
+pub(super) async fn set_execution_tag_impl(
+    pool: &PgPool,
+    id: &ExecutionId,
+    key: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let result = sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+        SET raw_fields = jsonb_set(
+            COALESCE(raw_fields, '{}'::jsonb),
+            ARRAY['tags', $3::text],
+            to_jsonb($4::text),
+            true
+        )
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(EngineError::NotFound {
+            entity: "execution",
+        });
+    }
+    Ok(())
+}
+
+/// Point-read of `raw_fields->'tags'->><key>`. `Ok(None)` covers
+/// missing-tag and missing-execution alike — matches Valkey's `HGET`
+/// collapse (see `EngineBackend::get_execution_tag` rustdoc).
+pub(super) async fn get_execution_tag_impl(
+    pool: &PgPool,
+    id: &ExecutionId,
+    key: &str,
+) -> Result<Option<String>, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT raw_fields->'tags'->>$3
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    Ok(row.and_then(|(tag,)| tag))
+}

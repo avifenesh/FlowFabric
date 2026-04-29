@@ -1308,6 +1308,101 @@ async fn describe_flow_impl(
     build_flow_snapshot(id.clone(), &raw, edge_groups).map(Some)
 }
 
+/// `ff_set_execution_tags` single-pair forwarder. Matches the
+/// `EngineBackend::set_execution_tag` semantics — caller-namespaced key
+/// validated by `ff_core::engine_backend::validate_tag_key` before
+/// entry; the Lua contract re-validates server-side.
+async fn set_execution_tag_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+    key: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    use ff_core::contracts::SetExecutionTagsArgs;
+    use ff_script::functions::execution::ff_set_execution_tags;
+    use std::collections::BTreeMap;
+
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let mut tags = BTreeMap::new();
+    tags.insert(key.to_owned(), value.to_owned());
+    let args = SetExecutionTagsArgs {
+        execution_id: execution_id.clone(),
+        tags,
+    };
+    let _ = ff_set_execution_tags(client, &ctx, &args)
+        .await
+        .map_err(EngineError::from)?;
+    Ok(())
+}
+
+/// `ff_set_flow_tags` single-pair forwarder.
+async fn set_flow_tag_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    flow_id: &FlowId,
+    key: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    use ff_core::contracts::SetFlowTagsArgs;
+    use ff_script::functions::flow::ff_set_flow_tags;
+    use std::collections::BTreeMap;
+
+    let partition = flow_partition(flow_id, partition_config);
+    let fctx = FlowKeyContext::new(&partition, flow_id);
+    let mut tags = BTreeMap::new();
+    tags.insert(key.to_owned(), value.to_owned());
+    let args = SetFlowTagsArgs {
+        flow_id: flow_id.clone(),
+        tags,
+    };
+    let _ = ff_set_flow_tags(client, &fctx, &args)
+        .await
+        .map_err(EngineError::from)?;
+    Ok(())
+}
+
+/// `HGET :tags <key>` on the execution's partition. `Ok(None)` for
+/// absent field or absent hash (indistinguishable on Valkey — if the
+/// caller needs existence semantics, use `describe_execution` first).
+async fn get_execution_tag_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+    key: &str,
+) -> Result<Option<String>, EngineError> {
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.tags())
+        .arg(key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    Ok(raw)
+}
+
+/// `HGET :tags <key>` on the flow's partition.
+async fn get_flow_tag_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    flow_id: &FlowId,
+    key: &str,
+) -> Result<Option<String>, EngineError> {
+    let partition = flow_partition(flow_id, partition_config);
+    let fctx = FlowKeyContext::new(&partition, flow_id);
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(fctx.tags())
+        .arg(key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    Ok(raw)
+}
+
 /// Stage A edge-group reader. Walks the flow's `members` SET, skips
 /// members without inbound edges, and decodes either the edgegroup
 /// hash (new) or the `deps_meta` fallback (existing flows). AllOf is
@@ -5242,6 +5337,66 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "describe_flow: HGETALL flow_core")
+            })
+    }
+
+    async fn set_execution_tag(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        set_execution_tag_impl(&self.client, &self.partition_config, execution_id, key, value)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "set_execution_tag: FCALL ff_set_execution_tags",
+                )
+            })
+    }
+
+    async fn set_flow_tag(
+        &self,
+        flow_id: &FlowId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        set_flow_tag_impl(&self.client, &self.partition_config, flow_id, key, value)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "set_flow_tag: FCALL ff_set_flow_tags",
+                )
+            })
+    }
+
+    async fn get_execution_tag(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        get_execution_tag_impl(&self.client, &self.partition_config, execution_id, key)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "get_execution_tag: HGET :tags")
+            })
+    }
+
+    async fn get_flow_tag(
+        &self,
+        flow_id: &FlowId,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        ff_core::engine_backend::validate_tag_key(key)?;
+        get_flow_tag_impl(&self.client, &self.partition_config, flow_id, key)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(e, "get_flow_tag: HGET :tags")
             })
     }
 

@@ -876,3 +876,80 @@ pub async fn set_edge_group_policy(
 // aren't otherwise referenced after trimming.
 #[allow(dead_code)]
 fn _unused_imports_anchor(_p: Partition, _f: PartitionFamily) {}
+
+// ─── set_flow_tag / get_flow_tag (issue #433) ─────────────────────
+//
+// Flow tags are stored as *top-level* `raw_fields` keys (not nested
+// under `raw_fields.tags`) — matches the `extract_tags` projection
+// used by `describe_flow`. Valkey's `ff_set_flow_tags` Lua lazy-
+// migrates any pre-58.4 inline fields to the dedicated `:tags` key;
+// PG has no such migration because the on-disk shape has always been
+// top-level `raw_fields` keys.
+
+/// Upsert a single namespaced tag on a flow. Key assumed pre-validated
+/// by `ff_core::engine_backend::validate_tag_key`. Missing flow →
+/// `EngineError::NotFound { entity: "flow" }`.
+pub(super) async fn set_flow_tag_impl(
+    pool: &sqlx::PgPool,
+    partition_config: &ff_core::partition::PartitionConfig,
+    flow_id: &FlowId,
+    key: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    let part = flow_partition_byte(flow_id, partition_config);
+    let flow_uuid: Uuid = flow_id.0;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE ff_flow_core
+        SET raw_fields = jsonb_set(
+            COALESCE(raw_fields, '{}'::jsonb),
+            ARRAY[$3::text],
+            to_jsonb($4::text),
+            true
+        )
+        WHERE partition_key = $1 AND flow_id = $2
+        "#,
+    )
+    .bind(part)
+    .bind(flow_uuid)
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(EngineError::NotFound { entity: "flow" });
+    }
+    Ok(())
+}
+
+/// Point-read of `raw_fields->><key>` on `ff_flow_core`. `Ok(None)`
+/// covers missing-tag and missing-flow alike — matches Valkey's
+/// `HGET` collapse (see `EngineBackend::get_flow_tag` rustdoc).
+pub(super) async fn get_flow_tag_impl(
+    pool: &sqlx::PgPool,
+    partition_config: &ff_core::partition::PartitionConfig,
+    flow_id: &FlowId,
+    key: &str,
+) -> Result<Option<String>, EngineError> {
+    let part = flow_partition_byte(flow_id, partition_config);
+    let flow_uuid: Uuid = flow_id.0;
+
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT raw_fields->>$3
+        FROM ff_flow_core
+        WHERE partition_key = $1 AND flow_id = $2
+        "#,
+    )
+    .bind(part)
+    .bind(flow_uuid)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    Ok(row.and_then(|(tag,)| tag))
+}
