@@ -64,16 +64,21 @@ static TRACING_INIT: OnceLock<()> = OnceLock::new();
 /// Called automatically from [`fixtures::TestCluster::connect`] so
 /// every integration test picks it up without per-test boilerplate.
 pub fn init_test_tracing() {
+    // Treat unset OR empty as "no subscriber". GitHub Actions
+    // matrix-gated env expressions (`${{ cond && 'x' || '' }}`) set
+    // the var to an empty string on the false branch rather than
+    // leaving it unset, and we don't want a passing cell to pay the
+    // subscriber-init cost for an empty filter.
+    //
+    // Check `RUST_LOG` BEFORE touching `TRACING_INIT` so a no-op call
+    // does not lock the `OnceLock` into the "not installed" state.
+    // Otherwise a test that reads `RUST_LOG=unset`, calls this helper,
+    // and later sets `RUST_LOG=...` would never get a subscriber.
+    match std::env::var_os("RUST_LOG") {
+        Some(v) if !v.is_empty() => {}
+        _ => return,
+    }
     TRACING_INIT.get_or_init(|| {
-        // Treat unset OR empty as "no subscriber". GitHub Actions
-        // matrix-gated env expressions (`${{ cond && 'x' || '' }}`)
-        // set the var to an empty string on the false branch rather
-        // than leaving it unset, and we don't want a passing cell to
-        // pay the subscriber-init cost for an empty filter.
-        match std::env::var_os("RUST_LOG") {
-            Some(v) if !v.is_empty() => {}
-            _ => return,
-        }
         // `try_init` is the non-panicking form — if some other
         // subscriber was already installed (e.g. a test opted to
         // set one up itself before calling a ff-test helper), we

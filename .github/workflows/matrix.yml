@@ -295,8 +295,16 @@ jobs:
           # shipped in #426/#427/#429; `ff_script=debug` picks up the
           # loader retry loop.
           RUST_LOG: ${{ matrix.mode == 'cluster' && 'ferriskey=warn,ff_script=debug' || '' }}
+          FF_MODE: ${{ matrix.mode }}
         run: |
-          cargo test -p ff-test -- --test-threads=1 --nocapture
+          # `--nocapture` only on cluster cells so the fmt subscriber
+          # output actually reaches the CI log. Standalone + mac cells
+          # keep the default (captured) form to stay noise-free.
+          if [ "$FF_MODE" = "cluster" ]; then
+            cargo test -p ff-test -- --test-threads=1 --nocapture
+          else
+            cargo test -p ff-test -- --test-threads=1
+          fi
 
       # ── Diagnostics on failure ────────────────────────────────────
 
