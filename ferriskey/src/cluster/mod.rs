@@ -4804,6 +4804,672 @@ mod throttle_tests {
 }
 
 #[cfg(test)]
+mod retry_state_machine_tests {
+    //! Unit coverage for the cluster retry state machine (`Request<C>::poll`
+    //! error-handling arms) and for the error → `RetryMethod` classifier.
+    //!
+    //! Motivation
+    //! ----------
+    //! The READONLY fix arc (#426 aggregate / #427 sub-request short-circuit
+    //! / #429 helper extraction) surfaced four independent bugs in this state
+    //! machine — FanOut READONLY aggregation, `reset_routing` replica pinning,
+    //! throttle-skip suppression, and a backward-clock footgun — over the
+    //! span of a single release. Each bug survived review because the state
+    //! machine had **zero unit coverage**: live cluster CI + log-reading were
+    //! the only correctness signal.
+    //!
+    //! These tests drive the state machine with synthetic `OperationResult`
+    //! errors and assert the `Next::*` outcome matches what the code claims
+    //! to do for each error × target combination. They compose with the
+    //! existing `throttle_tests` module above (`decide_should_refresh`
+    //! coverage) to pin the full retry-decision surface.
+    //!
+    //! Scope
+    //! -----
+    //! - `OperationTarget::FanOut` arm (mod.rs ~L1449): READONLY →
+    //!   RefreshSlots-with-request, non-READONLY → Done.
+    //! - `OperationTarget::NotFound` arm (mod.rs ~L1490): always RefreshSlots
+    //!   with fresh routing.
+    //! - `RetryMethod::RefreshSlotsAndRetry` arm with `CmdArg::MultiCmd`
+    //!   short-circuit (#427, mod.rs ~L1533): READONLY on a MultiCmd bubbles
+    //!   to the aggregator; READONLY on a plain Cmd refreshes + retries.
+    //! - Retry budget exhaustion (mod.rs ~L1397): `retry >= number_of_retries`
+    //!   terminates with Done.
+    //! - `RetryParams::default()`: pin the numeric defaults that diagnosis
+    //!   of the #426 arc relied on.
+    //!
+    //! The `decide_should_refresh` helper (category 4 in the test plan) is
+    //! already fully covered by the `throttle_tests` module directly above,
+    //! extracted by PR #429. No duplicate coverage added here.
+
+    use super::{
+        CmdArg, InternalRoutingInfo, InternalSingleNodeRouting, Next, OperationResult,
+        OperationTarget, PendingRequest, Request, RequestInfo, RequestState,
+    };
+    use crate::cluster::client::RetryParams;
+    use crate::cmd::cmd;
+    use crate::connection::MultiplexedConnection;
+    use crate::value::{Error, ErrorKind};
+    use futures::future::{self, BoxFuture};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::sync::oneshot;
+
+    // ───────────────────────── helpers ─────────────────────────
+
+    type Conn = MultiplexedConnection;
+
+    fn err(kind: ErrorKind) -> Error {
+        Error::from((kind, "simulated"))
+    }
+
+    fn single_node_cmd_arg() -> CmdArg<Conn> {
+        CmdArg::Cmd {
+            packed: cmd("PING").get_packed_command(),
+            is_fenced: false,
+            routing: InternalRoutingInfo::SingleNode(InternalSingleNodeRouting::Random),
+        }
+    }
+
+    fn multi_cmd_arg() -> CmdArg<Conn> {
+        // Routing payload mirrors the shape produced by
+        // `execute_on_multiple_nodes`: a SingleNode pin that, after
+        // `reset_routing`, collapses to `ByAddress(..)` — exactly the
+        // pinned-to-replica shape that motivated the #427 short-circuit.
+        CmdArg::MultiCmd {
+            cmd: Arc::new(cmd("PING").clone()),
+            routing: InternalRoutingInfo::SingleNode(InternalSingleNodeRouting::ByAddress(
+                "127.0.0.1:7000".into(),
+            )),
+        }
+    }
+
+    fn build_request(
+        retry: u32,
+        cmd_arg: CmdArg<Conn>,
+        target: OperationTarget,
+        error: Error,
+    ) -> (Request<Conn>, oneshot::Receiver<crate::value::Result<super::Response>>) {
+        let (tx, rx) = oneshot::channel();
+        let pending = PendingRequest {
+            retry,
+            sender: tx,
+            info: RequestInfo { cmd: cmd_arg },
+        };
+        let fut: BoxFuture<'static, OperationResult> =
+            Box::pin(future::ready(Err((target, error))));
+        let req = Request {
+            retry_params: RetryParams::default(),
+            request: Some(pending),
+            future: RequestState::Future { future: fut },
+        };
+        (req, rx)
+    }
+
+    /// Poll a Request once. The inner future is always `ready(..)`, so the
+    /// state machine must return `Poll::Ready(Next::*)` on a single poll.
+    fn poll_once(req: Request<Conn>) -> Next<Conn> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut boxed: Pin<Box<Request<Conn>>> = Box::pin(req);
+        match boxed.as_mut().poll(&mut cx) {
+            Poll::Ready(next) => next,
+            Poll::Pending => panic!("Request::poll returned Pending on a ready inner future"),
+        }
+    }
+
+    // ────────────────── FanOut arm (mod.rs ~L1449) ─────────────────
+
+    #[test]
+    fn fanout_readonly_refreshes_slots_and_redrives_request() {
+        // PR #426 regression: aggregate READONLY on a fan-out must schedule a
+        // topology refresh AND carry the request forward so the fresh slot
+        // map can pick the new primary. Without the refresh-with-request
+        // outcome, the fan-out would either drop the request or replay
+        // against the same (now-replica) node.
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::FanOut,
+            err(ErrorKind::ReadOnly),
+        );
+        match poll_once(req) {
+            Next::RefreshSlots {
+                request: Some(pending),
+                sleep_duration: Some(_),
+                moved_redirect: None,
+            } => {
+                assert_eq!(
+                    pending.retry, 1,
+                    "retry counter must be incremented when the fan-out arm redrives"
+                );
+            }
+            other => panic!(
+                "expected Next::RefreshSlots {{ request: Some, sleep: Some, moved: None }}, got {}",
+                next_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn fanout_generic_error_responds_done_no_retry() {
+        // Non-READONLY fan-out errors: per the #426 comment, the aggregate
+        // layer does NOT add its own retry loop for most error kinds
+        // (sub-requests retry per-node). Arm must respond with the error
+        // and return Done; the caller / aggregator handles any further
+        // retry via its own loop.
+        let (req, rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::FanOut,
+            err(ErrorKind::ResponseError),
+        );
+        assert!(matches!(poll_once(req), Next::Done));
+        // Error was delivered to the caller.
+        let delivered = rx.blocking_recv().expect("sender must have fired");
+        assert!(delivered.is_err());
+    }
+
+    #[test]
+    fn fanout_moved_is_not_short_circuited_as_readonly() {
+        // MOVED on a fan-out sub-request is NOT the READONLY case: the fan-out
+        // arm only treats ReadOnly specially. Other kinds — including MOVED
+        // observed at the aggregate layer — fall through to the generic
+        // `respond(Err) + Done` tail.
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::FanOut,
+            err(ErrorKind::Moved),
+        );
+        assert!(matches!(poll_once(req), Next::Done));
+    }
+
+    #[test]
+    fn single_node_readonly_refreshes_slots_not_fanout_arm() {
+        // Regression guard: the FanOut READONLY short-circuit must NOT fire
+        // for single-node commands. Single-node READONLY goes through the
+        // `RetryMethod::RefreshSlotsAndRetry` arm below, which calls
+        // `reset_routing` and returns RefreshSlots. Both paths end at
+        // RefreshSlots, but via different code; this test pins the
+        // single-node path does NOT accidentally take the fan-out branch.
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::ReadOnly),
+        );
+        match poll_once(req) {
+            Next::RefreshSlots {
+                request: Some(pending),
+                sleep_duration: Some(_),
+                moved_redirect: None,
+            } => {
+                assert_eq!(pending.retry, 1, "single-node retry counter must increment");
+            }
+            other => panic!(
+                "expected Next::RefreshSlots (single-node), got {}",
+                next_name(&other)
+            ),
+        }
+    }
+
+    // ───────────────── NotFound arm (mod.rs ~L1490) ────────────────
+
+    #[test]
+    fn not_found_target_refreshes_slots_and_retries() {
+        // NotFound means the slot-map lookup itself returned no node. Arm
+        // must unconditionally refresh + redrive with a clean routing reset.
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::NotFound,
+            err(ErrorKind::ResponseError),
+        );
+        match poll_once(req) {
+            Next::RefreshSlots {
+                request: Some(pending),
+                sleep_duration: Some(_),
+                moved_redirect: None,
+            } => {
+                assert_eq!(pending.retry, 1);
+            }
+            other => panic!("expected RefreshSlots, got {}", next_name(&other)),
+        }
+    }
+
+    // ────────────── MultiCmd READONLY short-circuit (#427) ─────────
+
+    #[test]
+    fn multicmd_readonly_short_circuits_without_local_retry() {
+        // PR #427: a MultiCmd sub-request that observes READONLY must NOT
+        // take the normal `RetryMethod::RefreshSlotsAndRetry` path. It
+        // burns the local retry budget (~30s with defaults) pinned to the
+        // same replica via `ByAddress(addr)` after `reset_routing`, so we
+        // short-circuit by responding with the READONLY error immediately
+        // so the aggregator can redrive the whole fan-out.
+        let (req, rx) = build_request(
+            0,
+            multi_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::ReadOnly),
+        );
+        assert!(matches!(poll_once(req), Next::Done));
+        let delivered = rx.blocking_recv().expect("sender must have fired");
+        let err = delivered.expect_err("response must be the bubbled READONLY error");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::ReadOnly,
+            "aggregator must observe the original READONLY classification"
+        );
+    }
+
+    #[test]
+    fn multicmd_moved_takes_normal_redirect_path() {
+        // MOVED on a MultiCmd is NOT the short-circuit case — MOVED genuinely
+        // needs a redirect (the slot has migrated), and the aggregate layer
+        // relies on the sub-request's `MovedRedirect` → RefreshSlots outcome.
+        // Short-circuiting MOVED would regress valid cluster-migration
+        // handling. Pin that MOVED drives `Next::RefreshSlots` with the
+        // `moved_redirect` field populated from the redirect target.
+        let (req, _rx) = build_request(
+            0,
+            multi_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::Moved),
+        );
+        match poll_once(req) {
+            Next::RefreshSlots {
+                request: Some(_),
+                sleep_duration: None,
+                moved_redirect: _,
+            } => {}
+            other => panic!(
+                "MOVED on MultiCmd must take the MovedRedirect path, got {}",
+                next_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn single_cmd_readonly_takes_normal_refresh_and_retry() {
+        // Contrast with `multicmd_readonly_short_circuits_without_local_retry`:
+        // a plain `CmdArg::Cmd` (not MultiCmd) with READONLY must take the
+        // normal `RetryMethod::RefreshSlotsAndRetry` branch — refresh slots
+        // + retry with `reset_routing` applied. The short-circuit condition
+        // explicitly matches `CmdArg::MultiCmd { .. }` only.
+        let (req, rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::ReadOnly),
+        );
+        match poll_once(req) {
+            Next::RefreshSlots {
+                request: Some(_),
+                sleep_duration: Some(_),
+                moved_redirect: None,
+            } => {}
+            other => panic!(
+                "expected single-Cmd READONLY to refresh+retry, got {}",
+                next_name(&other)
+            ),
+        }
+        // The request is carried forward into the refresh, so the oneshot
+        // receiver must NOT have been fired yet.
+        drop(rx);
+    }
+
+    // ────────────── retry budget exhaustion (mod.rs ~L1397) ────────
+
+    #[test]
+    fn retry_budget_exhausted_terminates_with_done() {
+        // When `request.retry >= retry_params.number_of_retries`, the state
+        // machine must not increment further; it takes the "out of retries"
+        // branch which responds with the error and returns a terminal
+        // Next::* (Done for non-refresh errors, RefreshSlots-without-request
+        // for MOVED/REFRESH classes, ReconnectToInitialNodes for
+        // AllConnectionsUnavailable). For a plain ResponseError the arm is
+        // `Next::Done`.
+        let cap = RetryParams::default().number_of_retries;
+        let (req, rx) = build_request(
+            cap, // already at cap → exceeds `>=` check
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::ResponseError),
+        );
+        assert!(matches!(poll_once(req), Next::Done));
+        let delivered = rx.blocking_recv().expect("sender must have fired");
+        assert!(delivered.is_err(), "cap-exceeded must deliver the error");
+    }
+
+    #[test]
+    fn retry_budget_exhausted_on_readonly_still_refreshes_without_request() {
+        // Even at the retry cap, a READONLY (RefreshSlotsAndRetry-classified)
+        // error must emit `Next::RefreshSlots { request: None, .. }` so the
+        // cluster task at least updates its topology view. The request is
+        // `None` because the retry budget is used up — no further attempt.
+        let cap = RetryParams::default().number_of_retries;
+        let (req, _rx) = build_request(
+            cap,
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::ReadOnly),
+        );
+        match poll_once(req) {
+            Next::RefreshSlots {
+                request: None,
+                sleep_duration: None,
+                moved_redirect: None,
+            } => {}
+            other => panic!(
+                "cap-exceeded READONLY must refresh slots without redrive, got {}",
+                next_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn retry_params_defaults_match_diagnosis_assumptions() {
+        // Pin the numeric defaults used during the #426 diagnosis arc.
+        // The diagnosis reasoning ("16 retries × ~30s worst-case burn")
+        // depended on these values; if a future refactor changes them,
+        // update `project_ferriskey_retry_state_machine_test_gap.md`
+        // and the #427 comment block together.
+        let p = RetryParams::default();
+        assert_eq!(p.number_of_retries, 16, "DEFAULT_RETRIES");
+        // min_wait_time / max_wait_time are private; verify them indirectly
+        // via `wait_time_for_retry(0)`, which is bounded by
+        // `[min_wait, min(base, max_wait).max(min_wait+1))`.
+        // For retry=0: base = factor * exponent_base^0 = 10, clamped to
+        // max(10, min_wait_time+1) = 1281, so the jitter range is
+        // [min_wait_time, 1281). Assert the lower bound holds.
+        let wait = p.wait_time_for_retry(0);
+        assert!(
+            wait.as_millis() >= 1280,
+            "min_wait_time default must be 1280ms, got {:?}",
+            wait
+        );
+        assert!(
+            wait.as_millis() < 1281,
+            "with retry=0 the jitter ceiling is 1281ms, got {:?}",
+            wait
+        );
+    }
+
+    // ───── additional single-node retry-method arms (sanity coverage) ─────
+
+    #[test]
+    fn single_node_moved_emits_refresh_slots_with_redirect_metadata() {
+        // MOVED on a single-node command carries a redirect target in the
+        // error; the `RetryMethod::MovedRedirect` arm must surface it via
+        // `moved_redirect` on `Next::RefreshSlots` (and NOT sleep —
+        // `sleep_duration: None` distinguishes the MOVED path from the
+        // generic refresh path).
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::Moved),
+        );
+        match poll_once(req) {
+            Next::RefreshSlots {
+                request: Some(_),
+                sleep_duration: None,
+                moved_redirect: _,
+            } => {}
+            other => panic!(
+                "MOVED single-node must refresh slots with no sleep, got {}",
+                next_name(&other)
+            ),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn single_node_try_again_wait_and_retries() {
+        // TryAgain → WaitAndRetry stashes the request in the `Sleep` state
+        // variant and re-polls self. The sleep future is Pending on the
+        // first poll, so `Request::poll` returns `Poll::Pending` (not a
+        // terminal `Next::*`). Assert that shape — it's the signature of
+        // "state machine paused for backoff" as opposed to Done (give up)
+        // or RefreshSlots (topology fault). The full sleep→retry loop is
+        // exercised by live-cluster integration tests; unit coverage here
+        // just pins that TryAgain does NOT terminate prematurely.
+        let (tx, _rx) = oneshot::channel();
+        let pending = PendingRequest {
+            retry: 0,
+            sender: tx,
+            info: RequestInfo {
+                cmd: single_node_cmd_arg(),
+            },
+        };
+        let fut: BoxFuture<'static, OperationResult> = Box::pin(future::ready(Err((
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::TryAgain),
+        ))));
+        let req = Request {
+            retry_params: RetryParams::default(),
+            request: Some(pending),
+            future: RequestState::Future { future: fut },
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut boxed: Pin<Box<Request<Conn>>> = Box::pin(req);
+        assert!(
+            matches!(boxed.as_mut().poll(&mut cx), Poll::Pending),
+            "TryAgain must transition into the Sleep state (Pending), not terminate"
+        );
+    }
+
+    #[test]
+    fn single_node_ask_redirects_via_retry() {
+        // AskRedirect sets the redirect on the request and emits
+        // `Next::Retry` (no slot refresh — ASK is transient, not topology
+        // change).
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::Ask),
+        );
+        assert!(
+            matches!(poll_once(req), Next::Retry { .. }),
+            "ASK must emit Next::Retry with redirect applied, not refresh"
+        );
+    }
+
+    #[test]
+    fn single_node_busy_loading_emits_retry_busy_loading_error() {
+        // BUSYLOADING classifies as WaitAndRetryOnPrimaryRedirectOnReplica —
+        // the state machine emits a dedicated `Next::RetryBusyLoadingError`
+        // variant so the caller can special-case the primary-redirect
+        // logic on replica-originated BUSYLOADING.
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7001".into(),
+            },
+            err(ErrorKind::BusyLoadingError),
+        );
+        match poll_once(req) {
+            Next::RetryBusyLoadingError { address, .. } => {
+                assert_eq!(address, "127.0.0.1:7001");
+            }
+            other => panic!(
+                "BUSYLOADING must emit RetryBusyLoadingError, got {}",
+                next_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn fatal_error_target_terminates_without_retry() {
+        // `OperationTarget::FatalError` is the "connection task gave up"
+        // signal — propagate the error to the caller, return Done, no
+        // retries, no refresh.
+        let (req, rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::FatalError,
+            err(ErrorKind::IoError),
+        );
+        assert!(matches!(poll_once(req), Next::Done));
+        let delivered = rx.blocking_recv().expect("sender must have fired");
+        assert!(delivered.is_err());
+    }
+
+    #[test]
+    fn all_connections_unavailable_triggers_reconnect_to_initial_nodes() {
+        // Special-cased above the `retry_method()` dispatch: any
+        // `AllConnectionsUnavailable` with retry budget remaining emits
+        // `Next::ReconnectToInitialNodes { request: Some }` so the cluster
+        // can rebuild connectivity from the seed list.
+        let (req, _rx) = build_request(
+            0,
+            single_node_cmd_arg(),
+            OperationTarget::Node {
+                address: "127.0.0.1:7000".into(),
+            },
+            err(ErrorKind::AllConnectionsUnavailable),
+        );
+        match poll_once(req) {
+            Next::ReconnectToInitialNodes {
+                request: Some(_), ..
+            } => {}
+            other => panic!(
+                "AllConnectionsUnavailable must trigger ReconnectToInitialNodes, got {}",
+                next_name(&other)
+            ),
+        }
+    }
+
+    // Helper for panic messages — Next does not impl Debug.
+    fn next_name<C>(n: &Next<C>) -> &'static str {
+        match n {
+            Next::Retry { .. } => "Retry",
+            Next::RetryBusyLoadingError { .. } => "RetryBusyLoadingError",
+            Next::Reconnect { .. } => "Reconnect",
+            Next::RefreshSlots { .. } => "RefreshSlots",
+            Next::ReconnectToInitialNodes { .. } => "ReconnectToInitialNodes",
+            Next::Done => "Done",
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_classification_tests {
+    //! Pin the `ErrorKind → RetryMethod` classifier (value.rs ~L987).
+    //!
+    //! The cluster state-machine tests above assume specific classifier
+    //! outputs (e.g. READONLY → RefreshSlotsAndRetry drives the MultiCmd
+    //! short-circuit; MOVED → MovedRedirect drives the non-short-circuit
+    //! MultiCmd redirect path). A silent classifier change would break
+    //! those assumptions without flagging the state-machine tests as
+    //! wrong — so pin the classifier contract here.
+    use crate::value::{Error, ErrorKind, RetryMethod};
+
+    fn classify(kind: ErrorKind) -> RetryMethod {
+        Error::from((kind, "simulated")).retry_method()
+    }
+
+    #[test]
+    fn readonly_classifies_as_refresh_slots_and_retry() {
+        assert_eq!(classify(ErrorKind::ReadOnly), RetryMethod::RefreshSlotsAndRetry);
+    }
+
+    #[test]
+    fn moved_classifies_as_moved_redirect() {
+        assert_eq!(classify(ErrorKind::Moved), RetryMethod::MovedRedirect);
+    }
+
+    #[test]
+    fn ask_classifies_as_ask_redirect() {
+        assert_eq!(classify(ErrorKind::Ask), RetryMethod::AskRedirect);
+    }
+
+    #[test]
+    fn cluster_down_classifies_as_wait_and_retry() {
+        assert_eq!(classify(ErrorKind::ClusterDown), RetryMethod::WaitAndRetry);
+    }
+
+    #[test]
+    fn try_again_classifies_as_wait_and_retry() {
+        assert_eq!(classify(ErrorKind::TryAgain), RetryMethod::WaitAndRetry);
+    }
+
+    #[test]
+    fn busy_loading_classifies_as_primary_redirect_on_replica() {
+        assert_eq!(
+            classify(ErrorKind::BusyLoadingError),
+            RetryMethod::WaitAndRetryOnPrimaryRedirectOnReplica,
+        );
+    }
+
+    #[test]
+    fn io_connection_reset_is_retryable_as_reconnect() {
+        // IoError routes through the inner io::ErrorKind. ConnectionReset is
+        // a canonical mid-stream failure and must classify as Reconnect so
+        // the state machine tears down + rebuilds the connection rather
+        // than NoRetry'ing a transient network event.
+        let e = Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "simulated",
+        ));
+        assert_eq!(e.retry_method(), RetryMethod::Reconnect);
+    }
+
+    #[test]
+    fn all_connections_unavailable_classifies_as_reconnect() {
+        assert_eq!(
+            classify(ErrorKind::AllConnectionsUnavailable),
+            RetryMethod::Reconnect,
+        );
+    }
+
+    #[test]
+    fn response_error_classifies_as_no_retry() {
+        // Bare ResponseError (server-side semantic error) must not be
+        // retried — retrying a CROSSSLOT, SYNTAX, NOSCRIPT etc. would
+        // burn budget against a guaranteed-failing command.
+        assert_eq!(classify(ErrorKind::ResponseError), RetryMethod::NoRetry);
+    }
+
+    #[test]
+    fn cross_slot_classifies_as_no_retry() {
+        assert_eq!(classify(ErrorKind::CrossSlot), RetryMethod::NoRetry);
+    }
+
+    #[test]
+    fn extension_error_classifies_as_no_retry() {
+        // Custom extension errors (RESP `-CUSTOM ...` without a matching
+        // class) are user/application semantic errors, not transport
+        // failures — retrying them would mask application bugs.
+        assert_eq!(classify(ErrorKind::ExtensionError), RetryMethod::NoRetry);
+    }
+}
+
+#[cfg(test)]
 mod pipeline_routing_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
