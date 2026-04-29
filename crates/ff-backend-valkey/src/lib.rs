@@ -71,8 +71,9 @@ use ff_script::functions::execution::{
     ff_create_execution,
 };
 use ff_script::functions::flow::{
-    DepOpKeys, FlowStructOpKeys, ff_add_execution_to_flow, ff_apply_dependency_to_child,
-    ff_cancel_flow, ff_create_flow, ff_replay_execution, ff_stage_dependency_edge,
+    DepOpKeys, FlowStructOpKeys, ResolveDependencyKeys, ff_add_execution_to_flow,
+    ff_apply_dependency_to_child, ff_cancel_flow, ff_create_flow, ff_replay_execution,
+    ff_resolve_dependency, ff_stage_dependency_edge,
 };
 use ff_script::functions::lease::ff_revoke_lease;
 use ff_script::functions::scheduling::{
@@ -6182,6 +6183,42 @@ impl EngineBackend for ValkeyBackend {
                 transport_script(e),
                 "apply_dependency_to_child: FCALL ff_apply_dependency_to_child",
             ))
+    }
+
+    // core-gated at trait level; ff-backend-valkey propagates ff-core/core
+    //
+    // PR-7b Step 0: wraps `ff_resolve_dependency` (RFC-016 Stage C
+    // signature). Both the dep_reconciler scanner and the post-
+    // completion dispatch loop route through this trait method.
+    async fn resolve_dependency(
+        &self,
+        args: ff_core::contracts::ResolveDependencyArgs,
+    ) -> Result<ff_core::contracts::ResolveDependencyOutcome, EngineError> {
+        let ctx = ExecKeyContext::new(&args.partition, &args.downstream_execution_id);
+        let idx = IndexKeys::new(&args.partition);
+        let upstream_ctx = ExecKeyContext::new(&args.partition, &args.upstream_execution_id);
+        // Flow partition co-locates with the exec partition under
+        // `{fp:N}` via RFC-011 flow-affinity; use the same partition
+        // so the FCALL remains single-slot.
+        let flow_ctx = FlowKeyContext::new(&args.partition, &args.flow_id);
+        let flow_idx = ff_core::keys::FlowIndexKeys::new(&args.partition);
+        let keys = ResolveDependencyKeys {
+            ctx: &ctx,
+            idx: &idx,
+            lane_id: &args.lane_id,
+            upstream_ctx: &upstream_ctx,
+            flow_ctx: &flow_ctx,
+            flow_idx: &flow_idx,
+            downstream_eid: &args.downstream_execution_id,
+            current_attempt_index: args.current_attempt_index,
+        };
+        let result = ff_resolve_dependency(&self.client, &keys, &args)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "resolve_dependency: FCALL ff_resolve_dependency",
+            ))?;
+        Ok(result.into())
     }
 
     // core-gated at trait level; ff-backend-valkey propagates ff-core/core

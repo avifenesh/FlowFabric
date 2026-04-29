@@ -1420,6 +1420,46 @@ pub trait EngineBackend: Send + Sync + 'static {
         })
     }
 
+    /// Resolve one dependency edge after its upstream reached a
+    /// terminal outcome — satisfy on "success", mark impossible
+    /// otherwise. Idempotent (`AlreadyResolved` on replay).
+    ///
+    /// PR-7b Step 0 overlap-resolver: lifted here so cluster 2
+    /// (`scanner/dependency_reconciler`) and cluster 4
+    /// (`completion_listener::spawn_dispatch_loop`) can both trait-
+    /// route through `Arc<dyn EngineBackend>` without a merge
+    /// conflict. Both Valkey call sites today build identical
+    /// KEYS[14]+ARGV[5] and invoke the `ff_resolve_dependency`
+    /// FCALL — this method is that FCALL behind the trait.
+    ///
+    /// # Backend status
+    ///
+    /// - **Valkey:** wraps `ff_resolve_dependency` (RFC-016 Stage C
+    ///   signature). Atomic single-slot FCALL.
+    /// - **Postgres:** `Unavailable`. PG's post-completion cascade is
+    ///   not per-edge; it runs via
+    ///   `ff_backend_postgres::dispatch::dispatch_completion(event_id)`
+    ///   keyed on the `ff_completion_event` outbox row. The Valkey-
+    ///   shaped per-edge resolve does not map cleanly to that model;
+    ///   PG's `dependency_reconciler` already calls `dispatch_completion`
+    ///   directly. The engine's PR-7b/final integration test expects
+    ///   `Unsupported` logs from Valkey-shaped scanners on a PG
+    ///   deployment — this surface honours that contract.
+    /// - **SQLite:** `Unavailable` for the same reason (mirrors PG).
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so a
+    /// backend that has not been migrated surfaces a typed
+    /// `Unsupported`-grade error rather than a panic.
+    #[cfg(feature = "core")]
+    async fn resolve_dependency(
+        &self,
+        _args: crate::contracts::ResolveDependencyArgs,
+    ) -> Result<crate::contracts::ResolveDependencyOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "resolve_dependency",
+        })
+    }
+
     // ── RFC-017 Stage A — Operator control (4) ─────────────────
 
     /// Operator-initiated execution cancel (row 2).
@@ -2324,6 +2364,44 @@ mod tests {
         assert_eq!(caps.identity.rfc017_stage, "unknown");
         // Every field false on the default (matches `Supports::none()`).
         assert_eq!(caps.supports, crate::capability::Supports::none());
+    }
+
+    // ── resolve_dependency (PR-7b Step 0) ──
+
+    /// Default impl returns `Unavailable { op: "resolve_dependency" }`
+    /// so pre-migration backends surface a typed Unsupported-grade
+    /// error rather than panic. Both cluster 2's dependency_reconciler
+    /// and cluster 4's completion_listener route through this method;
+    /// the default is the safety net for non-Valkey deployments.
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_resolve_dependency_is_unavailable() {
+        use crate::contracts::ResolveDependencyArgs;
+        use crate::partition::{Partition, PartitionFamily};
+        use crate::types::{AttemptIndex, EdgeId, FlowId, LaneId};
+
+        let b = DefaultBackend;
+        let partition = Partition {
+            family: PartitionFamily::Flow,
+            index: 0,
+        };
+        let args = ResolveDependencyArgs::new(
+            partition,
+            FlowId::parse("11111111-1111-1111-1111-111111111111").unwrap(),
+            ExecutionId::parse("{fp:0}:22222222-2222-2222-2222-222222222222").unwrap(),
+            ExecutionId::parse("{fp:0}:33333333-3333-3333-3333-333333333333").unwrap(),
+            EdgeId::parse("44444444-4444-4444-4444-444444444444").unwrap(),
+            LaneId::new("default"),
+            AttemptIndex::new(0),
+            "success".to_owned(),
+            TimestampMs::now(),
+        );
+        match b.resolve_dependency(args).await {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "resolve_dependency");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 
     // ── validate_tag_key (issue #433) ──
