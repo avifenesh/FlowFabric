@@ -72,9 +72,8 @@ use ff_script::functions::execution::{
 };
 use ff_script::functions::flow::{
     DepOpKeys, FlowStructOpKeys, ResolveDependencyKeys, ff_add_execution_to_flow,
-    ff_apply_dependency_to_child, ff_cancel_flow, ff_create_flow,
-    ff_evaluate_flow_eligibility, ff_replay_execution, ff_resolve_dependency,
-    ff_stage_dependency_edge,
+    ff_apply_dependency_to_child, ff_cancel_flow, ff_create_flow, ff_replay_execution,
+    ff_resolve_dependency, ff_stage_dependency_edge,
 };
 use ff_script::functions::lease::{ff_renew_lease, ff_revoke_lease};
 use ff_script::functions::suspension::{ResumeOpKeys, ff_resume_execution};
@@ -7064,8 +7063,15 @@ impl EngineBackend for ValkeyBackend {
         let idx = IndexKeys::new(&partition);
 
         // Pre-read lane_id + current_worker_instance_id so callers
-        // only supply execution_id + fence + attempt_index (same
-        // ergonomics as `revoke_lease`'s WIID auto-resolution).
+        // only supply execution_id + fence + attempt_index.
+        //
+        // Empty/missing `current_worker_instance_id` is a typed error
+        // rather than an empty-string fallback — `ExecOpKeys` feeds
+        // the WIID into `idx.worker_leases(wiid)` which would collide
+        // across multiple executions under the same "empty worker"
+        // key on Valkey. Missing lane_id is also a typed error:
+        // `exec_core` without a lane is an invariant violation
+        // (`create_execution` writes lane_id atomically).
         let dyn_fields: Vec<Option<String>> = self
             .client
             .cmd("HMGET")
@@ -7078,20 +7084,26 @@ impl EngineBackend for ValkeyBackend {
                 transport_fk(e),
                 "complete_execution: HMGET exec_core",
             ))?;
-        let lane = LaneId::new(
-            dyn_fields
-                .first()
-                .and_then(|v| v.as_ref())
-                .cloned()
-                .unwrap_or_else(|| "default".to_owned()),
-        );
-        let wiid = WorkerInstanceId::new(
-            dyn_fields
-                .get(1)
-                .and_then(|v| v.as_ref())
-                .map(String::as_str)
-                .unwrap_or(""),
-        );
+        let lane_str = dyn_fields.first().and_then(|v| v.as_ref()).filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!(
+                    "complete_execution: exec_core[{eid}].lane_id missing or empty",
+                    eid = args.execution_id
+                ),
+            })?
+            .clone();
+        let wiid_str = dyn_fields.get(1).and_then(|v| v.as_ref()).filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Validation {
+                kind: ValidationKind::InvalidLeaseForSuspend,
+                detail: format!(
+                    "complete_execution: exec_core[{eid}].current_worker_instance_id missing — no active lease",
+                    eid = args.execution_id
+                ),
+            })?
+            .clone();
+        let lane = LaneId::new(lane_str);
+        let wiid = WorkerInstanceId::new(wiid_str);
 
         let keys = ExecOpKeys {
             ctx: &ctx,
@@ -7116,6 +7128,9 @@ impl EngineBackend for ValkeyBackend {
         let ctx = ExecKeyContext::new(&partition, &args.execution_id);
         let idx = IndexKeys::new(&partition);
 
+        // Same pre-read contract as `complete_execution` above —
+        // empty WIID / lane_id are typed errors, never silent
+        // fallbacks.
         let dyn_fields: Vec<Option<String>> = self
             .client
             .cmd("HMGET")
@@ -7128,20 +7143,26 @@ impl EngineBackend for ValkeyBackend {
                 transport_fk(e),
                 "fail_execution: HMGET exec_core",
             ))?;
-        let lane = LaneId::new(
-            dyn_fields
-                .first()
-                .and_then(|v| v.as_ref())
-                .cloned()
-                .unwrap_or_else(|| "default".to_owned()),
-        );
-        let wiid = WorkerInstanceId::new(
-            dyn_fields
-                .get(1)
-                .and_then(|v| v.as_ref())
-                .map(String::as_str)
-                .unwrap_or(""),
-        );
+        let lane_str = dyn_fields.first().and_then(|v| v.as_ref()).filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!(
+                    "fail_execution: exec_core[{eid}].lane_id missing or empty",
+                    eid = args.execution_id
+                ),
+            })?
+            .clone();
+        let wiid_str = dyn_fields.get(1).and_then(|v| v.as_ref()).filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Validation {
+                kind: ValidationKind::InvalidLeaseForSuspend,
+                detail: format!(
+                    "fail_execution: exec_core[{eid}].current_worker_instance_id missing — no active lease",
+                    eid = args.execution_id
+                ),
+            })?
+            .clone();
+        let lane = LaneId::new(lane_str);
+        let wiid = WorkerInstanceId::new(wiid_str);
 
         let keys = ExecOpKeys {
             ctx: &ctx,
@@ -7183,6 +7204,13 @@ impl EngineBackend for ValkeyBackend {
         // on `exec_core`. Cairn's pre-migration code did the same
         // HGET before dispatching the raw FCALL — same semantics,
         // different routing (trait method instead of raw fcall()).
+        //
+        // Both fields are REQUIRED: `ff_resume_execution` builds
+        // KEYS[3]/[4] from the waitpoint id and uses lane_id in the
+        // index keys. An empty or unparseable waitpoint_id would make
+        // the Lua operate on the wrong keys or on a made-up waitpoint
+        // — surface `State::ExecutionNotSuspended` / `Corruption`
+        // typed errors instead of fabricating a UUID.
         let dyn_fields: Vec<Option<String>> = self
             .client
             .cmd("HMGET")
@@ -7195,23 +7223,31 @@ impl EngineBackend for ValkeyBackend {
                 transport_fk(e),
                 "resume_execution: HMGET exec_core",
             ))?;
-        let lane = LaneId::new(
-            dyn_fields
-                .first()
-                .and_then(|v| v.as_ref())
-                .cloned()
-                .unwrap_or_else(|| "default".to_owned()),
-        );
+        let lane_str = dyn_fields.first().and_then(|v| v.as_ref()).filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!(
+                    "resume_execution: exec_core[{eid}].lane_id missing or empty",
+                    eid = args.execution_id
+                ),
+            })?
+            .clone();
+        let lane = LaneId::new(lane_str);
         let wp_id_str = dyn_fields
             .get(1)
             .and_then(|v| v.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let wp_id = if wp_id_str.is_empty() {
-            WaitpointId::new()
-        } else {
-            WaitpointId::parse(&wp_id_str).unwrap_or_else(|_| WaitpointId::new())
-        };
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EngineError::State(
+                ff_core::engine_error::StateKind::ExecutionNotSuspended,
+            ))?
+            .clone();
+        let wp_id = WaitpointId::parse(&wp_id_str).map_err(|e| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!(
+                "resume_execution: exec_core[{eid}].current_waitpoint_id unparseable: {e}",
+                eid = args.execution_id
+            ),
+        })?;
 
         let keys = ResumeOpKeys {
             ctx: &ctx,
@@ -7261,35 +7297,38 @@ impl EngineBackend for ValkeyBackend {
         &self,
         args: ff_core::contracts::EvaluateFlowEligibilityArgs,
     ) -> Result<ff_core::contracts::EvaluateFlowEligibilityResult, EngineError> {
-        // `ff_evaluate_flow_eligibility` reads KEYS (exec_core,
-        // deps_meta) only — the `DepOpKeys` struct carries extra
-        // `idx`/`lane_id`/`flow_ctx`/`downstream_eid` fields the Lua
-        // never reads, but the key-context type is shared across the
-        // dependency ops. Build with zero-valued dummies for the
-        // unused fields to satisfy the type.
+        // `ff_evaluate_flow_eligibility` takes KEYS=(exec_core,
+        // deps_meta) + ARGV=(). The ff-script wrapper is expressed
+        // over `DepOpKeys` because the macro standardises on that
+        // shape for all dependency ops, but this op does not read
+        // `flow_ctx` / `lane_id` / `idx` / `downstream_eid`. Rather
+        // than synthesise unused values (brittle if the wrapper's
+        // KEYS set ever grows), issue the FCALL directly — same
+        // pattern `cancel_execution` and `revoke_lease` use when the
+        // shared key-context doesn't match the Lua's key layout.
+        //
+        // KEYS definition: see `ff_evaluate_flow_eligibility` in
+        // `crates/ff-script/src/functions/flow.rs` (KEYS(2) /
+        // ARGV(0)) + `lua/flow.lua::ff_evaluate_flow_eligibility`.
         let partition = execution_partition(&args.execution_id, &self.partition_config);
         let ctx = ExecKeyContext::new(&partition, &args.execution_id);
-        let idx = IndexKeys::new(&partition);
-        // Dummy flow context — `ff_evaluate_flow_eligibility` does
-        // not touch `flow_ctx.edgegroup()` in its KEYS (lua source at
-        // `flowfabric.lua:8422` confirms KEYS[1..2] only). A fresh
-        // FlowId with any partition is safe because the key is unused.
-        let flow_id = FlowId::new();
-        let flow_partition_k = flow_partition(&flow_id, &self.partition_config);
-        let flow_ctx = FlowKeyContext::new(&flow_partition_k, &flow_id);
-        let lane = LaneId::new("default".to_owned());
-        let keys = DepOpKeys {
-            ctx: &ctx,
-            idx: &idx,
-            lane_id: &lane,
-            flow_ctx: &flow_ctx,
-            downstream_eid: &args.execution_id,
-        };
-        ff_evaluate_flow_eligibility(&self.client, &keys, &args)
+        let keys: Vec<String> = vec![ctx.core(), ctx.deps_meta()];
+        let argv: Vec<String> = vec![];
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+
+        let raw: ferriskey::Value = self
+            .client
+            .fcall("ff_evaluate_flow_eligibility", &key_refs, &arg_refs)
             .await
             .map_err(|e| ff_core::engine_error::backend_context(
-                transport_script(e),
+                transport_fk(e),
                 "evaluate_flow_eligibility: FCALL ff_evaluate_flow_eligibility",
+            ))?;
+        ff_core::contracts::EvaluateFlowEligibilityResult::from_fcall_result(&raw)
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "evaluate_flow_eligibility: parse",
             ))
     }
 

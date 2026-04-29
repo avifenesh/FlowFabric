@@ -2572,7 +2572,12 @@ mod tests {
     // keep compiling and consumers get a terminal-classified error
     // rather than a panic. Mirrors the precedent used by
     // `issue_reclaim_grant` / `reclaim_execution` / `suspend_by_triple`.
+    //
+    // Feature-gated on `core` because the methods under test only
+    // exist on the trait under that feature — matches the precedent
+    // of `default_resolve_dependency_is_unavailable` above.
 
+    #[cfg(feature = "core")]
     #[tokio::test]
     async fn default_complete_execution_is_unavailable() {
         use crate::contracts::CompleteExecutionArgs;
@@ -2595,6 +2600,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "core")]
     #[tokio::test]
     async fn default_fail_execution_is_unavailable() {
         use crate::contracts::FailExecutionArgs;
@@ -2618,6 +2624,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "core")]
     #[tokio::test]
     async fn default_renew_lease_is_unavailable() {
         use crate::contracts::RenewLeaseArgs;
@@ -2638,6 +2645,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "core")]
     #[tokio::test]
     async fn default_resume_execution_is_unavailable() {
         use crate::contracts::ResumeExecutionArgs;
@@ -2656,6 +2664,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "core")]
     #[tokio::test]
     async fn default_check_admission_is_unavailable() {
         use crate::contracts::CheckAdmissionArgs;
@@ -2682,6 +2691,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "core")]
     #[tokio::test]
     async fn default_evaluate_flow_eligibility_is_unavailable() {
         use crate::contracts::EvaluateFlowEligibilityArgs;
