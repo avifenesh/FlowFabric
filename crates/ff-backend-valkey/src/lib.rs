@@ -2630,6 +2630,17 @@ async fn append_frame_impl(
     Ok(outcome)
 }
 
+/// Compute `expires_at_ms` for a pending waitpoint, clamping overflow to
+/// `i64::MAX` to match the PG + SQLite `create_waitpoint` behaviour
+/// (see `ff-backend-postgres::suspend_ops::create_waitpoint` ~L722-730 and
+/// `ff-backend-sqlite::suspend_ops::create_waitpoint_impl`). A stricter
+/// "overflow => Validation" contract would require a one-shot trait-docs +
+/// all-three-backends change; keep parity until then.
+fn waitpoint_expires_at_ms(now_ms: i64, expires_in: Duration) -> i64 {
+    let expires_in_ms = i64::try_from(expires_in.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_add(expires_in_ms)
+}
+
 /// Round-7 — `create_waitpoint` FCALL body. Migrated from
 /// `ff_sdk::task::ClaimedTask::create_pending_waitpoint`. 4 KEYS, 5
 /// ARGV. Mints a fresh `WaitpointId` client-side and returns the
@@ -2656,8 +2667,10 @@ async fn create_waitpoint_impl(
     let idx = IndexKeys::new(&partition);
 
     let waitpoint_id = WaitpointId::new();
-    let expires_at =
-        TimestampMs::from_millis(now_ms_timestamp().0 + expires_in.as_millis() as i64);
+    let expires_at = TimestampMs::from_millis(waitpoint_expires_at_ms(
+        now_ms_timestamp().0,
+        expires_in,
+    ));
 
     let keys: Vec<String> = vec![
         ctx.core(),
@@ -8465,6 +8478,21 @@ mod tests {
             cancel_policy_to_str(CancelFlowPolicy::CancelPending),
             "cancel_pending"
         );
+    }
+
+    /// `Duration::MAX.as_millis()` overflows `i64`. The pre-fix code used
+    /// `as i64` which silently truncates and can wrap NEGATIVE. Post-fix
+    /// should clamp to `i64::MAX` (via `saturating_add`) to match the PG +
+    /// SQLite `create_waitpoint` behaviour.
+    #[test]
+    fn create_waitpoint_expires_in_max_clamps_instead_of_wrapping() {
+        let now_ms: i64 = 1_700_000_000_000; // arbitrary positive "now"
+        let got = waitpoint_expires_at_ms(now_ms, Duration::MAX);
+        assert!(
+            got > 0,
+            "expires_at must not wrap negative on oversized expires_in (got {got})"
+        );
+        assert_eq!(got, i64::MAX, "expires_at must clamp to i64::MAX");
     }
 
     #[test]
