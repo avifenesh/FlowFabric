@@ -4647,11 +4647,17 @@ pub(crate) fn decide_should_refresh(
     let Some(last) = last_run else {
         return RefreshDecision::Refresh;
     };
-    // `saturating_duration_since` returns `Duration::ZERO` rather than
-    // panicking if the monotonic clock appears to go backward
-    // (platform-specific anomaly). A zero elapsed time forces a refresh,
-    // which matches the prior `SystemTime`-fallback behavior.
-    let passed = now.saturating_duration_since(last);
+    // Backward-clock guard: if `now < last`, the monotonic clock appears to
+    // have gone backward (platform-specific anomaly) or `last_run` holds a
+    // future stamp from a prior skewed read. `Instant::checked_duration_since`
+    // returns `None` iff `self < earlier`, so `now.checked_duration_since(last)`
+    // gives `Some(passed)` on a forward clock and `None` on backward.
+    // On backward clock, force a refresh — trusting a stale/future `last_run`
+    // would silently suppress the fail-safe refresh, matching the intent of
+    // the prior `SystemTime`-fallback behavior.
+    let Some(passed) = now.checked_duration_since(last) else {
+        return RefreshDecision::Refresh;
+    };
     if passed <= window {
         RefreshDecision::Skip { passed, window }
     } else {
@@ -4748,11 +4754,11 @@ mod throttle_tests {
     }
 
     #[test]
-    fn throttable_with_backward_clock_refreshes() {
-        // Simulate `now < last` via saturating_duration_since: passed = 0,
-        // which is `<= window`, so under the current (prior) behavior the
-        // refresh is still skipped. This test pins that behavior so any
-        // future change to the saturating-clock semantics is deliberate.
+    fn throttable_with_backward_clock_forces_refresh() {
+        // Backward clock is untrusted; fail-safe is to refresh rather than
+        // trust a stale `last_run` that may be from the future per a skewed
+        // clock. `now < last` is detected via `now.checked_duration_since(last)`
+        // returning `None`.
         let now = Instant::now();
         let last = now + Duration::from_secs(1); // "future" last_run
         let decision = decide_should_refresh(
@@ -4761,11 +4767,38 @@ mod throttle_tests {
             now,
             WINDOW,
         );
+        assert_eq!(
+            decision,
+            RefreshDecision::Refresh,
+            "backward clock (now < last) must force refresh — trusting a \
+             future `last_run` would silently suppress the fail-safe refresh"
+        );
+    }
+
+    #[test]
+    fn throttable_with_zero_elapsed_forward_clock_still_skips() {
+        // Edge case: `now == last` means zero elapsed time but the clock has
+        // NOT gone backward (`now.checked_duration_since(last)` returns
+        // `Some(ZERO)`, not `None`). Under a forward clock with
+        // `passed = 0 <= window`, the throttle must still skip. This pins
+        // that the backward-clock fix does not over-trigger on the
+        // legitimate `now == last` boundary.
+        let now = Instant::now();
+        let last = now;
+        let decision = decide_should_refresh(
+            &RefreshPolicy::Throttable,
+            Some(last),
+            now,
+            WINDOW,
+        );
         match decision {
-            RefreshDecision::Skip { passed, .. } => {
+            RefreshDecision::Skip { passed, window } => {
                 assert_eq!(passed, Duration::ZERO);
+                assert_eq!(window, WINDOW);
             }
-            RefreshDecision::Refresh => panic!("expected Skip with ZERO elapsed"),
+            RefreshDecision::Refresh => {
+                panic!("expected Skip — `now == last` is a forward clock with zero elapsed")
+            }
         }
     }
 }
