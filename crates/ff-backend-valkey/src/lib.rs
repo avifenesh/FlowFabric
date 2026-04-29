@@ -8154,6 +8154,53 @@ impl EngineBackend for ValkeyBackend {
             .map_err(transport_fk)?;
         Ok(())
     }
+
+    // PR-7b Cluster 2: wraps `ff_unblock_execution` (RFC-010 §6).
+    // KEYS[3]: exec_core, <source_blocked_zset>, eligible_zset
+    // ARGV[3]: execution_id, now_ms, expected_blocking_reason
+    //
+    // `expected_blocking_reason` selects which of the three blocked
+    // ZSETs (`blocked:budget`, `blocked:quota`, `blocked:route`) is
+    // drained. The Lua body re-validates `blocking_reason` on
+    // `exec_core` to fence a stale unblock when the execution has
+    // already transitioned.
+    async fn unblock_execution(
+        &self,
+        partition: Partition,
+        lane_id: &LaneId,
+        execution_id: &ExecutionId,
+        expected_blocking_reason: &str,
+        now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let tag = partition.hash_tag();
+        let eid_str = execution_id.as_str();
+        let idx = IndexKeys::new(&partition);
+
+        let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
+        let blocked_zset = match expected_blocking_reason {
+            "waiting_for_budget" => idx.lane_blocked_budget(lane_id),
+            "waiting_for_quota" => idx.lane_blocked_quota(lane_id),
+            "waiting_for_capable_worker" => idx.lane_blocked_route(lane_id),
+            other => {
+                return Err(EngineError::Validation {
+                    kind: ff_core::engine_error::ValidationKind::InvalidBlockingReason,
+                    detail: format!("unblock_execution: {other}"),
+                });
+            }
+        };
+        let eligible_zset = idx.lane_eligible(lane_id);
+
+        let keys: [&str; 3] = [&exec_core, &blocked_zset, &eligible_zset];
+        let now_s = now_ms.to_string();
+        let argv: [&str; 3] = [eid_str, &now_s, expected_blocking_reason];
+
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_unblock_execution", &keys, &argv)
+            .await
+            .map_err(transport_fk)?;
+        Ok(())
+    }
 }
 
 /// Aggregate partition-level lease-history stream key. RFC-019 Stage A

@@ -17,10 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::contracts::ResolveDependencyArgs;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, execution_partition};
-use ff_core::types::{ExecutionId, LaneId};
+use ff_core::types::{AttemptIndex, EdgeId, ExecutionId, FlowId, LaneId, TimestampMs};
 
 use super::{should_skip_candidate, ScanResult, Scanner};
 
@@ -138,7 +139,7 @@ impl Scanner for DependencyReconciler {
                     continue;
                 }
                 match reconcile_one_execution(
-                    client, &tag, &idx, lane, eid_str,
+                    client, self.backend.as_ref(), &p, &tag, &idx, lane, eid_str,
                     &mut upstream_cache, &self.partition_config,
                 ).await {
                     Ok(n) => total_processed += n,
@@ -160,8 +161,11 @@ impl Scanner for DependencyReconciler {
 }
 
 /// Reconcile one blocked execution. Returns count of edges resolved.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_one_execution(
     client: &ferriskey::Client,
+    backend: Option<&Arc<dyn EngineBackend>>,
+    partition: &Partition,
     tag: &str,
     idx: &IndexKeys,
     lane: &LaneId,
@@ -225,39 +229,17 @@ async fn reconcile_one_execution(
             Err(_) => continue,
         };
 
-        // Build KEYS for ff_resolve_dependency
+        // Read current_attempt_index + flow_id (needed for both the
+        // trait-routed and the fallback paths — Valkey's impl reads
+        // these itself from `ResolveDependencyArgs`).
         let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
-        let deps_meta = format!("ff:exec:{}:{}:deps:meta", tag, eid_str);
-        let eligible_key = idx.lane_eligible(lane);
-        let blocked_deps_key = idx.lane_blocked_dependencies(lane);
-        let terminal_key = idx.lane_terminal(lane);
-
-        // For attempt_hash and stream_meta, read current_attempt_index
         let att_idx_str: Option<String> = client
             .cmd("HGET")
             .arg(&exec_core)
             .arg("current_attempt_index")
             .execute()
             .await?;
-        let att_idx = att_idx_str.as_deref().unwrap_or("0");
-        let attempt_hash = format!("ff:attempt:{}:{}:{}", tag, eid_str, att_idx);
-        let stream_meta = format!("ff:stream:{}:{}:{}:meta", tag, eid_str, att_idx);
-
-        // KEYS must match Lua positional order:
-        // [1] exec_core, [2] deps_meta, [3] unresolved_set, [4] dep_hash,
-        // [5] eligible_zset, [6] terminal_zset, [7] blocked_deps_zset,
-        // [8] attempt_hash, [9] stream_meta, [10] downstream_payload,
-        // [11] upstream_result, [12] edgegroup (RFC-016 Stage A)
-        // [10]/[11] added for Batch C item 3. [12] added for RFC-016
-        // Stage A: the per-downstream edgegroup hash lives under the
-        // flow partition, which is the same `{fp:N}` slot via RFC-011
-        // flow-affinity co-location.
-        let downstream_payload = format!("ff:exec:{}:{}:payload", tag, eid_str);
-        let upstream_result = format!("ff:exec:{}:{}:result", tag, upstream_id);
-        // Read the downstream's flow_id so we can construct the
-        // edgegroup key. Absent / empty flow_id (standalones) means
-        // there is no edge group; the key is harmless — Lua's
-        // `is_set`+`EXISTS` guards skip edgegroup writes.
+        let att_idx_n: u32 = att_idx_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
         let flow_id_str: Option<String> = client
             .cmd("HGET")
             .arg(&exec_core)
@@ -265,19 +247,97 @@ async fn reconcile_one_execution(
             .execute()
             .await
             .unwrap_or_default();
+
+        if let Some(backend_arc) = backend {
+            // PR-7b Cluster 2: trait-routed resolve. The Valkey impl
+            // wraps `ff_resolve_dependency` with identical KEYS[14] /
+            // ARGV[5]; Postgres returns `Unavailable` (structural —
+            // PG's dispatch uses `dispatch_completion(event_id)` per
+            // `resolve_dependency` rustdoc).
+            let Ok(downstream_eid) = ExecutionId::parse(eid_str) else {
+                tracing::warn!(execution_id = eid_str, "malformed eid; skipping");
+                continue;
+            };
+            let Ok(upstream_eid) = ExecutionId::parse(&upstream_id) else {
+                tracing::warn!(upstream_id = %upstream_id, "malformed upstream eid; skipping");
+                continue;
+            };
+            let flow_id_parsed = flow_id_str
+                .as_deref()
+                .and_then(|s| if s.is_empty() { None } else { FlowId::parse(s).ok() });
+            // `resolve_dependency` requires a flow_id; standalone
+            // executions have no flow deps so skip — the Lua path's
+            // `_nil_` sentinel only works when the FCALL is issued
+            // anyway with a matching slot key. The trait surface uses
+            // a typed `FlowId` (no sentinel); defer standalones to the
+            // fallback path below.
+            let Some(flow_id) = flow_id_parsed else {
+                // No flow → no dep edges. Shouldn't happen here since
+                // we've just read `deps:unresolved` for this exec, but
+                // be defensive — skip silently rather than fabricate a
+                // nil flow id.
+                continue;
+            };
+            let Ok(edge_id_parsed) = EdgeId::parse(edge_id) else {
+                tracing::warn!(edge_id = edge_id.as_str(), "malformed edge_id; skipping");
+                continue;
+            };
+            let args = ResolveDependencyArgs::new(
+                *partition,
+                flow_id,
+                downstream_eid,
+                upstream_eid,
+                edge_id_parsed,
+                lane.clone(),
+                AttemptIndex::new(att_idx_n),
+                terminal_outcome.clone(),
+                TimestampMs::from_millis(now_ms as i64),
+            );
+            match backend_arc.resolve_dependency(args).await {
+                Ok(outcome) => {
+                    resolved += 1;
+                    tracing::debug!(
+                        execution_id = eid_str,
+                        edge_id = edge_id.as_str(),
+                        upstream_id = upstream_id.as_str(),
+                        resolution = resolution,
+                        ?outcome,
+                        "dependency_reconciler: resolved stale dependency"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = eid_str,
+                        edge_id = edge_id.as_str(),
+                        error = %e,
+                        "dependency_reconciler: resolve_dependency failed"
+                    );
+                }
+            }
+            continue;
+        }
+
+        // ── Test-only fallback (no backend wired) ──
+        // Preserves the pre-trait-routing FCALL path for unit tests that
+        // construct the scanner without a backend. Mirrors cluster-1's
+        // lease_expiry pattern.
+        let deps_meta = format!("ff:exec:{}:{}:deps:meta", tag, eid_str);
+        let eligible_key = idx.lane_eligible(lane);
+        let blocked_deps_key = idx.lane_blocked_dependencies(lane);
+        let terminal_key = idx.lane_terminal(lane);
+
+        let att_idx = att_idx_str.as_deref().unwrap_or("0");
+        let attempt_hash = format!("ff:attempt:{}:{}:{}", tag, eid_str, att_idx);
+        let stream_meta = format!("ff:stream:{}:{}:{}:meta", tag, eid_str, att_idx);
+
+        let downstream_payload = format!("ff:exec:{}:{}:payload", tag, eid_str);
+        let upstream_result = format!("ff:exec:{}:{}:result", tag, upstream_id);
         let edgegroup_key = match flow_id_str.as_deref() {
             Some(fid) if !fid.is_empty() => {
                 format!("ff:flow:{}:{}:edgegroup:{}", tag, fid, eid_str)
             }
-            // Standalone execution — no dep edges possible, but we
-            // still need a cluster-slot-valid KEYS[12]. Use a
-            // well-formed sentinel key on the same {fp:N} tag; Lua's
-            // EXISTS guard skips the write.
             _ => format!("ff:flow:{}:_nil_:edgegroup:_nil_", tag),
         };
-        // RFC-016 Stage C: incoming_set + pending_cancel_groups SET
-        // for the sibling-enumeration + dispatcher-index path. Both
-        // live on the same {fp:N} slot as the edgegroup.
         let incoming_set_key = match flow_id_str.as_deref() {
             Some(fid) if !fid.is_empty() => {
                 format!("ff:flow:{}:{}:in:{}", tag, fid, eid_str)
@@ -288,28 +348,28 @@ async fn reconcile_one_execution(
             format!("ff:idx:{}:pending_cancel_groups", tag);
         let flow_id_owned = flow_id_str.clone().unwrap_or_default();
         let keys: [&str; 14] = [
-            &exec_core,                   // 1
-            &deps_meta,                   // 2
-            &deps_unresolved_key,         // 3
-            &dep_key,                     // 4
-            &eligible_key,                // 5
-            &terminal_key,                // 6
-            &blocked_deps_key,            // 7
-            &attempt_hash,                // 8
-            &stream_meta,                 // 9
-            &downstream_payload,          // 10
-            &upstream_result,             // 11
-            &edgegroup_key,               // 12
-            &incoming_set_key,            // 13 (RFC-016 Stage C)
-            &pending_cancel_groups_key,   // 14 (RFC-016 Stage C)
+            &exec_core,
+            &deps_meta,
+            &deps_unresolved_key,
+            &dep_key,
+            &eligible_key,
+            &terminal_key,
+            &blocked_deps_key,
+            &attempt_hash,
+            &stream_meta,
+            &downstream_payload,
+            &upstream_result,
+            &edgegroup_key,
+            &incoming_set_key,
+            &pending_cancel_groups_key,
         ];
         let now_s = now_ms.to_string();
         let argv: [&str; 5] = [
             edge_id.as_str(),
             resolution,
             &now_s,
-            flow_id_owned.as_str(),       // 4 (RFC-016 Stage C)
-            eid_str,                      // 5 (RFC-016 Stage C)
+            flow_id_owned.as_str(),
+            eid_str,
         ];
 
         match client
@@ -323,7 +383,7 @@ async fn reconcile_one_execution(
                     edge_id = edge_id.as_str(),
                     upstream_id = upstream_id.as_str(),
                     resolution,
-                    "dependency_reconciler: resolved stale dependency"
+                    "dependency_reconciler: resolved stale dependency (fallback)"
                 );
             }
             Err(e) => {
@@ -331,7 +391,7 @@ async fn reconcile_one_execution(
                     execution_id = eid_str,
                     edge_id = edge_id.as_str(),
                     error = %e,
-                    "dependency_reconciler: ff_resolve_dependency failed"
+                    "dependency_reconciler: ff_resolve_dependency failed (fallback)"
                 );
             }
         }
