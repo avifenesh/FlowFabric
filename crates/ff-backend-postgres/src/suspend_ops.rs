@@ -729,7 +729,10 @@ pub(crate) async fn create_waitpoint_impl(
             detail: "expires_in exceeds i64 milliseconds".into(),
         }
     })?;
-    let expires_at = now.saturating_add(expires_ms);
+    let expires_at = now.checked_add(expires_ms).ok_or(EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: "expires_in causes expires_at_ms overflow".into(),
+    })?;
     let msg = format!("{}:{}", payload.execution_id, wp_id);
     let token = hmac_sign(&secret, &kid, msg.as_bytes());
 
