@@ -1376,7 +1376,7 @@ async fn get_execution_tag_impl(
     let ctx = ExecKeyContext::new(&partition, execution_id);
     let raw: Option<String> = client
         .cmd("HGET")
-        .arg(&ctx.tags())
+        .arg(ctx.tags())
         .arg(key)
         .execute()
         .await
@@ -1395,7 +1395,7 @@ async fn get_flow_tag_impl(
     let fctx = FlowKeyContext::new(&partition, flow_id);
     let raw: Option<String> = client
         .cmd("HGET")
-        .arg(&fctx.tags())
+        .arg(fctx.tags())
         .arg(key)
         .execute()
         .await

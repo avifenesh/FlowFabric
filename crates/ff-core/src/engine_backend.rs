@@ -1939,6 +1939,13 @@ pub fn cancel_flow_wait_deadline(wait: CancelFlowWait) -> Option<Duration> {
 /// keyspace. On rejection, returns
 /// [`EngineError::Validation { kind: ValidationKind::InvalidInput, .. }`](crate::engine_error::EngineError::Validation)
 /// with the offending key in `detail`.
+///
+/// `#[allow(clippy::result_large_err)]` — `EngineError` is the uniform
+/// error across the whole `EngineBackend` trait surface (see trait method
+/// signatures above); boxing it here alone would introduce a
+/// gratuitous signature deviation. Clippy 1.95 flags free functions but
+/// not trait methods; this function mirrors the trait-method convention.
+#[allow(clippy::result_large_err)]
 pub fn validate_tag_key(key: &str) -> Result<(), EngineError> {
     use crate::engine_error::ValidationKind;
 
