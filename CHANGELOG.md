@@ -5,6 +5,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-04-28
+
 ### Changed
 
 - **Agnostic-SDK PR-5.5 — `ClaimedTask` + `claim_from_grant` /
