@@ -68,13 +68,25 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
     //
     // This loader-side loop is kept for v0.12 as defense-in-depth:
     // the aggregate ferriskey retry bound is finite, and legitimate
-    // cold-start topology churn can outlive it. It is scheduled to
+    // cold-start topology churn can outlive it.
+    //
+    // Per the v0.12 tag-blocker diagnosis (#423, Verdict B): post-#426
+    // + #427, cluster cells still flaked ~25% of the time on the
+    // `Server::start` → `FUNCTION LOAD` → `READONLY` path, non-
+    // deterministically across tests, architectures, and primitives.
+    // The same fix path works once the cluster is warm; it simply
+    // wasn't given enough time on a cold cluster where gossip
+    // propagation can exceed ~15s. The retry window is extended
+    // here so the loader absorbs that cold-cluster gossip window
+    // without requiring a ferriskey-level change.
+    //
+    // Each retry remains productive (fresh topology refresh between
+    // attempts), so the total window is ~39.5s (500ms + 1s + 2s +
+    // 4s + 7s + 10s + 15s between 8 attempts). It is scheduled to
     // be simplified/removed in v0.13 once the ferriskey fix has
-    // proven sufficient across more CI runs. Each retry is still
-    // productive (fresh topology), so the total window is ~14.5s
-    // (500ms + 1s + 2s + 4s + 7s between 6 attempts).
-    const MAX_ATTEMPTS: u32 = 6;
-    let backoff_ms: [u64; 5] = [500, 1_000, 2_000, 4_000, 7_000];
+    // proven sufficient across more CI runs.
+    const MAX_ATTEMPTS: u32 = 8;
+    let backoff_ms: [u64; 7] = [500, 1_000, 2_000, 4_000, 7_000, 10_000, 15_000];
     let mut last_err = None;
     for attempt in 1..=MAX_ATTEMPTS {
         match client.function_load_replace(LIBRARY_SOURCE).await {
