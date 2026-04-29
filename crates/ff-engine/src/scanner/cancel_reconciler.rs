@@ -21,9 +21,11 @@
 //! scope. This reconciler shrinks the escape window from "forever" to
 //! "one reconciler interval plus grace_ms."
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{
     execution_partition, Partition, PartitionConfig, PartitionFamily,
@@ -39,6 +41,7 @@ pub struct CancelReconciler {
     interval: Duration,
     partition_config: PartitionConfig,
     filter: ScannerFilter,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl CancelReconciler {
@@ -58,6 +61,23 @@ impl CancelReconciler {
             interval,
             partition_config,
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for filter-resolution
+    /// reads. FCALL routing is cluster 3 scope.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            partition_config,
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -299,7 +319,7 @@ impl Scanner for CancelReconciler {
                     &self.partition_config,
                 ).index;
                 if should_skip_candidate(
-                    client,
+                    self.backend.as_ref(),
                     &self.filter,
                     member_part,
                     eid_str,

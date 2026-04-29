@@ -6,11 +6,14 @@
 //!
 //! Reference: RFC-004 §Pending waitpoint expiry scanner, RFC-010 §6.3
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
+use ff_core::types::{ExecutionId, TimestampMs};
 
 use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
@@ -20,6 +23,8 @@ pub struct PendingWaitpointExpiryScanner {
     interval: Duration,
     failures: FailureTracker,
     filter: ScannerFilter,
+    /// PR-7b Cluster 1: trait-dispatch target.
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl PendingWaitpointExpiryScanner {
@@ -36,6 +41,21 @@ impl PendingWaitpointExpiryScanner {
             interval,
             failures: FailureTracker::new(),
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for trait-routed FCALLs.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            failures: FailureTracker::new(),
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -129,12 +149,38 @@ impl Scanner for PendingWaitpointExpiryScanner {
                     }
                 };
                 let Some(eid) = eid else { continue };
-                if should_skip_candidate(client, &self.filter, partition, &eid).await {
+                if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, &eid).await {
                     continue;
                 }
             }
 
-            match close_expired_waitpoint(client, &tag, &idx, wp_id_str).await {
+            let res = if let Some(ref backend) = self.backend {
+                // Resolve owning execution_id from the waitpoint hash
+                // — the trait takes both (exec_id, wp_id) so the
+                // Valkey impl doesn't re-read it. If the hash is
+                // missing/resolve fails we still attempt the call
+                // with an empty exec_id (the Lua cleanup path no-ops
+                // on missing exec_core).
+                let eid_str: String = client
+                    .cmd("HGET")
+                    .arg(format!("ff:wp:{}:{}", tag, wp_id_str).as_str())
+                    .arg("execution_id")
+                    .execute::<Option<String>>()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let Ok(eid) = ExecutionId::parse(&eid_str) else { tracing::warn!(execution_id=%eid_str, "malformed eid; skipping"); continue; };
+                backend
+                    .close_waitpoint(p, &eid, wp_id_str, TimestampMs(now_ms as i64))
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                close_expired_waitpoint(client, &tag, &idx, wp_id_str)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            match res {
                 Ok(()) => {
                     self.failures.record_success(wp_id_str);
                     processed += 1;
@@ -144,7 +190,7 @@ impl Scanner for PendingWaitpointExpiryScanner {
                         partition,
                         waitpoint_id = wp_id_str.as_str(),
                         error = %e,
-                        "pending_wp_expiry: ff_close_waitpoint failed"
+                        "pending_wp_expiry: close_waitpoint failed"
                     );
                     self.failures.record_failure(wp_id_str, "pending_wp_expiry");
                     errors += 1;

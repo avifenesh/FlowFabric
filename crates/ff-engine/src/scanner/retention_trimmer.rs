@@ -11,9 +11,11 @@
 //!
 //! Reference: RFC-010 §6.12
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
@@ -31,6 +33,7 @@ pub struct RetentionTrimmer {
     /// Default retention period in ms (used when execution has no policy).
     default_retention_ms: u64,
     filter: ScannerFilter,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl RetentionTrimmer {
@@ -46,6 +49,24 @@ impl RetentionTrimmer {
             lanes,
             default_retention_ms: DEFAULT_RETENTION_MS,
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for filter-resolution
+    /// reads via `should_skip_candidate`.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        lanes: Vec<LaneId>,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            lanes,
+            default_retention_ms: DEFAULT_RETENTION_MS,
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -120,7 +141,7 @@ impl Scanner for RetentionTrimmer {
             }
 
             for eid_str in &expired {
-                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+                if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, eid_str).await {
                     continue;
                 }
                 match purge_execution(

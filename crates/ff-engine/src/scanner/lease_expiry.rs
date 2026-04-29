@@ -7,11 +7,14 @@
 //!
 //! Reference: RFC-003 §Reclaim scan pattern, RFC-010 §6.1
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
+use ff_core::types::ExecutionId;
 
 use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
@@ -32,6 +35,15 @@ pub struct LeaseExpiryScanner {
     interval: Duration,
     failures: FailureTracker,
     filter: ScannerFilter,
+    /// PR-7b Cluster 1 plumbing — the trait-dispatch target for the
+    /// per-candidate FCALL equivalent. `Engine::start_internal`
+    /// constructs via [`Self::with_filter_and_backend`]; external
+    /// callers (tests) that don't need filter enforcement can still
+    /// use [`Self::new`] / [`Self::with_filter`], which leave the
+    /// backend at `None`. When `None` + a non-noop filter is set,
+    /// [`should_skip_candidate`] returns conservative-skip (same
+    /// posture as a transport error).
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl LeaseExpiryScanner {
@@ -46,6 +58,23 @@ impl LeaseExpiryScanner {
             interval,
             failures: FailureTracker::new(),
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: like [`Self::with_filter`] but wires the
+    /// `EngineBackend` through for trait-routed FCALLs +
+    /// filter-resolution reads.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            failures: FailureTracker::new(),
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -121,27 +150,50 @@ impl Scanner for LeaseExpiryScanner {
             if self.failures.should_skip(eid_str) {
                 continue;
             }
-            if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+            if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, eid_str)
+                .await
+            {
                 continue;
             }
 
-            let exec_core = format!("ff:exec:{}:{}:core", p.hash_tag(), eid_str);
-            let lease_current = format!("ff:exec:{}:{}:lease:current", p.hash_tag(), eid_str);
-            let lease_history = format!("ff:exec:{}:{}:lease:history", p.hash_tag(), eid_str);
-
-            let keys: [&str; 4] = [
-                &exec_core,
-                &lease_current,
-                &lease_expiry_key,
-                &lease_history,
-            ];
-
-            match client.fcall::<ferriskey::Value>(
-                "ff_mark_lease_expired_if_due",
-                &keys,
-                &[eid_str.as_str()],
-            ).await {
-                Ok(_) => {
+            let res = if let Some(ref backend) = self.backend {
+                // PR-7b Cluster 1: trait-routed FCALL. The Valkey
+                // impl wraps `ff_mark_lease_expired_if_due` with
+                // identical KEYS + ARGV; Postgres runs a single-row
+                // tx via `reconcilers::lease_expiry::release_for_execution`.
+                let Ok(eid) = ExecutionId::parse(eid_str) else { tracing::warn!(execution_id=%eid_str, "malformed eid; skipping"); continue; };
+                backend
+                    .mark_lease_expired_if_due(p, &eid)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                // Test-only fallback: direct FCALL on the supplied
+                // client. Preserves the pre-trait-routing path for
+                // unit tests that construct the scanner without a
+                // backend.
+                let exec_core = format!("ff:exec:{}:{}:core", p.hash_tag(), eid_str);
+                let lease_current =
+                    format!("ff:exec:{}:{}:lease:current", p.hash_tag(), eid_str);
+                let lease_history =
+                    format!("ff:exec:{}:{}:lease:history", p.hash_tag(), eid_str);
+                let keys: [&str; 4] = [
+                    &exec_core,
+                    &lease_current,
+                    &lease_expiry_key,
+                    &lease_history,
+                ];
+                client
+                    .fcall::<ferriskey::Value>(
+                        "ff_mark_lease_expired_if_due",
+                        &keys,
+                        &[eid_str.as_str()],
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            };
+            match res {
+                Ok(()) => {
                     self.failures.record_success(eid_str);
                     processed += 1;
                 }
@@ -150,7 +202,7 @@ impl Scanner for LeaseExpiryScanner {
                         partition,
                         execution_id = eid_str.as_str(),
                         error = %e,
-                        "lease_expiry: ff_mark_lease_expired_if_due failed"
+                        "lease_expiry: mark_lease_expired_if_due failed"
                     );
                     self.failures.record_failure(eid_str, "lease_expiry");
                     errors += 1;

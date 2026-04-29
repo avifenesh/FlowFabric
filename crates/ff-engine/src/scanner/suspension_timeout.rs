@@ -7,11 +7,14 @@
 //!
 //! Reference: RFC-004 §Timeout scanner, RFC-010 §6.2
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
+use ff_core::types::{ExecutionId, TimestampMs};
 
 use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
@@ -32,6 +35,7 @@ pub struct SuspensionTimeoutScanner {
     interval: Duration,
     failures: FailureTracker,
     filter: ScannerFilter,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl SuspensionTimeoutScanner {
@@ -46,6 +50,21 @@ impl SuspensionTimeoutScanner {
             interval,
             failures: FailureTracker::new(),
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for trait-routed FCALLs.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            failures: FailureTracker::new(),
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -118,11 +137,22 @@ impl Scanner for SuspensionTimeoutScanner {
             if self.failures.should_skip(eid_str) {
                 continue;
             }
-            if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+            if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, eid_str).await {
                 continue;
             }
 
-            match expire_suspension(client, &tag, &idx, eid_str).await {
+            let res = if let Some(ref backend) = self.backend {
+                let Ok(eid) = ExecutionId::parse(eid_str) else { tracing::warn!(execution_id=%eid_str, "malformed eid; skipping"); continue; };
+                backend
+                    .expire_suspension(p, &eid, TimestampMs(now_ms as i64))
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                expire_suspension(client, &tag, &idx, eid_str)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            match res {
                 Ok(()) => {
                     self.failures.record_success(eid_str);
                     processed += 1;
@@ -132,7 +162,7 @@ impl Scanner for SuspensionTimeoutScanner {
                         partition,
                         execution_id = eid_str.as_str(),
                         error = %e,
-                        "suspension_timeout: ff_expire_suspension failed"
+                        "suspension_timeout: expire_suspension failed"
                     );
                     self.failures.record_failure(eid_str, "suspension_timeout");
                     errors += 1;

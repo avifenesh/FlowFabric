@@ -68,11 +68,11 @@ use ff_core::contracts::{
 };
 #[cfg(feature = "streaming")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
-use ff_core::engine_backend::EngineBackend;
+use ff_core::engine_backend::{EngineBackend, ExpirePhase};
 use ff_core::engine_error::EngineError;
 #[cfg(feature = "core")]
 use ff_core::partition::PartitionKey;
-use ff_core::partition::PartitionConfig;
+use ff_core::partition::{Partition, PartitionConfig};
 #[cfg(feature = "streaming")]
 use ff_core::types::AttemptIndex;
 #[cfg(feature = "core")]
@@ -1363,6 +1363,80 @@ impl EngineBackend for PostgresBackend {
         filter: &ff_core::backend::ScannerFilter,
     ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
         signal_delivery_subscribe::subscribe(&self.pool, 0, cursor, filter.clone()).await
+    }
+
+    // ── PR-7b Cluster 1 — Foundation scanner operations ─────────
+    //
+    // Per-execution wrappers around the existing batch reconcilers in
+    // `crate::reconcilers::*`. The reconcilers' per-row tx logic
+    // (`release_one`, `expire_one`, `expire_one` for suspension) is
+    // exposed through a `_for_execution` helper per module and invoked
+    // here. This lets the engine-side scanner trait-dispatch hit the
+    // same SQL the batch path uses, without duplicating either.
+    //
+    // `promote_delayed`, `close_waitpoint`, and `expire_execution` on
+    // the `ExecutionDeadline` phase are intentionally left at their
+    // trait defaults (`EngineError::Unavailable`) — the PG schema for
+    // delay/waitpoint-expiry reconciliation is RFC-020 Wave 9 scope
+    // (see coordination note in `/tmp/pr-7b-coordination.md`).
+
+    async fn mark_lease_expired_if_due(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        reconcilers::lease_expiry::release_for_execution(&self.pool, partition_key, exec_uuid)
+            .await
+    }
+
+    async fn expire_execution(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+        phase: ExpirePhase,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        match phase {
+            ExpirePhase::AttemptTimeout => {
+                reconcilers::attempt_timeout::expire_for_execution(
+                    &self.pool,
+                    partition_key,
+                    exec_uuid,
+                )
+                .await
+            }
+            ExpirePhase::ExecutionDeadline => {
+                // RFC-020 Wave 9 scope: `ff_exec_core.deadline_at_ms`
+                // wall-clock execution deadline reconciler shares the
+                // attempt-timeout terminal flip but needs a distinct
+                // candidate-selection query (`deadline_at_ms` not
+                // `lease_expires_at_ms`). Left at Unavailable pending
+                // Wave 9 owner call on whether to collapse the two.
+                Err(EngineError::Unavailable {
+                    op: "expire_execution:execution_deadline",
+                })
+            }
+        }
+    }
+
+    async fn expire_suspension(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let (pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = i16::try_from(partition.index).unwrap_or(pk_from_eid);
+        reconcilers::suspension_timeout::expire_for_execution(
+            &self.pool,
+            partition_key,
+            exec_uuid,
+        )
+        .await
     }
 }
 

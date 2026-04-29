@@ -88,6 +88,49 @@ pub async fn scan_tick(
     Ok(report)
 }
 
+/// Per-execution suspension-expire action. Exposed so the
+/// `EngineBackend::expire_suspension` trait dispatch (PR-7b
+/// Cluster 1) can invoke the same per-row tx logic as `scan_tick`.
+/// Discovers the timeout behavior internally. Silently no-ops when
+/// the suspension has already been resolved (`timeout_at_ms IS NULL`
+/// re-checked under `FOR UPDATE`).
+pub async fn expire_for_execution(
+    pool: &PgPool,
+    partition_key: i16,
+    exec_uuid: uuid::Uuid,
+) -> Result<(), EngineError> {
+    let now_ms: i64 = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+
+    let row = sqlx::query(
+        r#"
+        SELECT timeout_behavior
+          FROM ff_suspension_current
+         WHERE partition_key = $1
+           AND execution_id = $2
+           AND timeout_at_ms IS NOT NULL
+           AND timeout_at_ms < $3
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .bind(now_ms)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    let Some(row) = row else { return Ok(()) };
+    let behavior: Option<String> = row
+        .try_get::<Option<String>, _>("timeout_behavior")
+        .map_err(map_sqlx_error)?;
+    let b = behavior.as_deref().unwrap_or("fail");
+    expire_one(pool, partition_key, exec_uuid, b, now_ms).await
+}
+
 async fn expire_one(
     pool: &PgPool,
     partition_key: i16,
