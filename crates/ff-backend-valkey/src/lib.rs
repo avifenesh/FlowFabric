@@ -1384,6 +1384,26 @@ async fn get_execution_tag_impl(
     Ok(raw)
 }
 
+/// `HGET :core namespace` on the execution's partition. `Ok(None)`
+/// for absent field or absent hash (see `get_execution_tag_impl`
+/// rationale).
+async fn get_execution_namespace_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+) -> Result<Option<String>, EngineError> {
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("namespace")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    Ok(raw)
+}
+
 /// `HGET :tags <key>` on the flow's partition.
 async fn get_flow_tag_impl(
     client: &ferriskey::Client,
@@ -5397,6 +5417,20 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "get_flow_tag: HGET :tags")
+            })
+    }
+
+    async fn get_execution_namespace(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<String>, EngineError> {
+        get_execution_namespace_impl(&self.client, &self.partition_config, execution_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "get_execution_namespace: HGET :core namespace",
+                )
             })
     }
 

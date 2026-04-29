@@ -683,6 +683,33 @@ pub trait EngineBackend: Send + Sync + 'static {
         })
     }
 
+    /// Read an execution's `namespace` scalar. Returns `Ok(None)` when
+    /// the row is absent or the field is unset. Dedicated point-read
+    /// used by the scanner per-candidate filter (`should_skip_candidate`)
+    /// to preserve the 1-HGET cost contract documented in
+    /// `ff_engine::scanner::should_skip_candidate` — `describe_execution`
+    /// is heavier (HGETALL / full snapshot) and unnecessary when only
+    /// the namespace scalar is needed.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET :core namespace` on the execution's partition
+    ///   (single field read on the already-hot exec_core hash).
+    /// * **Postgres** — `SELECT raw_fields->>'namespace' FROM ff_exec_core
+    ///   WHERE partition_key = $1 AND execution_id = $2`.
+    /// * **SQLite** — `SELECT json_extract(raw_fields, '$.namespace')
+    ///   FROM ff_exec_core WHERE ...`.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn get_execution_namespace(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_execution_namespace",
+        })
+    }
+
     /// Read a single namespaced flow tag. Returns `Ok(None)` when
     /// the tag is absent **or** the flow row does not exist (same
     /// collapse semantics as [`Self::get_execution_tag`]). Symmetry

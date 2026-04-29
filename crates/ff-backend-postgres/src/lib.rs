@@ -680,6 +680,14 @@ impl EngineBackend for PostgresBackend {
         flow::get_flow_tag_impl(&self.pool, &self.partition_config, flow_id, key).await
     }
 
+    #[tracing::instrument(name = "pg.get_execution_namespace", skip_all)]
+    async fn get_execution_namespace(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<String>, EngineError> {
+        exec_core::get_execution_namespace_impl(&self.pool, execution_id).await
+    }
+
     #[cfg(feature = "core")]
     #[tracing::instrument(name = "pg.list_edges", skip_all)]
     async fn list_edges(

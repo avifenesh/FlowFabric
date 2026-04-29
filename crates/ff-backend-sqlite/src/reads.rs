@@ -643,6 +643,33 @@ pub(crate) async fn get_execution_tag_impl(
     Ok(tag)
 }
 
+pub(crate) async fn get_execution_namespace_impl(
+    pool: &SqlitePool,
+    id: &ExecutionId,
+) -> Result<Option<String>, EngineError> {
+    let (part, exec_uuid) = split_exec_id(id)?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT json_extract(raw_fields, '$.namespace') AS ns_value
+          FROM ff_exec_core
+         WHERE partition_key = ?1 AND execution_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // Missing-row collapses to Ok(None) — see get_execution_tag_impl.
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let ns: Option<String> = row.try_get("ns_value").map_err(map_sqlx_error)?;
+    Ok(ns)
+}
+
 pub(crate) async fn get_flow_tag_impl(
     pool: &SqlitePool,
     flow_id: &ff_core::types::FlowId,

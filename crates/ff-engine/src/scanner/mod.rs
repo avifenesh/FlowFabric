@@ -244,12 +244,12 @@ pub async fn should_skip_candidate(
     };
 
     if let Some(ref want_ns) = filter.namespace {
-        match backend.describe_execution(&exec_id).await {
-            // describe_execution is heavier than a single HGET (reads
-            // the full ExecutionSnapshot) but the cost is acceptable
-            // at scanner cadence — a few-hundred candidates/cycle,
-            // short-circuits on first miss.
-            Ok(Some(snap)) if &snap.namespace == want_ns => {}
+        // Dedicated point-read — preserves the 1-HGET cost contract
+        // documented above. `describe_execution` would be an N-field
+        // HGETALL / full-snapshot read and is the wrong tool when only
+        // the namespace scalar is needed.
+        match backend.get_execution_namespace(&exec_id).await {
+            Ok(Some(ref got)) if got == want_ns.as_str() => {}
             _ => return true,
         }
     }
@@ -391,3 +391,4 @@ impl ScannerRunner {
         })
     }
 }
+
