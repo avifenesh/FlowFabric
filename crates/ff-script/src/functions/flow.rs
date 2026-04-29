@@ -58,6 +58,14 @@ pub struct ResolveDependencyKeys<'a> {
     pub flow_ctx: &'a FlowKeyContext,
     pub flow_idx: &'a FlowIndexKeys,
     pub downstream_eid: &'a ff_core::types::ExecutionId,
+    /// Child's current attempt index — needed to build the correct
+    /// `attempt_hash` + `stream_meta` KEYS. PR-7b Step 0 lift: prior
+    /// to the trait migration the wrapper hardcoded
+    /// `AttemptIndex::new(0)` as a placeholder because the only caller
+    /// was a scanner path that had other guards; the trait entry-
+    /// point is hot-path (post-completion cascade) so it must pin
+    /// the right attempt.
+    pub current_attempt_index: ff_core::types::AttemptIndex,
 }
 
 // ─── ff_create_flow ──────────────────────────────────────────────────
@@ -308,8 +316,8 @@ ff_function! {
             k.idx.lane_eligible(k.lane_id),
             k.idx.lane_terminal(k.lane_id),
             k.idx.lane_blocked_dependencies(k.lane_id),
-            k.ctx.attempt_hash(ff_core::types::AttemptIndex::new(0)), // placeholder
-            k.ctx.stream_meta(ff_core::types::AttemptIndex::new(0)),  // placeholder
+            k.ctx.attempt_hash(k.current_attempt_index),
+            k.ctx.stream_meta(k.current_attempt_index),
             k.ctx.payload(),
             k.upstream_ctx.result(),
             k.flow_ctx.edgegroup(k.downstream_eid),
