@@ -24,15 +24,42 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   at the `EngineError::Unavailable` default — RFC-020 Wave 9 schema
   scope); SQLite stays on the trait defaults (per RFC-023 §4.1 the
   SQLite backend hosts its own reconciler supervisor, not the
-  engine's scanner loop). `scanner::should_skip_candidate` now
-  dispatches through `EngineBackend::describe_execution` /
-  `get_execution_tag`. Engine-side: each of the 11 scanners that use
-  `should_skip_candidate` grew a `backend:
-  Option<Arc<dyn EngineBackend>>` field plus a
+  engine's scanner loop). `scanner::should_skip_candidate` dispatches
+  the namespace check through a new
+  `EngineBackend::get_execution_namespace` single-field point-read
+  trait method (preserves the 1-HGET cost contract), and the tag
+  check through `EngineBackend::get_execution_tag`. Engine-side:
+  each of the 11 scanners that use `should_skip_candidate` grew a
+  `backend: Option<Arc<dyn EngineBackend>>` field plus a
   `with_filter_and_backend(..)` constructor; the 6 Cluster-1 scanner
   bodies route their operation FCALL through the trait when a
   backend is wired. Unblocks PR-7b Clusters 2 + 3 (reconcilers +
   cancel-family) to land in parallel.
+- **`EngineBackend` service-layer typed FCALL surface (cairn #389).**
+  Six new trait methods let control-plane consumers (cairn et al.)
+  dispatch against `(execution_id, fence)` tuples instead of requiring
+  a worker `Handle`, eliminating the raw `ferriskey::Value` +
+  `check_fcall_success` + `parse_*` pattern cairn had on 15+ sites in
+  `valkey_control_plane_impl.rs`:
+  `complete_execution`, `fail_execution`, `renew_lease`,
+  `resume_execution`, `check_admission`, `evaluate_flow_eligibility`.
+  Args/Result types already existed in `ff_core::contracts`; the gap
+  was the trait-method surface that lets cairn drop its direct
+  `ferriskey` dep and unblock the Postgres-backend migration. Each
+  method defaults to `EngineError::Unavailable` so out-of-tree
+  backends keep compiling; Valkey overrides all six with thin
+  delegates to the existing `ff_script::functions::*` wrappers.
+  `check_admission` takes `quota_policy_id: &QuotaPolicyId` and
+  `dimension: &str` as trait-method arguments alongside
+  `CheckAdmissionArgs` — quota keys live on the `{q:<policy>}`
+  partition that cannot be derived from `execution_id`, and
+  widening the `CheckAdmissionArgs` struct would have been a semver
+  break for existing struct-literal callers. Empty `dimension` falls
+  back to `"default"` to match cairn's pre-migration default.
+  Postgres + SQLite keep the
+  `Unavailable` default pending follow-up parity work (tracked in
+  `POSTGRES_PARITY_MATRIX.md`); same staging precedent as
+  `issue_reclaim_grant` / `reclaim_execution`.
 - **Backend-agnostic `FlowFabricAdminClient` facade (SC-10 ergonomics
   follow-up, v0.13).** `FlowFabricAdminClient` now supports both HTTP
   (`new` / `with_token` — existing) and embedded

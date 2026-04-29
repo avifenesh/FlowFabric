@@ -111,6 +111,7 @@ both when the `streaming` feature is enabled, `n/a` otherwise.
 | 3 | `add_execution_to_flow` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 4 | `stage_dependency_edge` | `impl` | `impl` | Promoted from PG inherent to trait. |
 | 5 | `apply_dependency_to_child` | `impl` | `impl` | Promoted from PG inherent to trait. |
+| 5b | `resolve_dependency` | `impl` | `stub` | **PR-7b Step 0 overlap-resolver.** Valkey wraps `ff_resolve_dependency` FCALL (RFC-016 Stage C KEYS[14]+ARGV[5]). Postgres returns `Unavailable { op: "resolve_dependency" }`; PG's post-completion cascade runs via `ff_backend_postgres::dispatch::dispatch_completion(event_id)` keyed on the `ff_completion_event` outbox, not per-edge — the per-edge Valkey shape does not map cleanly. PG reconciler already calls `dispatch_completion` directly; PR-7b/final's integration test expects `Unsupported` from Valkey-shaped scanners on PG. SQLite mirrors PG. |
 | 6 | `cancel_execution` | `impl` | `impl` | **Landed Stage C (Valkey) + Wave 9 v0.11 (Postgres, RFC-020).** Postgres wraps the §4.2 SERIALIZABLE-fn template + `ff_lease_event` emit. Valkey body does HMGET pre-read (lane_id + current_attempt_index + current_waitpoint_id + current_worker_instance_id) then raw FCALL with variadic KEYS(21)/ARGV(5) matching `lua/execution.lua::ff_cancel_execution`. |
 | 7 | `change_priority` | `impl` | `impl` | **Landed Stage C (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.2.4).** Postgres UPDATE on `ff_exec_core` + `ff_operator_event` outbox emit (migration 0010); row-count=0 maps to `EngineError::ExecutionNotEligible` per Rev 7 Fork 3. Valkey reads authoritative lane via HGET when caller passes empty `lane_id`, then wraps `ff_change_priority`. |
 | 8 | `replay_execution` | `impl` | `impl` | **Landed Stage C (Valkey) + Wave 9 v0.11 (Postgres, RFC-020 §4.2.5 Rev 7).** Postgres in-place UPDATE on existing `ff_attempt` (no `attempt_index` bump, matches Valkey) + `ff_edge_group` counter reset for skipped-flow-member path (Rev 7 Fork 1 Option A) + `ff_operator_event` emit. |
@@ -500,3 +501,39 @@ All five foundation-scanner ops land real SQL on Postgres as of
 PR-7b Cluster 1 + Wave-9-minimal (this row). Consumer deployments
 switching from Valkey to Postgres no longer see `Unavailable` for
 scanner-op writes.
+
+`get_execution_namespace` — dedicated single-field point-read used
+by `scanner::should_skip_candidate` to preserve the 1-HGET cost
+contract — lands as `impl` on all three backends (Valkey:
+`HGET :core namespace`; Postgres: `SELECT raw_fields->>'namespace'
+FROM ff_exec_core WHERE ...`; SQLite: `SELECT json_extract(raw_fields,
+'$.namespace') FROM ff_exec_core WHERE ...`).
+
+### cairn #389 — service-layer typed FCALL surface (v0.13)
+
+Six `EngineBackend` methods that mirror existing Handle-taking peers
+(`complete` / `fail` / `renew`) but accept `(execution_id, fence)`
+tuples — lets control-plane callers (cairn's
+`valkey_control_plane_impl.rs`, future non-Handle consumers) drop
+the raw `ferriskey::Value` + `check_fcall_success` + `parse_*`
+pattern. Args/Result types already existed in `ff_core::contracts`;
+this landing adds the trait-method surface.
+
+Valkey ships bodies at landing; PG + SQLite inherit
+`EngineError::Unavailable` until follow-up parity work — same
+staging as RFC-024 reclaim primitives + `claim_execution` above.
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `complete_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `complete(handle)`. Valkey pre-reads `lane_id` + `current_worker_instance_id` from `exec_core` then delegates to `ff_complete_execution`. |
+| `fail_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `fail(handle, …)`. Same `exec_core` pre-read pattern; delegates to `ff_fail_execution`. |
+| `renew_lease` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `renew(handle)`. No pre-read needed — `ExecKeyContext` suffices. Delegates to `ff_renew_lease`. |
+| `resume_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Lifecycle transition from suspended to runnable. Valkey pre-reads `lane_id` + `current_waitpoint_id` from `exec_core` then delegates to `ff_resume_execution`. |
+| `check_admission` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Atomic admission check against a quota policy. Takes `quota_policy_id: &QuotaPolicyId` and `dimension: &str` outside the `CheckAdmissionArgs` struct — quota keys live on the `{q:<policy>}` partition that cannot be derived from `execution_id`, and widening the existing pub-fields struct would semver-break. Empty `dimension` → `"default"`. Delegates to `ff_check_admission_and_record`. |
+| `evaluate_flow_eligibility` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Read-only eligibility status (`eligible`, `blocked_by_dependencies`, …). Delegates to `ff_evaluate_flow_eligibility`. |
+
+PG + SQLite parity for this surface is the v0.13 follow-up scope.
+Until the bodies land, consumers compiling against those backends
+receive `EngineError::Unavailable { op: "<name>" }` on dispatch — a
+terminal, non-retryable classification the `ErrorClass` mapping
+already handles.
