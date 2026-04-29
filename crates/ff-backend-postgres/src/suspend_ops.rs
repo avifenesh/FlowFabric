@@ -719,8 +719,17 @@ pub(crate) async fn create_waitpoint_impl(
     let wp_id = WaitpointId::new();
     let wp_u = wp_uuid(&wp_id)?;
     let now = now_ms();
-    let expires_at =
-        now.saturating_add(i64::try_from(expires_in.as_millis()).unwrap_or(i64::MAX));
+    // Caller-supplied `expires_in` that doesn't fit in i64 ms is a
+    // nonsense value (>292M years). Reject as validation rather than
+    // silently clamping — `bigint expires_at_ms` can't represent it
+    // and saturating would mask the bad input.
+    let expires_ms = i64::try_from(expires_in.as_millis()).map_err(|_| {
+        EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "expires_in exceeds i64 milliseconds".into(),
+        }
+    })?;
+    let expires_at = now.saturating_add(expires_ms);
     let msg = format!("{}:{}", payload.execution_id, wp_id);
     let token = hmac_sign(&secret, &kid, msg.as_bytes());
 

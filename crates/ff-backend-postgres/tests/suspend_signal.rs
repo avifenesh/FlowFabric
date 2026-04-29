@@ -1141,13 +1141,14 @@ async fn create_waitpoint_mints_token_and_row() {
         .await
         .expect("create_waitpoint ok");
 
-    // Token shape: `<kid>:<hex>` (same format suspend produces).
+    // Token shape: `<kid>:<hex>` (same format suspend produces). Don't
+    // print the full token on failure — it's a live HMAC credential.
     let tok = pending.hmac_token.as_str();
-    assert!(
-        tok.starts_with("kid-suspend-1:"),
-        "token should embed active kid, got {tok}"
-    );
-    assert!(tok.len() > "kid-suspend-1:".len(), "token body missing");
+    let (kid, body) = tok
+        .split_once(':')
+        .expect("token has `<kid>:<body>` shape");
+    assert_eq!(kid, "kid-suspend-1", "token should embed active kid");
+    assert!(!body.is_empty(), "token body missing (len={})", body.len());
 
     // Row landed with state='pending' and the expected (exec, key).
     let wp_u = Uuid::parse_str(&pending.waitpoint_id.to_string()).unwrap();
