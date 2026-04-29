@@ -2273,14 +2273,94 @@ pub enum ApplyDependencyToChildResult {
 
 // ─── resolve_dependency ───
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Inputs to [`crate::engine_backend::EngineBackend::resolve_dependency`]
+/// — the trait-level entry point PR-7b Step 0 lifted out of the two
+/// inline FCALL call sites (`ff-engine::partition_router::
+/// dispatch_dependency_resolution` and
+/// `ff-engine::scanner::dependency_reconciler::resolve_eligible_edges`).
+///
+/// Both Valkey call sites build identical KEYS[14]+ARGV[5] arrays.
+/// The fields below are the minimum they need to survive a trait-
+/// boundary hand-off: `partition` drives the Valkey key-tagging,
+/// `downstream_execution_id` + `lane_id` + `current_attempt_index`
+/// pin the child's KEYS, `upstream_execution_id` derives KEYS[11]
+/// (`upstream_result` for server-side `data_passing_ref` copy),
+/// `flow_id` supplies the RFC-016 Stage C ARGV[4] + edgegroup/incoming
+/// KEYS.
+///
+/// `#[non_exhaustive]` + `::new` per
+/// `feedback_non_exhaustive_needs_constructor`. Does NOT derive
+/// `Serialize` / `Deserialize` — this is a trait-boundary args
+/// struct, not a wire-format type.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ResolveDependencyArgs {
+    /// Child (downstream) execution's partition. Flow + exec partitions
+    /// co-locate on `{fp:N}` post-RFC-011 so the FCALL stays single-slot.
+    pub partition: crate::partition::Partition,
+    pub flow_id: crate::types::FlowId,
+    pub downstream_execution_id: ExecutionId,
+    pub upstream_execution_id: ExecutionId,
     pub edge_id: crate::types::EdgeId,
+    pub lane_id: LaneId,
+    /// Child's current attempt index — selects `attempt_hash` +
+    /// `stream_meta` KEYS so late satisfaction updates the active
+    /// attempt (race-safe under renewal).
+    pub current_attempt_index: AttemptIndex,
     /// "success", "failed", "cancelled", "expired", "skipped"
     pub upstream_outcome: String,
     pub now: TimestampMs,
 }
 
+impl ResolveDependencyArgs {
+    /// Construct a `ResolveDependencyArgs`. Added alongside
+    /// `#[non_exhaustive]` per
+    /// `feedback_non_exhaustive_needs_constructor`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        partition: crate::partition::Partition,
+        flow_id: crate::types::FlowId,
+        downstream_execution_id: ExecutionId,
+        upstream_execution_id: ExecutionId,
+        edge_id: crate::types::EdgeId,
+        lane_id: LaneId,
+        current_attempt_index: AttemptIndex,
+        upstream_outcome: String,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            partition,
+            flow_id,
+            downstream_execution_id,
+            upstream_execution_id,
+            edge_id,
+            lane_id,
+            current_attempt_index,
+            upstream_outcome,
+            now,
+        }
+    }
+}
+
+/// Typed outcome of
+/// [`crate::engine_backend::EngineBackend::resolve_dependency`].
+///
+/// `#[non_exhaustive]` so additional variants (e.g. `ChildSkipped`
+/// cascade hints) can be added in minor releases without forcing
+/// match-arm churn on consumers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResolveDependencyOutcome {
+    /// Edge satisfied — downstream may become eligible.
+    Satisfied,
+    /// Edge made impossible — downstream becomes skipped.
+    Impossible,
+    /// Already resolved (idempotent).
+    AlreadyResolved,
+}
+
+/// Legacy name retained for `ff-script`'s `FromFcallResult` plumbing.
+/// Prefer [`ResolveDependencyOutcome`] in trait-level code.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolveDependencyResult {
     /// Edge satisfied — downstream may become eligible.
@@ -2289,6 +2369,16 @@ pub enum ResolveDependencyResult {
     Impossible,
     /// Already resolved (idempotent).
     AlreadyResolved,
+}
+
+impl From<ResolveDependencyResult> for ResolveDependencyOutcome {
+    fn from(r: ResolveDependencyResult) -> Self {
+        match r {
+            ResolveDependencyResult::Satisfied => ResolveDependencyOutcome::Satisfied,
+            ResolveDependencyResult::Impossible => ResolveDependencyOutcome::Impossible,
+            ResolveDependencyResult::AlreadyResolved => ResolveDependencyOutcome::AlreadyResolved,
+        }
+    }
 }
 
 // ─── promote_blocked_to_eligible ───
