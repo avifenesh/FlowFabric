@@ -4865,6 +4865,15 @@ mod retry_state_machine_tests {
         Error::from((kind, "simulated"))
     }
 
+    /// Build a MOVED/ASK error with a parseable detail so
+    /// `Error::redirect_node()` returns `Some((addr, slot))`. Without this,
+    /// a bare `err(ErrorKind::Moved)` would still classify as
+    /// `MovedRedirect` but `redirect_node()` yields `None`, masking
+    /// regressions in redirect-metadata plumbing.
+    fn redirect_err(kind: ErrorKind, slot: u16, addr: &str) -> Error {
+        Error::from((kind, "redirect", format!("{slot} {addr}")))
+    }
+
     fn single_node_cmd_arg() -> CmdArg<Conn> {
         CmdArg::Cmd {
             packed: cmd("PING").get_packed_command(),
@@ -4874,10 +4883,14 @@ mod retry_state_machine_tests {
     }
 
     fn multi_cmd_arg() -> CmdArg<Conn> {
-        // Routing payload mirrors the shape produced by
-        // `execute_on_multiple_nodes`: a SingleNode pin that, after
-        // `reset_routing`, collapses to `ByAddress(..)` — exactly the
-        // pinned-to-replica shape that motivated the #427 short-circuit.
+        // Uses `ByAddress(..)` directly, which is the shape
+        // `execute_on_multiple_nodes` collapses to after
+        // `reset_routing` — i.e. the already-post-reset, pinned-to-replica
+        // shape that motivated the #427 short-circuit. Constructing the
+        // pre-reset `Connection { address, conn }` variant here would
+        // require stubbing a live `ConnectionFuture<C>`, which is not
+        // needed for this test surface (the state machine doesn't touch
+        // the `conn` handle in the MultiCmd-READONLY short-circuit arm).
         CmdArg::MultiCmd {
             cmd: Arc::new(cmd("PING").clone()),
             routing: InternalRoutingInfo::SingleNode(InternalSingleNodeRouting::ByAddress(
@@ -5084,16 +5097,19 @@ mod retry_state_machine_tests {
             OperationTarget::Node {
                 address: "127.0.0.1:7000".into(),
             },
-            err(ErrorKind::Moved),
+            redirect_err(ErrorKind::Moved, 3999, "127.0.0.1:7002"),
         );
         match poll_once(req) {
             Next::RefreshSlots {
                 request: Some(_),
                 sleep_duration: None,
-                moved_redirect: _,
-            } => {}
+                moved_redirect: Some(redir),
+            } => {
+                assert_eq!(redir.address, "127.0.0.1:7002");
+                assert_eq!(redir.slot, 3999);
+            }
             other => panic!(
-                "MOVED on MultiCmd must take the MovedRedirect path, got {}",
+                "MOVED on MultiCmd must refresh with parsed redirect metadata, got {}",
                 next_name(&other)
             ),
         }
@@ -5219,23 +5235,28 @@ mod retry_state_machine_tests {
         // error; the `RetryMethod::MovedRedirect` arm must surface it via
         // `moved_redirect` on `Next::RefreshSlots` (and NOT sleep —
         // `sleep_duration: None` distinguishes the MOVED path from the
-        // generic refresh path).
+        // generic refresh path). Use a parseable detail so
+        // `Error::redirect_node()` returns Some; otherwise `moved_redirect`
+        // would be None regardless of plumbing correctness.
         let (req, _rx) = build_request(
             0,
             single_node_cmd_arg(),
             OperationTarget::Node {
                 address: "127.0.0.1:7000".into(),
             },
-            err(ErrorKind::Moved),
+            redirect_err(ErrorKind::Moved, 12182, "127.0.0.1:7003"),
         );
         match poll_once(req) {
             Next::RefreshSlots {
                 request: Some(_),
                 sleep_duration: None,
-                moved_redirect: _,
-            } => {}
+                moved_redirect: Some(redir),
+            } => {
+                assert_eq!(redir.address, "127.0.0.1:7003");
+                assert_eq!(redir.slot, 12182);
+            }
             other => panic!(
-                "MOVED single-node must refresh slots with no sleep, got {}",
+                "MOVED single-node must refresh slots with no sleep + parsed redirect, got {}",
                 next_name(&other)
             ),
         }
