@@ -14,9 +14,11 @@
 //! string-like token value (`&str` or `String`) via
 //! `impl AsRef<str>`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::contracts::RotateWaitpointHmacSecretOutcome;
+use ff_core::engine_backend::EngineBackend;
 // v0.12 PR-6: these imports only power the Valkey-typed
 // `rotate_waitpoint_hmac_secret_all_partitions` helper at the bottom
 // of the module; gated so the ungated module builds clean under
@@ -38,17 +40,54 @@ use crate::SdkError;
 /// than a client-side timeout error.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(130);
 
-/// Client for the `ff-server` admin REST surface.
+/// Client for FlowFabric admin primitives — backend-agnostic facade
+/// (v0.13 SC-10 ergonomics).
 ///
-/// Construct via [`FlowFabricAdminClient::new`] (no auth) or
-/// [`FlowFabricAdminClient::with_token`] (Bearer auth). Both
-/// return a ready-to-use client backed by a single pooled
-/// `reqwest::Client` — reuse the instance across calls instead of
-/// building one per request.
+/// Two construction shapes:
+///
+/// * [`FlowFabricAdminClient::new`] / [`FlowFabricAdminClient::with_token`]
+///   — HTTP transport targeting a running `ff-server`.
+/// * [`FlowFabricAdminClient::connect_with`] — embedded transport
+///   that dispatches directly through an `Arc<dyn EngineBackend>`.
+///   No `ff-server` required; works under `FF_DEV_MODE=1` + SQLite
+///   and in any in-process deployment.
+///
+/// The public method surface is identical across both transports;
+/// consumers choose at construction time. Admin methods that have
+/// no backend-trait equivalent return
+/// [`SdkError::AdminApi`] with status 503 on the embedded path —
+/// today every method on this client maps cleanly, so this fallback
+/// is only reached if a future admin primitive lands HTTP-first.
 #[derive(Debug, Clone)]
 pub struct FlowFabricAdminClient {
-    http: reqwest::Client,
-    base_url: String,
+    transport: AdminTransport,
+}
+
+/// Internal discriminator between the HTTP and embedded transports.
+/// Private by design — the public API is uniform across both shapes
+/// (see the [`FlowFabricAdminClient`] type-level docs).
+#[derive(Clone)]
+enum AdminTransport {
+    Http {
+        http: reqwest::Client,
+        base_url: String,
+    },
+    Embedded(Arc<dyn EngineBackend>),
+}
+
+impl std::fmt::Debug for AdminTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdminTransport::Http { base_url, .. } => f
+                .debug_struct("Http")
+                .field("base_url", base_url)
+                .finish_non_exhaustive(),
+            AdminTransport::Embedded(backend) => f
+                .debug_struct("Embedded")
+                .field("backend", &backend.backend_label())
+                .finish(),
+        }
+    }
 }
 
 impl FlowFabricAdminClient {
@@ -64,9 +103,41 @@ impl FlowFabricAdminClient {
                 context: "build reqwest::Client".into(),
             })?;
         Ok(Self {
-            http,
-            base_url: normalize_base_url(base_url.into()),
+            transport: AdminTransport::Http {
+                http,
+                base_url: normalize_base_url(base_url.into()),
+            },
         })
+    }
+
+    /// Build a client that dispatches admin primitives directly
+    /// through an `Arc<dyn EngineBackend>`, bypassing HTTP entirely.
+    ///
+    /// # When to use
+    ///
+    /// * `FF_DEV_MODE=1` SQLite scenarios where no `ff-server` is
+    ///   running.
+    /// * In-process / embedded deployments that hold a backend
+    ///   handle already (e.g. tests, examples, scheduler-hosting
+    ///   binaries).
+    ///
+    /// # Semantic parity
+    ///
+    /// Each method on [`FlowFabricAdminClient`] dispatches to the
+    /// equivalent `EngineBackend` trait method (see the RFC-024 /
+    /// RFC-017 admin surfaces). Validation + request-body translation
+    /// mirror the server-side handler in `ff-server` so consumers see
+    /// the same error shape regardless of transport.
+    ///
+    /// `EngineError::Unavailable` from the backend — emitted by
+    /// backends that have not implemented a given method — is mapped
+    /// to [`SdkError::AdminApi`] with `status = 503` and
+    /// `kind = Some("unavailable")` so callers see a uniform
+    /// admin-error surface across transports.
+    pub fn connect_with(backend: Arc<dyn EngineBackend>) -> Self {
+        Self {
+            transport: AdminTransport::Embedded(backend),
+        }
     }
 
     /// Build a client that sends `Authorization: Bearer <token>` on
@@ -125,8 +196,10 @@ impl FlowFabricAdminClient {
                 context: "build reqwest::Client".into(),
             })?;
         Ok(Self {
-            http,
-            base_url: normalize_base_url(base_url.into()),
+            transport: AdminTransport::Http {
+                http,
+                base_url: normalize_base_url(base_url.into()),
+            },
         })
     }
 
@@ -145,68 +218,14 @@ impl FlowFabricAdminClient {
         &self,
         req: ClaimForWorkerRequest,
     ) -> Result<Option<ClaimForWorkerResponse>, SdkError> {
-        // Percent-encode `worker_id` in the URL path — `WorkerId` is a
-        // free-form string (could contain `/`, spaces, `%`, etc.) and
-        // splicing it verbatim would produce malformed URLs or
-        // misrouted paths. `Url::path_segments_mut().push` handles the
-        // encoding natively.
-        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| SdkError::Config {
-            context: "admin_client: claim_for_worker".into(),
-            field: Some("base_url".into()),
-            message: format!("invalid base_url '{}': {e}", self.base_url),
-        })?;
-        {
-            let mut segs = url.path_segments_mut().map_err(|_| SdkError::Config {
-                context: "admin_client: claim_for_worker".into(),
-                field: Some("base_url".into()),
-                message: format!("base_url cannot be a base URL: '{}'", self.base_url),
-            })?;
-            segs.extend(&["v1", "workers", &req.worker_id, "claim"]);
+        match &self.transport {
+            AdminTransport::Http { http, base_url } => {
+                claim_for_worker_http(http, base_url, req).await
+            }
+            AdminTransport::Embedded(backend) => {
+                claim_for_worker_embedded(backend.as_ref(), req).await
+            }
         }
-        let url = url.to_string();
-        let resp = self
-            .http
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| SdkError::Http {
-                source: e,
-                context: "POST /v1/workers/{worker_id}/claim".into(),
-            })?;
-
-        let status = resp.status();
-        if status == reqwest::StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        if status.is_success() {
-            return resp
-                .json::<ClaimForWorkerResponse>()
-                .await
-                .map(Some)
-                .map_err(|e| SdkError::Http {
-                    source: e,
-                    context: "decode claim_for_worker response body".into(),
-                });
-        }
-
-        // Error path — mirror rotate_waitpoint_secret's ErrorBody decode.
-        let status_u16 = status.as_u16();
-        let raw = resp.text().await.map_err(|e| SdkError::Http {
-            source: e,
-            context: format!("read claim_for_worker error body (status {status_u16})"),
-        })?;
-        let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
-        Err(SdkError::AdminApi {
-            status: status_u16,
-            message: parsed
-                .as_ref()
-                .map(|b| b.error.clone())
-                .unwrap_or_else(|| raw.clone()),
-            kind: parsed.as_ref().and_then(|b| b.kind.clone()),
-            retryable: parsed.as_ref().and_then(|b| b.retryable),
-            raw_body: raw,
-        })
     }
 
     /// Rotate the waitpoint HMAC secret on the server.
@@ -240,54 +259,14 @@ impl FlowFabricAdminClient {
         &self,
         req: RotateWaitpointSecretRequest,
     ) -> Result<RotateWaitpointSecretResponse, SdkError> {
-        let url = format!("{}/v1/admin/rotate-waitpoint-secret", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| SdkError::Http {
-                source: e,
-                context: "POST /v1/admin/rotate-waitpoint-secret".into(),
-            })?;
-
-        let status = resp.status();
-        if status.is_success() {
-            return resp
-                .json::<RotateWaitpointSecretResponse>()
-                .await
-                .map_err(|e| SdkError::Http {
-                    source: e,
-                    context: "decode rotate-waitpoint-secret response body".into(),
-                });
+        match &self.transport {
+            AdminTransport::Http { http, base_url } => {
+                rotate_waitpoint_secret_http(http, base_url, req).await
+            }
+            AdminTransport::Embedded(backend) => {
+                rotate_waitpoint_secret_embedded(backend.as_ref(), req).await
+            }
         }
-
-        // Non-2xx: parse the server's ErrorBody if we can, fall
-        // back to a raw body otherwise. Propagate body-read
-        // transport errors as Http rather than silently flattening
-        // them into `AdminApi { raw_body: "" }` — a connection drop
-        // mid-body-read is a transport fault, not an API-layer
-        // reject, and misclassifying it strips `is_retryable`'s
-        // timeout/connect signal from the caller.
-        let status_u16 = status.as_u16();
-        let raw = resp.text().await.map_err(|e| SdkError::Http {
-            source: e,
-            context: format!(
-                "read rotate-waitpoint-secret error response body (status {status_u16})"
-            ),
-        })?;
-        let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
-        Err(SdkError::AdminApi {
-            status: status_u16,
-            message: parsed
-                .as_ref()
-                .map(|b| b.error.clone())
-                .unwrap_or_else(|| raw.clone()),
-            kind: parsed.as_ref().and_then(|b| b.kind.clone()),
-            retryable: parsed.as_ref().and_then(|b| b.retryable),
-            raw_body: raw,
-        })
     }
 
     /// Request a lease-reclaim grant for an execution in
@@ -353,64 +332,428 @@ impl FlowFabricAdminClient {
         execution_id: &str,
         req: IssueReclaimGrantRequest,
     ) -> Result<IssueReclaimGrantResponse, SdkError> {
-        // Percent-encode `execution_id` in the URL path — the id is a
-        // free-form string and splicing verbatim would produce
-        // malformed URLs. Mirrors `claim_for_worker`'s handling.
-        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| SdkError::Config {
-            context: "admin_client: issue_reclaim_grant".into(),
-            field: Some("base_url".into()),
-            message: format!("invalid base_url '{}': {e}", self.base_url),
-        })?;
-        {
-            let mut segs = url.path_segments_mut().map_err(|_| SdkError::Config {
-                context: "admin_client: issue_reclaim_grant".into(),
-                field: Some("base_url".into()),
-                message: format!("base_url cannot be a base URL: '{}'", self.base_url),
-            })?;
-            segs.extend(&["v1", "executions", execution_id, "reclaim"]);
+        match &self.transport {
+            AdminTransport::Http { http, base_url } => {
+                issue_reclaim_grant_http(http, base_url, execution_id, req).await
+            }
+            AdminTransport::Embedded(backend) => {
+                issue_reclaim_grant_embedded(backend.as_ref(), execution_id, req).await
+            }
         }
-        let url = url.to_string();
-        let resp = self
-            .http
-            .post(&url)
-            .json(&req)
-            .send()
+    }
+}
+
+// ── HTTP-transport helpers (private) ─────────────────────────────────
+
+async fn claim_for_worker_http(
+    http: &reqwest::Client,
+    base_url: &str,
+    req: ClaimForWorkerRequest,
+) -> Result<Option<ClaimForWorkerResponse>, SdkError> {
+    // Percent-encode `worker_id` in the URL path — `WorkerId` is a
+    // free-form string (could contain `/`, spaces, `%`, etc.) and
+    // splicing it verbatim would produce malformed URLs or
+    // misrouted paths. `Url::path_segments_mut().push` handles the
+    // encoding natively.
+    let mut url = reqwest::Url::parse(base_url).map_err(|e| SdkError::Config {
+        context: "admin_client: claim_for_worker".into(),
+        field: Some("base_url".into()),
+        message: format!("invalid base_url '{}': {e}", base_url),
+    })?;
+    {
+        let mut segs = url.path_segments_mut().map_err(|_| SdkError::Config {
+            context: "admin_client: claim_for_worker".into(),
+            field: Some("base_url".into()),
+            message: format!("base_url cannot be a base URL: '{}'", base_url),
+        })?;
+        segs.extend(&["v1", "workers", &req.worker_id, "claim"]);
+    }
+    let url = url.to_string();
+    let resp = http
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| SdkError::Http {
+            source: e,
+            context: "POST /v1/workers/{worker_id}/claim".into(),
+        })?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    if status.is_success() {
+        return resp
+            .json::<ClaimForWorkerResponse>()
+            .await
+            .map(Some)
+            .map_err(|e| SdkError::Http {
+                source: e,
+                context: "decode claim_for_worker response body".into(),
+            });
+    }
+
+    // Error path — mirror rotate_waitpoint_secret's ErrorBody decode.
+    let status_u16 = status.as_u16();
+    let raw = resp.text().await.map_err(|e| SdkError::Http {
+        source: e,
+        context: format!("read claim_for_worker error body (status {status_u16})"),
+    })?;
+    let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
+    Err(SdkError::AdminApi {
+        status: status_u16,
+        message: parsed
+            .as_ref()
+            .map(|b| b.error.clone())
+            .unwrap_or_else(|| raw.clone()),
+        kind: parsed.as_ref().and_then(|b| b.kind.clone()),
+        retryable: parsed.as_ref().and_then(|b| b.retryable),
+        raw_body: raw,
+    })
+}
+
+async fn rotate_waitpoint_secret_http(
+    http: &reqwest::Client,
+    base_url: &str,
+    req: RotateWaitpointSecretRequest,
+) -> Result<RotateWaitpointSecretResponse, SdkError> {
+    let url = format!("{}/v1/admin/rotate-waitpoint-secret", base_url);
+    let resp = http
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| SdkError::Http {
+            source: e,
+            context: "POST /v1/admin/rotate-waitpoint-secret".into(),
+        })?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return resp
+            .json::<RotateWaitpointSecretResponse>()
             .await
             .map_err(|e| SdkError::Http {
                 source: e,
-                context: "POST /v1/executions/{id}/reclaim".into(),
-            })?;
-
-        let status = resp.status();
-        if status.is_success() {
-            return resp
-                .json::<IssueReclaimGrantResponse>()
-                .await
-                .map_err(|e| SdkError::Http {
-                    source: e,
-                    context: "decode issue_reclaim_grant response body".into(),
-                });
-        }
-
-        let status_u16 = status.as_u16();
-        let raw = resp.text().await.map_err(|e| SdkError::Http {
-            source: e,
-            context: format!(
-                "read issue_reclaim_grant error body (status {status_u16})"
-            ),
-        })?;
-        let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
-        Err(SdkError::AdminApi {
-            status: status_u16,
-            message: parsed
-                .as_ref()
-                .map(|b| b.error.clone())
-                .unwrap_or_else(|| raw.clone()),
-            kind: parsed.as_ref().and_then(|b| b.kind.clone()),
-            retryable: parsed.as_ref().and_then(|b| b.retryable),
-            raw_body: raw,
-        })
+                context: "decode rotate-waitpoint-secret response body".into(),
+            });
     }
+
+    // Non-2xx: parse the server's ErrorBody if we can, fall
+    // back to a raw body otherwise. Propagate body-read
+    // transport errors as Http rather than silently flattening
+    // them into `AdminApi { raw_body: "" }` — a connection drop
+    // mid-body-read is a transport fault, not an API-layer
+    // reject, and misclassifying it strips `is_retryable`'s
+    // timeout/connect signal from the caller.
+    let status_u16 = status.as_u16();
+    let raw = resp.text().await.map_err(|e| SdkError::Http {
+        source: e,
+        context: format!(
+            "read rotate-waitpoint-secret error response body (status {status_u16})"
+        ),
+    })?;
+    let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
+    Err(SdkError::AdminApi {
+        status: status_u16,
+        message: parsed
+            .as_ref()
+            .map(|b| b.error.clone())
+            .unwrap_or_else(|| raw.clone()),
+        kind: parsed.as_ref().and_then(|b| b.kind.clone()),
+        retryable: parsed.as_ref().and_then(|b| b.retryable),
+        raw_body: raw,
+    })
+}
+
+async fn issue_reclaim_grant_http(
+    http: &reqwest::Client,
+    base_url: &str,
+    execution_id: &str,
+    req: IssueReclaimGrantRequest,
+) -> Result<IssueReclaimGrantResponse, SdkError> {
+    // Percent-encode `execution_id` in the URL path — the id is a
+    // free-form string and splicing verbatim would produce
+    // malformed URLs. Mirrors `claim_for_worker`'s handling.
+    let mut url = reqwest::Url::parse(base_url).map_err(|e| SdkError::Config {
+        context: "admin_client: issue_reclaim_grant".into(),
+        field: Some("base_url".into()),
+        message: format!("invalid base_url '{}': {e}", base_url),
+    })?;
+    {
+        let mut segs = url.path_segments_mut().map_err(|_| SdkError::Config {
+            context: "admin_client: issue_reclaim_grant".into(),
+            field: Some("base_url".into()),
+            message: format!("base_url cannot be a base URL: '{}'", base_url),
+        })?;
+        segs.extend(&["v1", "executions", execution_id, "reclaim"]);
+    }
+    let url = url.to_string();
+    let resp = http
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| SdkError::Http {
+            source: e,
+            context: "POST /v1/executions/{id}/reclaim".into(),
+        })?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return resp
+            .json::<IssueReclaimGrantResponse>()
+            .await
+            .map_err(|e| SdkError::Http {
+                source: e,
+                context: "decode issue_reclaim_grant response body".into(),
+            });
+    }
+
+    let status_u16 = status.as_u16();
+    let raw = resp.text().await.map_err(|e| SdkError::Http {
+        source: e,
+        context: format!(
+            "read issue_reclaim_grant error body (status {status_u16})"
+        ),
+    })?;
+    let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
+    Err(SdkError::AdminApi {
+        status: status_u16,
+        message: parsed
+            .as_ref()
+            .map(|b| b.error.clone())
+            .unwrap_or_else(|| raw.clone()),
+        kind: parsed.as_ref().and_then(|b| b.kind.clone()),
+        retryable: parsed.as_ref().and_then(|b| b.retryable),
+        raw_body: raw,
+    })
+}
+
+// ── Embedded-transport helpers (private) ─────────────────────────────
+//
+// Dispatch directly through the `EngineBackend` trait. The request
+// body validation mirrors the server-side handler in
+// `ff-server::api`. Translation between the wire DTOs and the core
+// `contracts::*` types lives here so consumers get identical
+// surfaces across transports.
+
+/// Map an `EngineError` from a backend call into the `SdkError::AdminApi`
+/// surface so embedded and HTTP transports emit the same shape. `Unavailable`
+/// becomes 503 with kind `"unavailable"`; every other engine error bubbles
+/// up via `SdkError::Engine`.
+fn engine_err_to_admin(err: ff_core::engine_error::EngineError, op: &str) -> SdkError {
+    if let ff_core::engine_error::EngineError::Unavailable { op: backend_op } = &err {
+        return SdkError::AdminApi {
+            status: 503,
+            message: format!(
+                "{op}: backend does not implement '{backend_op}' on this transport"
+            ),
+            kind: Some("unavailable".to_owned()),
+            retryable: Some(false),
+            raw_body: String::new(),
+        };
+    }
+    SdkError::Engine(Box::new(err))
+}
+
+async fn claim_for_worker_embedded(
+    backend: &dyn EngineBackend,
+    req: ClaimForWorkerRequest,
+) -> Result<Option<ClaimForWorkerResponse>, SdkError> {
+    // Mirror ff-server's validation + translation. Errors surface as
+    // SdkError::Config so consumers see validation faults loud rather
+    // than as backend transport errors.
+    let lane_id = ff_core::types::LaneId::try_new(req.lane_id).map_err(|e| SdkError::Config {
+        context: "admin_client: claim_for_worker".into(),
+        field: Some("lane_id".into()),
+        message: e.to_string(),
+    })?;
+    if req.worker_id.trim().is_empty() {
+        return Err(SdkError::Config {
+            context: "admin_client: claim_for_worker".into(),
+            field: Some("worker_id".into()),
+            message: "must be non-empty".into(),
+        });
+    }
+    if req.worker_instance_id.trim().is_empty() {
+        return Err(SdkError::Config {
+            context: "admin_client: claim_for_worker".into(),
+            field: Some("worker_instance_id".into()),
+            message: "must be non-empty".into(),
+        });
+    }
+    if req.grant_ttl_ms == 0 {
+        return Err(SdkError::Config {
+            context: "admin_client: claim_for_worker".into(),
+            field: Some("grant_ttl_ms".into()),
+            message: "must be > 0".into(),
+        });
+    }
+    let caps: std::collections::BTreeSet<String> = req.capabilities.into_iter().collect();
+    let args = ff_core::contracts::ClaimForWorkerArgs::new(
+        lane_id,
+        ff_core::types::WorkerId::new(req.worker_id),
+        ff_core::types::WorkerInstanceId::new(req.worker_instance_id),
+        caps,
+        req.grant_ttl_ms,
+    );
+    match backend
+        .claim_for_worker(args)
+        .await
+        .map_err(|e| engine_err_to_admin(e, "claim_for_worker"))?
+    {
+        ff_core::contracts::ClaimForWorkerOutcome::NoWork => Ok(None),
+        ff_core::contracts::ClaimForWorkerOutcome::Granted(grant) => {
+            Ok(Some(ClaimForWorkerResponse {
+                execution_id: grant.execution_id.to_string(),
+                partition_key: grant.partition_key,
+                grant_key: grant.grant_key,
+                expires_at_ms: grant.expires_at_ms,
+            }))
+        }
+        // `ClaimForWorkerOutcome` is `#[non_exhaustive]`; mirror
+        // ff-server's 503 policy on unknown variants.
+        _ => Err(SdkError::AdminApi {
+            status: 503,
+            message: "claim_for_worker: backend returned a non-exhaustive outcome this SDK build does not understand".to_owned(),
+            kind: Some("unknown_outcome".to_owned()),
+            retryable: Some(false),
+            raw_body: String::new(),
+        }),
+    }
+}
+
+async fn issue_reclaim_grant_embedded(
+    backend: &dyn EngineBackend,
+    execution_id: &str,
+    req: IssueReclaimGrantRequest,
+) -> Result<IssueReclaimGrantResponse, SdkError> {
+    let exec_id = ff_core::types::ExecutionId::parse(execution_id).map_err(|e| SdkError::Config {
+        context: "admin_client: issue_reclaim_grant".into(),
+        field: Some("execution_id".into()),
+        message: e.to_string(),
+    })?;
+    let lane_id = ff_core::types::LaneId::try_new(req.lane_id).map_err(|e| SdkError::Config {
+        context: "admin_client: issue_reclaim_grant".into(),
+        field: Some("lane_id".into()),
+        message: e.to_string(),
+    })?;
+    if req.worker_id.trim().is_empty() {
+        return Err(SdkError::Config {
+            context: "admin_client: issue_reclaim_grant".into(),
+            field: Some("worker_id".into()),
+            message: "must be non-empty".into(),
+        });
+    }
+    if req.worker_instance_id.trim().is_empty() {
+        return Err(SdkError::Config {
+            context: "admin_client: issue_reclaim_grant".into(),
+            field: Some("worker_instance_id".into()),
+            message: "must be non-empty".into(),
+        });
+    }
+    if req.grant_ttl_ms == 0 {
+        return Err(SdkError::Config {
+            context: "admin_client: issue_reclaim_grant".into(),
+            field: Some("grant_ttl_ms".into()),
+            message: "must be > 0".into(),
+        });
+    }
+    let caps: std::collections::BTreeSet<String> = req.worker_capabilities.into_iter().collect();
+    let args = ff_core::contracts::IssueReclaimGrantArgs::new(
+        exec_id,
+        ff_core::types::WorkerId::new(req.worker_id),
+        ff_core::types::WorkerInstanceId::new(req.worker_instance_id),
+        lane_id,
+        req.capability_hash,
+        req.grant_ttl_ms,
+        req.route_snapshot_json,
+        req.admission_summary,
+        caps,
+        ff_core::types::TimestampMs::now(),
+    );
+    match backend
+        .issue_reclaim_grant(args)
+        .await
+        .map_err(|e| engine_err_to_admin(e, "issue_reclaim_grant"))?
+    {
+        ff_core::contracts::IssueReclaimGrantOutcome::Granted(grant) => {
+            Ok(IssueReclaimGrantResponse::Granted {
+                execution_id: grant.execution_id.to_string(),
+                partition_key: grant.partition_key,
+                grant_key: grant.grant_key,
+                expires_at_ms: grant.expires_at_ms,
+                lane_id: grant.lane_id.as_str().to_owned(),
+            })
+        }
+        ff_core::contracts::IssueReclaimGrantOutcome::NotReclaimable { execution_id, detail } => {
+            Ok(IssueReclaimGrantResponse::NotReclaimable {
+                execution_id: execution_id.to_string(),
+                detail,
+            })
+        }
+        ff_core::contracts::IssueReclaimGrantOutcome::ReclaimCapExceeded {
+            execution_id,
+            reclaim_count,
+        } => Ok(IssueReclaimGrantResponse::ReclaimCapExceeded {
+            execution_id: execution_id.to_string(),
+            reclaim_count,
+        }),
+        _ => Err(SdkError::AdminApi {
+            status: 503,
+            message: "issue_reclaim_grant: backend returned a non-exhaustive outcome this SDK build does not understand".to_owned(),
+            kind: Some("unknown_outcome".to_owned()),
+            retryable: Some(false),
+            raw_body: String::new(),
+        }),
+    }
+}
+
+async fn rotate_waitpoint_secret_embedded(
+    backend: &dyn EngineBackend,
+    req: RotateWaitpointSecretRequest,
+) -> Result<RotateWaitpointSecretResponse, SdkError> {
+    // Note: unlike the HTTP handler, this path does not enforce the
+    // 120s end-to-end timeout (there is no HTTP deadline to honour)
+    // and does not emit the `audit`-target `waitpoint_hmac_rotation_*`
+    // events (those are server-owned operator-audit signals). The
+    // rotation itself is idempotent on the same (new_kid,
+    // new_secret_hex) pair, so retries are safe.
+    //
+    // `grace_ms = 0` mirrors the server's `rotate_waitpoint_secret`
+    // which does not forward a grace window to the backend primitive —
+    // backends provision grace from their own configuration.
+    let args = ff_core::contracts::RotateWaitpointHmacSecretAllArgs::new(
+        req.new_kid.clone(),
+        req.new_secret_hex,
+        0,
+    );
+    let result = backend
+        .rotate_waitpoint_hmac_secret_all(args)
+        .await
+        .map_err(|e| engine_err_to_admin(e, "rotate_waitpoint_secret"))?;
+
+    // Collapse the per-partition entries into the HTTP response shape
+    // the server emits — rotated count + failed indices + echoed
+    // new_kid — so consumers see identical return values across
+    // transports.
+    let mut rotated: u16 = 0;
+    let mut failed: Vec<u16> = Vec::new();
+    for entry in &result.entries {
+        match &entry.result {
+            Ok(_) => {
+                rotated = rotated.saturating_add(1);
+            }
+            Err(_) => failed.push(entry.partition),
+        }
+    }
+    Ok(RotateWaitpointSecretResponse {
+        rotated,
+        failed,
+        new_kid: req.new_kid,
+    })
 }
 
 /// Request body for `POST /v1/executions/{execution_id}/reclaim`
