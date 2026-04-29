@@ -719,20 +719,17 @@ pub(crate) async fn create_waitpoint_impl(
     let wp_id = WaitpointId::new();
     let wp_u = wp_uuid(&wp_id)?;
     let now = now_ms();
-    // Caller-supplied `expires_in` that doesn't fit in i64 ms is a
-    // nonsense value (>292M years). Reject as validation rather than
-    // silently clamping — `bigint expires_at_ms` can't represent it
-    // and saturating would mask the bad input.
-    let expires_ms = i64::try_from(expires_in.as_millis()).map_err(|_| {
-        EngineError::Validation {
-            kind: ValidationKind::InvalidInput,
-            detail: "expires_in exceeds i64 milliseconds".into(),
-        }
-    })?;
-    let expires_at = now.checked_add(expires_ms).ok_or(EngineError::Validation {
-        kind: ValidationKind::InvalidInput,
-        detail: "expires_in causes expires_at_ms overflow".into(),
-    })?;
+    // Clamp oversized `expires_in` to match the other backends:
+    //   * `ff-backend-sqlite::create_waitpoint_impl` uses
+    //     `i64::try_from(...).unwrap_or(i64::MAX)` + `saturating_add`.
+    //   * `ff-backend-valkey` / `ff_create_pending_waitpoint` Lua casts
+    //     with `as i64`.
+    //
+    // A stricter "overflow => Validation" contract would diverge from
+    // both — that tightening needs a one-shot trait-docs + all-three-
+    // backends change, not a PG-only fork. Keep parity until then.
+    let expires_ms = i64::try_from(expires_in.as_millis()).unwrap_or(i64::MAX);
+    let expires_at = now.saturating_add(expires_ms);
     let msg = format!("{}:{}", payload.execution_id, wp_id);
     let token = hmac_sign(&secret, &kid, msg.as_bytes());
 
