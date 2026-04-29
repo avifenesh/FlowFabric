@@ -1071,3 +1071,55 @@ async fn suspend_by_triple_fresh_returns_suspended() {
     let _ = fx.lane;
     let _ = fx.pool;
 }
+
+/// Issue #434 — `EngineBackend::read_waitpoint_token` on Postgres.
+/// After suspend, the waitpoint row carries a kid-prefixed HMAC
+/// token; reading it through the trait returns `Ok(Some(token))`.
+/// An unknown `WaitpointId` on the same partition returns
+/// `Ok(None)`.
+#[tokio::test]
+#[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
+async fn read_waitpoint_token_returns_some_for_existing_and_none_for_missing() {
+    let Some(fx) = setup_exec_or_skip().await else {
+        return;
+    };
+
+    let (args, wp_id) = make_suspend_args("wpk:read-token");
+    let _ = fx
+        .backend
+        .suspend(&fx.handle, args)
+        .await
+        .expect("suspend ok");
+
+    let partition = ff_core::partition::PartitionKey::from(
+        &ff_core::partition::Partition {
+            family: ff_core::partition::PartitionFamily::Flow,
+            index: fx.part as u16,
+        },
+    );
+
+    let token = fx
+        .backend
+        .read_waitpoint_token(partition.clone(), &wp_id)
+        .await
+        .expect("read_waitpoint_token ok");
+    let token = token.expect("waitpoint row exists → token populated");
+    assert!(
+        !token.is_empty() && token.contains(':'),
+        "stored token should be kid-prefixed hex, got {token:?}"
+    );
+
+    let missing = fx
+        .backend
+        .read_waitpoint_token(partition, &WaitpointId::new())
+        .await
+        .expect("read_waitpoint_token ok for missing");
+    assert!(missing.is_none(), "missing waitpoint should read back None");
+
+    let _ = fx.exec_id;
+    let _ = fx.exec_uuid;
+    let _ = fx.lease_epoch;
+    let _ = fx.attempt_index;
+    let _ = fx.lane;
+    let _ = fx.pool;
+}

@@ -2608,6 +2608,38 @@ async fn create_waitpoint_impl(
     ))
 }
 
+/// Point-read of a waitpoint's stored HMAC token. Targets the
+/// `ff:wp:<tag>:<wp_id>` hash's `waitpoint_token` field (written by
+/// the Lua suspension path, see `lua/suspension.lua:289`).
+///
+/// Empty string / missing field / missing hash all map to
+/// `Ok(None)` — signal delivery can legitimately race waitpoint
+/// consumption or expiry, and the signal-bridge authenticates on the
+/// token presence rather than on waitpoint liveness. The raw
+/// partition hash-tag is extracted from the opaque
+/// [`PartitionKey`] so this helper does not require a
+/// [`PartitionConfig`] round-trip.
+#[tracing::instrument(
+    name = "ff.read_waitpoint_token",
+    skip_all,
+    fields(backend = "valkey", waitpoint_id = %waitpoint_id)
+)]
+async fn read_waitpoint_token_impl(
+    client: &ferriskey::Client,
+    partition: &PartitionKey,
+    waitpoint_id: &WaitpointId,
+) -> Result<Option<String>, EngineError> {
+    let key = format!("ff:wp:{}:{}", partition.as_str(), waitpoint_id);
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(&key)
+        .arg("waitpoint_token")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    Ok(raw.filter(|s| !s.is_empty()))
+}
+
 /// Round-7 — `report_usage` FCALL body. Migrated from
 /// `ff_sdk::task::ClaimedTask::report_usage`. 3 KEYS, N ARGV (variable
 /// by dimension count).
@@ -5054,6 +5086,21 @@ impl EngineBackend for ValkeyBackend {
                 "create_waitpoint: FCALL ff_create_pending_waitpoint",
             )
         })
+    }
+
+    async fn read_waitpoint_token(
+        &self,
+        partition: PartitionKey,
+        waitpoint_id: &WaitpointId,
+    ) -> Result<Option<String>, EngineError> {
+        read_waitpoint_token_impl(&self.client, &partition, waitpoint_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "read_waitpoint_token: HGET ff:wp:<tag>:<wp_id> waitpoint_token",
+                )
+            })
     }
 
     async fn observe_signals(

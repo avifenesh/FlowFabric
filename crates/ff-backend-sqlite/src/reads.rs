@@ -485,3 +485,38 @@ pub(crate) async fn read_total_attempt_count_impl(
         .unwrap_or(0);
     Ok(ff_core::types::AttemptIndex::new(count))
 }
+
+/// Point-read of a waitpoint's HMAC token by `(partition, waitpoint_id)`
+/// for the signal-bridge resume path. Mirrors the Postgres impl at
+/// `ff-backend-postgres/src/suspend_ops.rs::read_waitpoint_token_impl`.
+///
+/// Missing row → `Ok(None)`. Empty `token` → `Ok(None)` (parity with
+/// the Valkey HGET mapping, even though the column is `NOT NULL`).
+pub(crate) async fn read_waitpoint_token_impl(
+    pool: &SqlitePool,
+    partition: &ff_core::partition::PartitionKey,
+    waitpoint_id: &ff_core::types::WaitpointId,
+) -> Result<Option<String>, EngineError> {
+    let part: i64 = partition
+        .parse()
+        .map_err(|e| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("partition_key: {e}"),
+        })?
+        .index as i64;
+    let wp_uuid_val = Uuid::parse_str(&waitpoint_id.to_string()).map_err(|e| {
+        EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!("waitpoint_id not a UUID: {e}"),
+        }
+    })?;
+    let row: Option<(String,)> = sqlx::query_as(
+        crate::queries::waitpoint::SELECT_WAITPOINT_TOKEN_BY_ID_SQL,
+    )
+    .bind(part)
+    .bind(wp_uuid_val)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    Ok(row.map(|(t,)| t).filter(|s| !s.is_empty()))
+}
