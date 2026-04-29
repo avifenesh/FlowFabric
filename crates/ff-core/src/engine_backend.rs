@@ -608,13 +608,21 @@ pub trait EngineBackend: Send + Sync + 'static {
     ///   only on their very first tag write. Callers MUST read tags
     ///   via [`Self::get_flow_tag`] (`HGET :tags <key>`) — direct
     ///   `HGETALL` against `flow_core` will not see post-migration
-    ///   values. The pre-existing `ValkeyBackend::describe_flow` /
-    ///   `FlowSnapshot::tags` read path snapshots `flow_core`
-    ///   fields only and does NOT today merge the `:tags` sub-hash;
-    ///   consumers that need the full tag set via `describe_flow`
-    ///   should complement the snapshot with per-key `get_flow_tag`
-    ///   reads. Extending `describe_flow` to merge `:tags` is
-    ///   additive and out of scope for this trait addition.
+    ///   values.
+    ///
+    ///   **Cross-backend parity caveat on `describe_flow`**: the
+    ///   pre-existing `ValkeyBackend::describe_flow` /
+    ///   `FlowSnapshot::tags` read path snapshots `flow_core` fields
+    ///   only and does NOT today merge the `:tags` sub-hash, whereas
+    ///   Postgres `describe_flow` DOES surface flow tags via
+    ///   `ff_backend_postgres::flow::extract_tags` (which reads them
+    ///   off `raw_fields` — the same store `set_flow_tag` writes on
+    ///   PG). Trait consumers MUST NOT assume a tag written here
+    ///   will be visible via `describe_flow` on every backend: on
+    ///   Valkey, callers that need the full tag set should
+    ///   complement the snapshot with per-key [`Self::get_flow_tag`]
+    ///   reads. Extending Valkey `describe_flow` to merge `:tags`
+    ///   is additive and out of scope for this trait addition.
     /// * **Postgres** — `UPDATE ff_flow_core SET raw_fields =
     ///   jsonb_set(..., '{<key>}', ...)` — flow tags are stored as
     ///   top-level `raw_fields` keys (matches
