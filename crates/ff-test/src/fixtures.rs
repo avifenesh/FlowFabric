@@ -62,6 +62,12 @@ impl TestCluster {
     /// Each test gets a fresh connection to avoid shared-state issues.
     /// Library loading happens once (first test loads, others verify).
     pub async fn connect() -> Self {
+        // PR #429 follow-up: install the process-wide `RUST_LOG`-gated
+        // tracing subscriber before the first Valkey round trip so any
+        // ferriskey / ff-script `warn!` emitted during connect or
+        // library load reaches the test log surface.
+        crate::init_test_tracing();
+
         let client = build_client_from_env()
             .await
             .unwrap_or_else(|e| panic!("Failed to connect to Valkey: {e}"));
