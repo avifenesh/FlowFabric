@@ -50,3 +50,9 @@ ff-backend-postgres = { workspace = true, optional = true }
 # Both flip on with the `postgres` feature only.
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"], optional = true }
 uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Unit-test mock `EngineBackend` impls need `#[async_trait]` to match
+# the trait shape defined in `ff-core::engine_backend`.
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

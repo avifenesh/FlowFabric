@@ -13,9 +13,11 @@
 //! Reference: RFC-007 §Resolve dependency, RFC-010 §6.14
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, execution_partition};
 use ff_core::types::{ExecutionId, LaneId};
@@ -31,6 +33,7 @@ pub struct DependencyReconciler {
     lanes: Vec<LaneId>,
     partition_config: PartitionConfig,
     filter: ScannerFilter,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl DependencyReconciler {
@@ -51,6 +54,25 @@ impl DependencyReconciler {
             lanes,
             partition_config,
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for filter-resolution
+    /// reads. FCALL routing is cluster 2 scope.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        lanes: Vec<LaneId>,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            lanes,
+            partition_config,
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -112,7 +134,7 @@ impl Scanner for DependencyReconciler {
             };
 
             for eid_str in &blocked {
-                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+                if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, eid_str).await {
                     continue;
                 }
                 match reconcile_one_execution(

@@ -30,8 +30,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
-use ff_core::partition::{Partition, PartitionFamily};
-use ff_core::types::Namespace;
+use ff_core::engine_backend::EngineBackend;
+use ff_core::types::ExecutionId;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -220,48 +220,42 @@ pub trait Scanner: Send + Sync + 'static {
 /// worse than the scanner temporarily underclaiming — the next cycle
 /// picks it back up once the backend recovers.
 pub async fn should_skip_candidate(
-    client: &ferriskey::Client,
+    backend: Option<&Arc<dyn EngineBackend>>,
     filter: &ScannerFilter,
-    partition: u16,
+    _partition: u16,
     eid: &str,
 ) -> bool {
     if filter.is_noop() {
         return false;
     }
-    let p = Partition {
-        family: PartitionFamily::Execution,
-        index: partition,
+    // With a non-noop filter but no backend plumbed, skip
+    // conservatively — same posture as a transport error. The
+    // in-tree engine path (`Engine::start_internal`) always plumbs a
+    // backend; `None` only reaches here from test-only scanner
+    // constructors that use `ScannerFilter::default()` (noop), so
+    // the first branch above already short-circuits.
+    let Some(backend) = backend else {
+        return true;
     };
-    let tag = p.hash_tag();
+    let Ok(exec_id) = ExecutionId::parse(eid) else {
+        // Malformed eid → skip conservatively (matches pre-PR-7b
+        // posture: anything we can't validate gets filtered out).
+        return true;
+    };
 
     if let Some(ref want_ns) = filter.namespace {
-        let core_key = format!("ff:exec:{}:{}:core", tag, eid);
-        match client
-            .cmd("HGET")
-            .arg(&core_key)
-            .arg("namespace")
-            .execute::<Option<String>>()
-            .await
-        {
-            Ok(Some(s)) => {
-                if &Namespace::new(s) != want_ns {
-                    return true;
-                }
-            }
-            // nil or transport error — skip conservatively.
+        // Dedicated point-read — preserves the 1-HGET cost contract
+        // documented above. `describe_execution` would be an N-field
+        // HGETALL / full-snapshot read and is the wrong tool when only
+        // the namespace scalar is needed.
+        match backend.get_execution_namespace(&exec_id).await {
+            Ok(Some(ref got)) if got == want_ns.as_str() => {}
             _ => return true,
         }
     }
 
     if let Some((ref tag_key, ref want_value)) = filter.instance_tag {
-        let tags_key = format!("ff:exec:{}:{}:tags", tag, eid);
-        match client
-            .cmd("HGET")
-            .arg(&tags_key)
-            .arg(tag_key.as_str())
-            .execute::<Option<String>>()
-            .await
-        {
+        match backend.get_execution_tag(&exec_id, tag_key.as_str()).await {
             Ok(Some(v)) if &v == want_value => {}
             _ => return true,
         }
@@ -397,3 +391,4 @@ impl ScannerRunner {
         })
     }
 }
+

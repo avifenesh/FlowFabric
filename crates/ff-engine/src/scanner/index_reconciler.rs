@@ -9,9 +9,11 @@
 //!
 //! Reference: RFC-010 §6.14
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::LaneId;
@@ -26,6 +28,7 @@ pub struct IndexReconciler {
     /// Lanes to check. Phase 1: just "default".
     lanes: Vec<LaneId>,
     filter: ScannerFilter,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl IndexReconciler {
@@ -40,6 +43,24 @@ impl IndexReconciler {
             interval,
             lanes,
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for filter-resolution
+    /// reads via `should_skip_candidate`. FCALL routing for this
+    /// scanner is cluster 2b scope.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        lanes: Vec<LaneId>,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            lanes,
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -101,7 +122,7 @@ impl Scanner for IndexReconciler {
             };
 
             for eid_str in &members {
-                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+                if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, eid_str).await {
                     continue;
                 }
                 match check_execution_index(client, &p, &idx, eid_str, &self.lanes).await {

@@ -91,6 +91,52 @@ pub async fn scan_tick(
     Ok(report)
 }
 
+/// Per-execution expire action. Exposed so the
+/// `EngineBackend::expire_execution` trait dispatch (PR-7b Cluster 1)
+/// can invoke the same per-row tx logic as `scan_tick`. Discovers the
+/// current attempt_index internally. Silently no-ops when the lease
+/// is no longer expired or the exec is no longer `active` (checked
+/// under `FOR UPDATE`).
+pub async fn expire_for_execution(
+    pool: &PgPool,
+    partition_key: i16,
+    exec_uuid: uuid::Uuid,
+) -> Result<(), EngineError> {
+    let now_ms: i64 = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+
+    let row = sqlx::query(
+        r#"
+        SELECT a.attempt_index
+          FROM ff_attempt a
+          JOIN ff_exec_core c
+            ON c.partition_key = a.partition_key
+           AND c.execution_id = a.execution_id
+         WHERE a.partition_key = $1
+           AND a.execution_id = $2
+           AND a.lease_expires_at_ms IS NOT NULL
+           AND a.lease_expires_at_ms < $3
+           AND c.lifecycle_phase = 'active'
+         ORDER BY a.lease_expires_at_ms ASC
+         LIMIT 1
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .bind(now_ms)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    let Some(row) = row else { return Ok(()) };
+    let attempt_index: i32 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
+    expire_one(pool, partition_key, exec_uuid, attempt_index, now_ms).await
+}
+
 async fn expire_one(
     pool: &PgPool,
     partition_key: i16,

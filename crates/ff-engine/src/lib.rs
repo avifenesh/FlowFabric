@@ -321,9 +321,10 @@ impl Engine {
         let scanner_filter = config.scanner_filter.clone();
 
         // Lease expiry scanner
-        let lease_scanner = Arc::new(LeaseExpiryScanner::with_filter(
+        let lease_scanner = Arc::new(LeaseExpiryScanner::with_filter_and_backend(
             config.lease_expiry_interval,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             lease_scanner,
@@ -334,10 +335,11 @@ impl Engine {
         ));
 
         // Delayed promoter
-        let delayed_scanner = Arc::new(DelayedPromoter::with_filter(
+        let delayed_scanner = Arc::new(DelayedPromoter::with_filter_and_backend(
             config.delayed_promoter_interval,
             config.lanes.clone(),
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             delayed_scanner,
@@ -348,10 +350,11 @@ impl Engine {
         ));
 
         // Index reconciler
-        let reconciler = Arc::new(IndexReconciler::with_filter(
+        let reconciler = Arc::new(IndexReconciler::with_filter_and_backend(
             config.index_reconciler_interval,
             config.lanes.clone(),
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             reconciler,
@@ -362,10 +365,11 @@ impl Engine {
         ));
 
         // Attempt timeout scanner
-        let timeout_scanner = Arc::new(AttemptTimeoutScanner::with_filter(
+        let timeout_scanner = Arc::new(AttemptTimeoutScanner::with_filter_and_backend(
             config.attempt_timeout_interval,
             config.lanes.clone(),
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             timeout_scanner,
@@ -376,9 +380,10 @@ impl Engine {
         ));
 
         // Suspension timeout scanner
-        let suspension_scanner = Arc::new(SuspensionTimeoutScanner::with_filter(
+        let suspension_scanner = Arc::new(SuspensionTimeoutScanner::with_filter_and_backend(
             config.suspension_timeout_interval,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             suspension_scanner,
@@ -389,9 +394,10 @@ impl Engine {
         ));
 
         // Pending waitpoint expiry scanner
-        let pending_wp_scanner = Arc::new(PendingWaitpointExpiryScanner::with_filter(
+        let pending_wp_scanner = Arc::new(PendingWaitpointExpiryScanner::with_filter_and_backend(
             config.pending_wp_expiry_interval,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             pending_wp_scanner,
@@ -402,10 +408,11 @@ impl Engine {
         ));
 
         // Retention trimmer
-        let retention_scanner = Arc::new(RetentionTrimmer::with_filter(
+        let retention_scanner = Arc::new(RetentionTrimmer::with_filter_and_backend(
             config.retention_trimmer_interval,
             config.lanes.clone(),
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             retention_scanner,
@@ -446,11 +453,12 @@ impl Engine {
         ));
 
         // Unblock scanner (iterates execution partitions, re-evaluates blocked)
-        let unblock_scanner = Arc::new(UnblockScanner::with_filter(
+        let unblock_scanner = Arc::new(UnblockScanner::with_filter_and_backend(
             config.unblock_interval,
             config.lanes.clone(),
             config.partition_config,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             unblock_scanner,
@@ -461,11 +469,12 @@ impl Engine {
         ));
 
         // Dependency reconciler (iterates execution partitions)
-        let dep_reconciler = Arc::new(DependencyReconciler::with_filter(
+        let dep_reconciler = Arc::new(DependencyReconciler::with_filter_and_backend(
             config.dependency_reconciler_interval,
             config.lanes.clone(),
             config.partition_config,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             dep_reconciler,
@@ -509,10 +518,11 @@ impl Engine {
         // Cancel reconciler (iterates flow partitions). Drains
         // cancel_backlog entries whose grace window has elapsed so a
         // process crash mid-dispatch can't leave flow members un-cancelled.
-        let cancel_reconciler = Arc::new(scanner::cancel_reconciler::CancelReconciler::with_filter(
+        let cancel_reconciler = Arc::new(scanner::cancel_reconciler::CancelReconciler::with_filter_and_backend(
             config.cancel_reconciler_interval,
             config.partition_config,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             cancel_reconciler,
@@ -563,10 +573,11 @@ impl Engine {
         ));
 
         // Execution deadline scanner (iterates execution partitions)
-        let deadline_scanner = Arc::new(ExecutionDeadlineScanner::with_filter(
+        let deadline_scanner = Arc::new(ExecutionDeadlineScanner::with_filter_and_backend(
             config.execution_deadline_interval,
             config.lanes,
             scanner_filter,
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             deadline_scanner,

@@ -688,6 +688,33 @@ pub trait EngineBackend: Send + Sync + 'static {
         })
     }
 
+    /// Read an execution's `namespace` scalar. Returns `Ok(None)` when
+    /// the row is absent or the field is unset. Dedicated point-read
+    /// used by the scanner per-candidate filter (`should_skip_candidate`)
+    /// to preserve the 1-HGET cost contract documented in
+    /// `ff_engine::scanner::should_skip_candidate` — `describe_execution`
+    /// is heavier (HGETALL / full snapshot) and unnecessary when only
+    /// the namespace scalar is needed.
+    ///
+    /// Per-backend shape:
+    ///
+    /// * **Valkey** — `HGET :core namespace` on the execution's partition
+    ///   (single field read on the already-hot exec_core hash).
+    /// * **Postgres** — `SELECT raw_fields->>'namespace' FROM ff_exec_core
+    ///   WHERE partition_key = $1 AND execution_id = $2`.
+    /// * **SQLite** — `SELECT json_extract(raw_fields, '$.namespace')
+    ///   FROM ff_exec_core WHERE ...`.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    async fn get_execution_namespace(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "get_execution_namespace",
+        })
+    }
+
     /// Read a single namespaced flow tag. Returns `Ok(None)` when
     /// the tag is absent **or** the flow row does not exist (same
     /// collapse semantics as [`Self::get_execution_tag`]). Symmetry
@@ -2035,6 +2062,132 @@ pub trait EngineBackend: Send + Sync + 'static {
         Err(EngineError::Unavailable {
             op: "subscribe_instance_tags",
         })
+    }
+
+    // ── PR-7b Cluster 1 — Foundation scanner operations ─────────
+    //
+    // Per-execution write hooks invoked by the engine scanner loop.
+    // Scanner bodies discover candidate executions via partition
+    // indices (Valkey ZSETs / PG index scans) and, for each candidate,
+    // call through to one of the methods below to perform the atomic
+    // state-flip. Defaults return `EngineError::Unavailable { op }`;
+    // Valkey impls wrap the corresponding `ff_*` FCALL; Postgres impls
+    // run a single-row tx mirroring the Lua semantic.
+
+    /// Lease-expiry scanner hook — mark an expired lease as reclaimable
+    /// so another worker can redeem the execution. Atomic per call.
+    ///
+    /// Valkey: `FCALL ff_mark_lease_expired_if_due`.
+    /// Postgres: single-row tx on `ff_attempt` + `ff_exec_core` (see
+    /// `ff_backend_postgres::reconcilers::lease_expiry`).
+    async fn mark_lease_expired_if_due(
+        &self,
+        _partition: crate::partition::Partition,
+        _execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "mark_lease_expired_if_due",
+        })
+    }
+
+    /// Delayed-promoter scanner hook — promote a delayed execution to
+    /// `eligible_now` once its `delay_until` has passed.
+    ///
+    /// Valkey: `FCALL ff_promote_delayed`.
+    /// Postgres: Wave 9 schema scope (no current impl).
+    async fn promote_delayed(
+        &self,
+        _partition: crate::partition::Partition,
+        _lane: &LaneId,
+        _execution_id: &ExecutionId,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "promote_delayed",
+        })
+    }
+
+    /// Pending-waitpoint-expiry scanner hook — close a pending
+    /// waitpoint whose deadline has passed (wake the suspended
+    /// execution with a timeout signal).
+    ///
+    /// Valkey: `FCALL ff_close_waitpoint`.
+    /// Postgres: Wave 9 schema scope (no current impl).
+    async fn close_waitpoint(
+        &self,
+        _partition: crate::partition::Partition,
+        _execution_id: &ExecutionId,
+        _waitpoint_id: &str,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "close_waitpoint",
+        })
+    }
+
+    /// Shared hook for the attempt-timeout and execution-deadline
+    /// scanners — terminate or retry an execution whose wall-clock
+    /// budget has elapsed. `phase` discriminates which of the two
+    /// scanner paths is calling so the backend can preserve diagnostic
+    /// breadcrumbs without forking the surface.
+    ///
+    /// Valkey: `FCALL ff_expire_execution` (with `phase` passed through
+    /// as an ARGV discriminator).
+    /// Postgres: single-row tx mirror of the Lua semantic for
+    /// `AttemptTimeout`; `ExecutionDeadline` is Wave 9 schema scope.
+    async fn expire_execution(
+        &self,
+        _partition: crate::partition::Partition,
+        _execution_id: &ExecutionId,
+        _phase: ExpirePhase,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "expire_execution",
+        })
+    }
+
+    /// Suspension-timeout scanner hook — expire a suspended execution
+    /// whose suspension deadline has passed (wake with timeout).
+    ///
+    /// Valkey: `FCALL ff_expire_suspension`.
+    /// Postgres: single-row tx on `ff_suspend` + `ff_exec_core`.
+    async fn expire_suspension(
+        &self,
+        _partition: crate::partition::Partition,
+        _execution_id: &ExecutionId,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "expire_suspension",
+        })
+    }
+}
+
+/// Which scanner invoked [`EngineBackend::expire_execution`].
+///
+/// The attempt-timeout and execution-deadline scanners share a single
+/// trait method — their underlying state flip is identical (terminate
+/// or retry per retry policy); the distinction is purely diagnostic
+/// (which deadline elapsed) and carried through to the backend so the
+/// same Lua / SQL path can log or tag appropriately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpirePhase {
+    /// Invoked by `attempt_timeout` scanner — the per-attempt
+    /// wall-clock budget elapsed.
+    AttemptTimeout,
+    /// Invoked by `execution_deadline` scanner — the whole-execution
+    /// wall-clock deadline elapsed.
+    ExecutionDeadline,
+}
+
+impl ExpirePhase {
+    /// Short string tag suitable for Lua ARGV or Postgres breadcrumbs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AttemptTimeout => "attempt_timeout",
+            Self::ExecutionDeadline => "execution_deadline",
+        }
     }
 }
 

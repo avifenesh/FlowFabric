@@ -68,11 +68,11 @@ use ff_core::contracts::{
 };
 #[cfg(feature = "streaming")]
 use ff_core::contracts::{StreamCursor, StreamFrames};
-use ff_core::engine_backend::EngineBackend;
+use ff_core::engine_backend::{EngineBackend, ExpirePhase};
 use ff_core::engine_error::EngineError;
 #[cfg(feature = "core")]
 use ff_core::partition::PartitionKey;
-use ff_core::partition::PartitionConfig;
+use ff_core::partition::{Partition, PartitionConfig};
 #[cfg(feature = "streaming")]
 use ff_core::types::AttemptIndex;
 #[cfg(feature = "core")]
@@ -678,6 +678,14 @@ impl EngineBackend for PostgresBackend {
     ) -> Result<Option<String>, EngineError> {
         ff_core::engine_backend::validate_tag_key(key)?;
         flow::get_flow_tag_impl(&self.pool, &self.partition_config, flow_id, key).await
+    }
+
+    #[tracing::instrument(name = "pg.get_execution_namespace", skip_all)]
+    async fn get_execution_namespace(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<String>, EngineError> {
+        exec_core::get_execution_namespace_impl(&self.pool, execution_id).await
     }
 
     #[cfg(feature = "core")]
@@ -1364,6 +1372,159 @@ impl EngineBackend for PostgresBackend {
     ) -> Result<ff_core::stream_events::SignalDeliverySubscription, EngineError> {
         signal_delivery_subscribe::subscribe(&self.pool, 0, cursor, filter.clone()).await
     }
+
+    // ── PR-7b Cluster 1 — Foundation scanner operations ─────────
+    //
+    // Per-execution wrappers around the reconcilers in
+    // `crate::reconcilers::*`. Each reconciler exposes a
+    // `*_for_execution` / `*_for_*` helper mirroring the batch
+    // `scan_tick` path's per-row tx logic so the engine-side scanner
+    // trait-dispatch and the batch reconciler share one SQL code
+    // path.
+    //
+    // All 5 scanner-op methods run real SQL on Postgres; both phases
+    // of `expire_execution` (`AttemptTimeout` + `ExecutionDeadline`)
+    // are covered. The Wave-9-minimal delivery (this commit) adds
+    // `delayed_promoter`, `pending_wp_expiry`, and
+    // `execution_deadline` reconcilers on top of the Wave 6c
+    // reconcilers shipped with PR-7b/1.
+    //
+    // Gated on `core` because `reconcilers` (and its `dispatch` dep)
+    // require `core`. Without `core` the trait defaults return
+    // `EngineError::Unavailable`, preserving behavioural parity with
+    // other feature-stripped callsites.
+
+    #[cfg(feature = "core")]
+    async fn mark_lease_expired_if_due(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
+        reconcilers::lease_expiry::release_for_execution(&self.pool, partition_key, exec_uuid)
+            .await
+    }
+
+    #[cfg(feature = "core")]
+    async fn promote_delayed(
+        &self,
+        partition: Partition,
+        _lane: &LaneId,
+        execution_id: &ExecutionId,
+        now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
+        // `lane` is ignored: lane is authoritative on `ff_exec_core`
+        // already (it was used only to locate the Valkey ZSET). The
+        // candidate selection in `promote_for_execution` re-checks
+        // the (lifecycle_phase, eligibility_state, deadline_at_ms)
+        // tuple that `attempt::delay()` writes.
+        reconcilers::delayed_promoter::promote_for_execution(
+            &self.pool,
+            partition_key,
+            exec_uuid,
+            now_ms.0,
+        )
+        .await
+    }
+
+    #[cfg(feature = "core")]
+    async fn close_waitpoint(
+        &self,
+        partition: Partition,
+        _execution_id: &ExecutionId,
+        waitpoint_id: &str,
+        now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        // The scanner resolves (waitpoint_id → owning execution_id)
+        // separately for filter application; the close action itself
+        // only needs the waitpoint row (which carries `execution_id`
+        // + `waitpoint_key`). Partition is authoritative from the
+        // caller.
+        let partition_key = partition_index_to_i16(partition)?;
+        let waitpoint_uuid = uuid::Uuid::parse_str(waitpoint_id).map_err(|e| {
+            EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: format!("waitpoint_id not a UUID: {e}"),
+            }
+        })?;
+        reconcilers::pending_wp_expiry::close_for_execution(
+            &self.pool,
+            partition_key,
+            waitpoint_uuid,
+            now_ms.0,
+        )
+        .await
+    }
+
+    #[cfg(feature = "core")]
+    async fn expire_execution(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+        phase: ExpirePhase,
+        now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
+        match phase {
+            ExpirePhase::AttemptTimeout => {
+                reconcilers::attempt_timeout::expire_for_execution(
+                    &self.pool,
+                    partition_key,
+                    exec_uuid,
+                )
+                .await
+            }
+            ExpirePhase::ExecutionDeadline => {
+                reconcilers::execution_deadline::expire_for_execution(
+                    &self.pool,
+                    partition_key,
+                    exec_uuid,
+                    now_ms.0,
+                )
+                .await
+            }
+        }
+    }
+
+    #[cfg(feature = "core")]
+    async fn expire_suspension(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let (_pk_from_eid, exec_uuid) = attempt::split_exec_id(execution_id)?;
+        let partition_key = partition_index_to_i16(partition)?;
+        reconcilers::suspension_timeout::expire_for_execution(
+            &self.pool,
+            partition_key,
+            exec_uuid,
+        )
+        .await
+    }
+}
+
+/// Narrow a `Partition`'s `u16` index into the `i16` the Postgres
+/// schema uses as its partition-key column. FlowFabric partitions
+/// max out well below `i16::MAX` in practice (production deployments
+/// run a few hundred partitions per family), but the conversion is
+/// still fallible at the type level. Surface overflow as
+/// `ValidationKind::InvalidInput` rather than silently substituting a
+/// fallback — a silently mis-routed reconciler would
+/// corrupt-by-omission without diagnostics.
+fn partition_index_to_i16(partition: Partition) -> Result<i16, EngineError> {
+    i16::try_from(partition.index).map_err(|_| EngineError::Validation {
+        kind: ff_core::engine_error::ValidationKind::InvalidInput,
+        detail: format!(
+            "partition index {} exceeds i16 range (max {})",
+            partition.index,
+            i16::MAX
+        ),
+    })
 }
 
 /// Minimum recommended `max_locks_per_transaction`. Partition-heavy
@@ -1447,5 +1608,46 @@ mod max_locks_tests {
     #[test]
     fn silent_for_unparseable_raw() {
         assert_eq!(max_locks_warn_value("not-a-number"), None);
+    }
+}
+
+#[cfg(test)]
+mod partition_index_tests {
+    use super::partition_index_to_i16;
+    use ff_core::engine_error::{EngineError, ValidationKind};
+    use ff_core::partition::{Partition, PartitionFamily};
+
+    #[test]
+    fn accepts_values_within_i16_range() {
+        let p = Partition { family: PartitionFamily::Flow, index: 0 };
+        assert_eq!(partition_index_to_i16(p).unwrap(), 0);
+
+        let p = Partition { family: PartitionFamily::Flow, index: 255 };
+        assert_eq!(partition_index_to_i16(p).unwrap(), 255);
+
+        let p = Partition { family: PartitionFamily::Budget, index: i16::MAX as u16 };
+        assert_eq!(partition_index_to_i16(p).unwrap(), i16::MAX);
+    }
+
+    #[test]
+    fn rejects_overflow_above_i16_max() {
+        let p = Partition { family: PartitionFamily::Flow, index: (i16::MAX as u16) + 1 };
+        let err = partition_index_to_i16(p).unwrap_err();
+        match err {
+            EngineError::Validation { kind, detail } => {
+                assert_eq!(kind, ValidationKind::InvalidInput);
+                assert!(detail.contains("exceeds i16 range"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_u16_max() {
+        let p = Partition { family: PartitionFamily::Quota, index: u16::MAX };
+        assert!(matches!(
+            partition_index_to_i16(p),
+            Err(EngineError::Validation { kind: ValidationKind::InvalidInput, .. })
+        ));
     }
 }
