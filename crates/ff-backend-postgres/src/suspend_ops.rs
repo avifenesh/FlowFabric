@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ff_core::backend::{BackendTag, Handle, HandleKind, HandleOpaque, ResumeSignal, WaitpointHmac};
+use ff_core::backend::{
+    BackendTag, Handle, HandleKind, HandleOpaque, PendingWaitpoint, ResumeSignal, WaitpointHmac,
+};
 use ff_core::contracts::{
     AdditionalWaitpointBinding, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
     ClaimedResumedExecution, CompositeBody, DeliverSignalArgs, DeliverSignalResult,
@@ -673,6 +675,88 @@ async fn suspend_core(
         })
     })
     .await
+}
+
+// ─── create_waitpoint ────────────────────────────────────────────────────
+
+/// Cairn #435 — caller-initiated waitpoint creation. Mints a fresh
+/// `WaitpointId`, signs a token under the active HMAC kid, and INSERTs
+/// a `pending` row into `ff_waitpoint_pending`. Mirrors
+/// `ff-backend-sqlite`'s `create_waitpoint_impl` + Valkey's
+/// `ff_create_pending_waitpoint` Lua: state stays `'pending'` (no
+/// activation — only `suspend` flips a waitpoint to `'active'`),
+/// `required_signal_names` is empty (wildcard wire marker), and the
+/// token is bound to `"{execution_id}:{waitpoint_id}"` so the
+/// pre-existing `deliver_signal` verify path accepts it unchanged.
+///
+/// Not idempotent by `waitpoint_key` — every call mints a fresh
+/// `WaitpointId`, matching both reference backends. Two calls with
+/// the same key produce two distinct waitpoints.
+pub(crate) async fn create_waitpoint_impl(
+    pool: &PgPool,
+    handle: &Handle,
+    waitpoint_key: &str,
+    expires_in: std::time::Duration,
+) -> Result<PendingWaitpoint, EngineError> {
+    let payload = decode_handle(handle)?;
+    let (part, exec_uuid) = split_exec_id(&payload.execution_id)?;
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+    let kid_row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT kid, secret FROM ff_waitpoint_hmac \
+         WHERE active = TRUE \
+         ORDER BY rotated_at_ms DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+    let (kid, secret) = kid_row.ok_or_else(|| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: "ff_waitpoint_hmac empty — seed a kid before create_waitpoint".into(),
+    })?;
+
+    let wp_id = WaitpointId::new();
+    let wp_u = wp_uuid(&wp_id)?;
+    let now = now_ms();
+    // Clamp oversized `expires_in` to match the other backends:
+    //   * `ff-backend-sqlite::create_waitpoint_impl` uses
+    //     `i64::try_from(...).unwrap_or(i64::MAX)` + `saturating_add`.
+    //   * `ff-backend-valkey` / `ff_create_pending_waitpoint` Lua casts
+    //     with `as i64`.
+    //
+    // A stricter "overflow => Validation" contract would diverge from
+    // both — that tightening needs a one-shot trait-docs + all-three-
+    // backends change, not a PG-only fork. Keep parity until then.
+    let expires_ms = i64::try_from(expires_in.as_millis()).unwrap_or(i64::MAX);
+    let expires_at = now.saturating_add(expires_ms);
+    let msg = format!("{}:{}", payload.execution_id, wp_id);
+    let token = hmac_sign(&secret, &kid, msg.as_bytes());
+
+    // State stays 'pending' — only the suspend path activates. Empty
+    // `required_signal_names` is the wildcard-wire marker per the
+    // `PendingWaitpointInfo` contract.
+    sqlx::query(
+        "INSERT INTO ff_waitpoint_pending \
+           (partition_key, waitpoint_id, execution_id, token_kid, token, \
+            created_at_ms, expires_at_ms, waitpoint_key, state, required_signal_names) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', '{}')",
+    )
+    .bind(part)
+    .bind(wp_u)
+    .bind(exec_uuid)
+    .bind(&kid)
+    .bind(&token)
+    .bind(now)
+    .bind(expires_at)
+    .bind(waitpoint_key)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+
+    Ok(PendingWaitpoint::new(wp_id, WaitpointHmac::new(token)))
 }
 
 // ─── deliver_signal ──────────────────────────────────────────────────────
