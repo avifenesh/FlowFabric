@@ -1380,7 +1380,13 @@ impl EngineBackend for PostgresBackend {
     // `delayed_promoter`, `pending_wp_expiry`, and
     // `execution_deadline` reconcilers on top of the Wave 6c
     // reconcilers shipped with PR-7b/1.
+    //
+    // Gated on `core` because `reconcilers` (and its `dispatch` dep)
+    // require `core`. Without `core` the trait defaults return
+    // `EngineError::Unavailable`, preserving behavioural parity with
+    // other feature-stripped callsites.
 
+    #[cfg(feature = "core")]
     async fn mark_lease_expired_if_due(
         &self,
         partition: Partition,
@@ -1392,6 +1398,7 @@ impl EngineBackend for PostgresBackend {
             .await
     }
 
+    #[cfg(feature = "core")]
     async fn promote_delayed(
         &self,
         partition: Partition,
@@ -1415,6 +1422,7 @@ impl EngineBackend for PostgresBackend {
         .await
     }
 
+    #[cfg(feature = "core")]
     async fn close_waitpoint(
         &self,
         partition: Partition,
@@ -1443,6 +1451,7 @@ impl EngineBackend for PostgresBackend {
         .await
     }
 
+    #[cfg(feature = "core")]
     async fn expire_execution(
         &self,
         partition: Partition,
@@ -1473,6 +1482,7 @@ impl EngineBackend for PostgresBackend {
         }
     }
 
+    #[cfg(feature = "core")]
     async fn expire_suspension(
         &self,
         partition: Partition,
