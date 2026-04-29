@@ -2796,6 +2796,13 @@ impl EngineBackend for SqliteBackend {
         crate::reads::get_flow_tag_impl(&self.inner.pool, flow_id, key).await
     }
 
+    async fn get_execution_namespace(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<String>, EngineError> {
+        crate::reads::get_execution_namespace_impl(&self.inner.pool, execution_id).await
+    }
+
     #[cfg(feature = "core")]
     async fn list_edges(
         &self,

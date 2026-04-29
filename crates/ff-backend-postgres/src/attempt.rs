@@ -64,7 +64,7 @@ fn now_ms() -> i64 {
 
 /// Extract `(partition_index, uuid)` from an `ExecutionId` formatted
 /// `{fp:N}:<uuid>`.
-fn split_exec_id(eid: &ExecutionId) -> Result<(i16, Uuid), EngineError> {
+pub(crate) fn split_exec_id(eid: &ExecutionId) -> Result<(i16, Uuid), EngineError> {
     let s = eid.as_str();
     let rest = s.strip_prefix("{fp:").ok_or_else(|| EngineError::Validation {
         kind: ff_core::engine_error::ValidationKind::InvalidInput,

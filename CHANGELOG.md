@@ -7,6 +7,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **PR-7b Cluster 1: foundation scanner operations on `EngineBackend`
+  (cairn #436).** Five new trait methods + `ExpirePhase` enum on
+  `ff_core::engine_backend::EngineBackend` for the six simple-expiry
+  scanners: `mark_lease_expired_if_due`, `promote_delayed`,
+  `close_waitpoint`, `expire_execution(phase: ExpirePhase)` (shared
+  between attempt-timeout and execution-deadline scanners), and
+  `expire_suspension`. Valkey impl wraps the existing
+  `ff_mark_lease_expired_if_due` / `ff_promote_delayed` /
+  `ff_close_waitpoint` / `ff_expire_execution` / `ff_expire_suspension`
+  FCALLs; Postgres wires `mark_lease_expired_if_due`,
+  `expire_execution(AttemptTimeout)`, and `expire_suspension` to
+  per-row helpers extracted from the existing batch reconcilers in
+  `ff_backend_postgres::reconcilers::*` (`promote_delayed`,
+  `close_waitpoint`, and `expire_execution(ExecutionDeadline)` remain
+  at the `EngineError::Unavailable` default — RFC-020 Wave 9 schema
+  scope); SQLite stays on the trait defaults (per RFC-023 §4.1 the
+  SQLite backend hosts its own reconciler supervisor, not the
+  engine's scanner loop). `scanner::should_skip_candidate` dispatches
+  the namespace check through a new
+  `EngineBackend::get_execution_namespace` single-field point-read
+  trait method (preserves the 1-HGET cost contract), and the tag
+  check through `EngineBackend::get_execution_tag`. Engine-side:
+  each of the 11 scanners that use `should_skip_candidate` grew a
+  `backend: Option<Arc<dyn EngineBackend>>` field plus a
+  `with_filter_and_backend(..)` constructor; the 6 Cluster-1 scanner
+  bodies route their operation FCALL through the trait when a
+  backend is wired. Unblocks PR-7b Clusters 2 + 3 (reconcilers +
+  cancel-family) to land in parallel.
 - **`EngineBackend` service-layer typed FCALL surface (cairn #389).**
   Six new trait methods let control-plane consumers (cairn et al.)
   dispatch against `(execution_id, fence)` tuples instead of requiring

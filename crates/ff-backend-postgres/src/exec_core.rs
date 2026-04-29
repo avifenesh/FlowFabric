@@ -1151,3 +1151,31 @@ pub(super) async fn get_execution_tag_impl(
 
     Ok(row.and_then(|(tag,)| tag))
 }
+
+/// Point-read of `raw_fields->>'namespace'`. `Ok(None)` covers
+/// missing-namespace and missing-execution alike (matches
+/// `get_execution_tag_impl`). Used by the scanner per-candidate
+/// filter — preserves the 1-point-read cost contract vs the heavier
+/// `describe_execution` full-snapshot read.
+pub(super) async fn get_execution_namespace_impl(
+    pool: &PgPool,
+    id: &ExecutionId,
+) -> Result<Option<String>, EngineError> {
+    let partition_key: i16 = id.partition() as i16;
+    let execution_id = eid_uuid(id);
+
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT raw_fields->>'namespace'
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    Ok(row.and_then(|(ns,)| ns))
+}

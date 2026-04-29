@@ -11,12 +11,14 @@
 //!
 //! Reference: RFC-010 §6, function #27
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
-use ff_core::types::LaneId;
+use ff_core::types::{ExecutionId, LaneId, TimestampMs};
 
 use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
@@ -28,6 +30,9 @@ pub struct DelayedPromoter {
     lanes: Vec<LaneId>,
     failures: FailureTracker,
     filter: ScannerFilter,
+    /// PR-7b Cluster 1: trait-dispatch target. See
+    /// [`super::lease_expiry::LeaseExpiryScanner::backend`] rustdoc.
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl DelayedPromoter {
@@ -43,6 +48,23 @@ impl DelayedPromoter {
             lanes,
             failures: FailureTracker::new(),
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for trait-routed FCALLs.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        lanes: Vec<LaneId>,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            lanes,
+            failures: FailureTracker::new(),
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -124,21 +146,29 @@ impl Scanner for DelayedPromoter {
                 if self.failures.should_skip(eid_str) {
                     continue;
                 }
-                if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+                if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, eid_str).await {
                     continue;
                 }
 
-                let exec_core = format!("ff:exec:{}:{}:core", p.hash_tag(), eid_str);
-                let keys: [&str; 3] = [&exec_core, &delayed_key, &eligible_key];
-                let now_str = now_ms.to_string();
-                let argv: [&str; 2] = [eid_str.as_str(), &now_str];
-
-                match client.fcall::<ferriskey::Value>(
-                    "ff_promote_delayed",
-                    &keys,
-                    &argv,
-                ).await {
-                    Ok(_) => {
+                let res = if let Some(ref backend) = self.backend {
+                    let Ok(eid) = ExecutionId::parse(eid_str) else { tracing::warn!(execution_id=%eid_str, "malformed eid; skipping"); continue; };
+                    backend
+                        .promote_delayed(p, lane, &eid, TimestampMs(now_ms as i64))
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    let exec_core = format!("ff:exec:{}:{}:core", p.hash_tag(), eid_str);
+                    let keys: [&str; 3] = [&exec_core, &delayed_key, &eligible_key];
+                    let now_str = now_ms.to_string();
+                    let argv: [&str; 2] = [eid_str.as_str(), &now_str];
+                    client
+                        .fcall::<ferriskey::Value>("ff_promote_delayed", &keys, &argv)
+                        .await
+                        .map(|_: ferriskey::Value| ())
+                        .map_err(|e| e.to_string())
+                };
+                match res {
+                    Ok(()) => {
                         self.failures.record_success(eid_str);
                         total_processed += 1;
                     }
@@ -148,7 +178,7 @@ impl Scanner for DelayedPromoter {
                             execution_id = eid_str.as_str(),
                             lane = %lane,
                             error = %e,
-                            "delayed_promoter: ff_promote_delayed failed"
+                            "delayed_promoter: promote_delayed failed"
                         );
                         self.failures.record_failure(eid_str, "delayed_promoter");
                         total_errors += 1;

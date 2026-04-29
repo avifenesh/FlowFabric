@@ -98,6 +98,11 @@ fn full_eid(bare_uuid: &str) -> String {
 #[tokio::test]
 async fn scanner_namespace_filter_isolates_candidates() {
     let client = build_client().await;
+    // PR-7b Cluster 1: `should_skip_candidate` now dispatches through
+    // `EngineBackend` (via `describe_execution` / `get_execution_tag`),
+    // not raw `ferriskey::Client` HGETs.
+    let be: std::sync::Arc<dyn ff_core::engine_backend::EngineBackend> =
+        backend().await;
 
     // Full execution-id strings matching production shape.
     let alpha_eid = full_eid("11111111-1111-1111-1111-111111111111");
@@ -130,26 +135,26 @@ async fn scanner_namespace_filter_isolates_candidates() {
 
     // Each filter must admit its own candidate and reject the other.
     assert!(
-        !should_skip_candidate(&client, &alpha_filter, PARTITION, &alpha_eid).await,
+        !should_skip_candidate(Some(&be), &alpha_filter, PARTITION, &alpha_eid).await,
         "alpha filter must admit alpha candidate"
     );
     assert!(
-        should_skip_candidate(&client, &alpha_filter, PARTITION, &beta_eid).await,
+        should_skip_candidate(Some(&be), &alpha_filter, PARTITION, &beta_eid).await,
         "alpha filter must reject beta candidate"
     );
     assert!(
-        !should_skip_candidate(&client, &beta_filter, PARTITION, &beta_eid).await,
+        !should_skip_candidate(Some(&be), &beta_filter, PARTITION, &beta_eid).await,
         "beta filter must admit beta candidate"
     );
     assert!(
-        should_skip_candidate(&client, &beta_filter, PARTITION, &alpha_eid).await,
+        should_skip_candidate(Some(&be), &beta_filter, PARTITION, &alpha_eid).await,
         "beta filter must reject alpha candidate"
     );
 
     // A no-op filter admits both — confirms the short-circuit path.
     let noop = ScannerFilter::default();
-    assert!(!should_skip_candidate(&client, &noop, PARTITION, &alpha_eid).await);
-    assert!(!should_skip_candidate(&client, &noop, PARTITION, &beta_eid).await);
+    assert!(!should_skip_candidate(Some(&be), &noop, PARTITION, &alpha_eid).await);
+    assert!(!should_skip_candidate(Some(&be), &noop, PARTITION, &beta_eid).await);
 
     // Cleanup.
     let _: i64 = client

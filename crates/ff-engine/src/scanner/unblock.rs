@@ -29,6 +29,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Mutex as AsyncMutex;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition};
 use ff_core::types::{BudgetId, LaneId};
@@ -69,6 +70,7 @@ pub struct UnblockScanner {
     /// cadence (one partition at a time per scanner task), so the mutex
     /// is effectively uncontended in steady state.
     caps_cache: Arc<AsyncMutex<CapsUnionCache>>,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 /// Worker-caps union snapshot with a monotonic freshness timestamp.
@@ -103,6 +105,30 @@ impl UnblockScanner {
                 fetched_at: None,
                 ttl: interval,
             })),
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for filter-resolution
+    /// reads. FCALL routing is cluster 2 scope.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        lanes: Vec<LaneId>,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            lanes,
+            partition_config,
+            filter,
+            caps_cache: Arc::new(AsyncMutex::new(CapsUnionCache {
+                snapshot: None,
+                fetched_at: None,
+                ttl: interval,
+            })),
+            backend: Some(backend),
         }
     }
 }
@@ -151,7 +177,7 @@ impl Scanner for UnblockScanner {
             // Scan blocked:budget
             let budget_key = idx.lane_blocked_budget(lane);
             let r = scan_blocked_set(
-                client, &p, &idx, lane, &budget_key,
+                client, self.backend.as_ref(), &p, &idx, lane, &budget_key,
                 "waiting_for_budget", &mut budget_cache,
                 &caps_cache,
                 &self.partition_config,
@@ -163,7 +189,7 @@ impl Scanner for UnblockScanner {
             // Scan blocked:quota
             let quota_key = idx.lane_blocked_quota(lane);
             let r = scan_blocked_set(
-                client, &p, &idx, lane, &quota_key,
+                client, self.backend.as_ref(), &p, &idx, lane, &quota_key,
                 "waiting_for_quota", &mut budget_cache,
                 &caps_cache,
                 &self.partition_config,
@@ -177,7 +203,7 @@ impl Scanner for UnblockScanner {
             // checks subset coverage. See check_route_cleared below.
             let route_key = idx.lane_blocked_route(lane);
             let r = scan_blocked_set(
-                client, &p, &idx, lane, &route_key,
+                client, self.backend.as_ref(), &p, &idx, lane, &route_key,
                 "waiting_for_capable_worker", &mut budget_cache,
                 &caps_cache,
                 &self.partition_config,
@@ -198,6 +224,7 @@ impl Scanner for UnblockScanner {
 #[allow(clippy::too_many_arguments)]
 async fn scan_blocked_set(
     client: &ferriskey::Client,
+    backend: Option<&Arc<dyn EngineBackend>>,
     partition: &Partition,
     idx: &IndexKeys,
     lane: &LaneId,
@@ -240,7 +267,7 @@ async fn scan_blocked_set(
     let tag = partition.hash_tag();
 
     for eid_str in &blocked {
-        if should_skip_candidate(client, filter, partition.index, eid_str).await {
+        if should_skip_candidate(backend, filter, partition.index, eid_str).await {
             continue;
         }
         // Read blocking_reason from exec_core to confirm still blocked

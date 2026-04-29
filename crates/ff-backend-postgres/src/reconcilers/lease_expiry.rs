@@ -97,6 +97,55 @@ pub async fn scan_tick(
     Ok(report)
 }
 
+/// Per-execution lease-release action. Exposed so the
+/// `EngineBackend::mark_lease_expired_if_due` trait dispatch
+/// (PR-7b Cluster 1) can invoke the same per-row tx logic as
+/// `scan_tick` without requiring a full partition scan.
+///
+/// `attempt_index` is discovered inside: the caller supplies only
+/// `(partition_key, exec_uuid)` and this helper looks up the
+/// current attempt. Silently no-ops when the lease is no longer
+/// expired (re-validated under `FOR UPDATE`).
+pub async fn release_for_execution(
+    pool: &PgPool,
+    partition_key: i16,
+    exec_uuid: uuid::Uuid,
+) -> Result<(), EngineError> {
+    let now_ms: i64 = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+
+    // Find the current attempt-with-lease for this execution. The
+    // scan_tick batch path orders by lease_expires_at_ms; here we
+    // only have one (execution, attempt) of interest — the attempt
+    // whose lease is holding the reclaim index entry.
+    let row = sqlx::query(
+        r#"
+        SELECT attempt_index
+          FROM ff_attempt
+         WHERE partition_key = $1
+           AND execution_id = $2
+           AND lease_expires_at_ms IS NOT NULL
+           AND lease_expires_at_ms < $3
+         ORDER BY lease_expires_at_ms ASC
+         LIMIT 1
+        "#,
+    )
+    .bind(partition_key)
+    .bind(exec_uuid)
+    .bind(now_ms)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    let Some(row) = row else { return Ok(()) };
+    let attempt_index: i32 = row.try_get("attempt_index").map_err(map_sqlx_error)?;
+    release_one(pool, partition_key, exec_uuid, attempt_index, now_ms).await
+}
+
 async fn release_one(
     pool: &PgPool,
     partition_key: i16,

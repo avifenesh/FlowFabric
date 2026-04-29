@@ -56,7 +56,7 @@ use ff_core::contracts::{
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
-use ff_core::engine_backend::EngineBackend;
+use ff_core::engine_backend::{EngineBackend, ExpirePhase};
 use ff_core::engine_error::EngineError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
@@ -1381,6 +1381,26 @@ async fn get_execution_tag_impl(
         .cmd("HGET")
         .arg(ctx.tags())
         .arg(key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    Ok(raw)
+}
+
+/// `HGET :core namespace` on the execution's partition. `Ok(None)`
+/// for absent field or absent hash (see `get_execution_tag_impl`
+/// rationale).
+async fn get_execution_namespace_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    execution_id: &ExecutionId,
+) -> Result<Option<String>, EngineError> {
+    let partition = execution_partition(execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, execution_id);
+    let raw: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("namespace")
         .execute()
         .await
         .map_err(transport_fk)?;
@@ -5416,6 +5436,20 @@ impl EngineBackend for ValkeyBackend {
             })
     }
 
+    async fn get_execution_namespace(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Option<String>, EngineError> {
+        get_execution_namespace_impl(&self.client, &self.partition_config, execution_id)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "get_execution_namespace: HGET :core namespace",
+                )
+            })
+    }
+
     async fn list_edges(
         &self,
         flow_id: &FlowId,
@@ -7888,6 +7922,237 @@ impl EngineBackend for ValkeyBackend {
             inner,
             disconnected_emitted: false,
         }))
+    }
+
+    // ── PR-7b Cluster 1 — Foundation scanner operations ─────────
+    //
+    // Thin wrappers around the existing scanner FCALLs. The per-
+    // candidate key-formatting + pre-read logic mirrors what the
+    // scanner bodies computed inline pre-PR-7b; moving it onto the
+    // backend lets scanners dispatch through `EngineBackend` instead
+    // of reaching for `ferriskey::Client` directly.
+
+    async fn mark_lease_expired_if_due(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        let tag = partition.hash_tag();
+        let eid_str = execution_id.as_str();
+        let idx = IndexKeys::new(&partition);
+        let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
+        let lease_current = format!("ff:exec:{}:{}:lease:current", tag, eid_str);
+        let lease_history = format!("ff:exec:{}:{}:lease:history", tag, eid_str);
+        let lease_expiry = idx.lease_expiry();
+        let keys: [&str; 4] = [&exec_core, &lease_current, &lease_expiry, &lease_history];
+        let argv: [&str; 1] = [eid_str];
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_mark_lease_expired_if_due", &keys, &argv)
+            .await
+            .map_err(transport_fk)?;
+        Ok(())
+    }
+
+    async fn promote_delayed(
+        &self,
+        partition: Partition,
+        lane: &LaneId,
+        execution_id: &ExecutionId,
+        now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let tag = partition.hash_tag();
+        let eid_str = execution_id.as_str();
+        let idx = IndexKeys::new(&partition);
+        let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
+        let delayed_zset = idx.lane_delayed(lane);
+        let eligible_zset = idx.lane_eligible(lane);
+        let keys: [&str; 3] = [&exec_core, &delayed_zset, &eligible_zset];
+        let now_str = now_ms.0.to_string();
+        let argv: [&str; 2] = [eid_str, &now_str];
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_promote_delayed", &keys, &argv)
+            .await
+            .map_err(transport_fk)?;
+        Ok(())
+    }
+
+    async fn close_waitpoint(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+        waitpoint_id: &str,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let tag = partition.hash_tag();
+        let eid_str = execution_id.as_str();
+        let idx = IndexKeys::new(&partition);
+        let waitpoint_hash = format!("ff:wp:{}:{}", tag, waitpoint_id);
+        let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
+        let pending_wp_expiry = idx.pending_waitpoint_expiry();
+        let keys: [&str; 3] = [&exec_core, &waitpoint_hash, &pending_wp_expiry];
+        let argv: [&str; 2] = [waitpoint_id, "never_committed"];
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_close_waitpoint", &keys, &argv)
+            .await
+            .map_err(transport_fk)?;
+        Ok(())
+    }
+
+    async fn expire_execution(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+        phase: ExpirePhase,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let tag = partition.hash_tag();
+        let eid_str = execution_id.as_str();
+        let idx = IndexKeys::new(&partition);
+
+        let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
+        let lease_current = format!("ff:exec:{}:{}:lease:current", tag, eid_str);
+        let lease_history = format!("ff:exec:{}:{}:lease:history", tag, eid_str);
+        let susp_current = format!("ff:exec:{}:{}:suspension:current", tag, eid_str);
+
+        // Pre-read lane_id and current_attempt_index from exec_core —
+        // the Lua function needs the real attempt index to find the
+        // correct attempt_hash + stream_meta. Same pattern the
+        // scanner body used pre-trait.
+        let pre_fields: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(&exec_core)
+            .arg("lane_id")
+            .arg("current_attempt_index")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let lane = LaneId::new(
+            pre_fields
+                .first()
+                .and_then(|v| v.as_deref())
+                .unwrap_or("default"),
+        );
+        let att_idx = pre_fields
+            .get(1)
+            .and_then(|v| v.as_deref())
+            .unwrap_or("0");
+
+        let attempt_hash = format!("ff:attempt:{}:{}:{}", tag, eid_str, att_idx);
+        let stream_meta = format!("ff:stream:{}:{}:{}:meta", tag, eid_str, att_idx);
+
+        let lease_expiry = idx.lease_expiry();
+        let worker_leases = idx.worker_leases(&WorkerInstanceId::new(""));
+        let active = idx.lane_active(&lane);
+        let terminal = idx.lane_terminal(&lane);
+        let attempt_timeout = idx.attempt_timeout();
+        let execution_deadline = idx.execution_deadline();
+        let suspended = idx.lane_suspended(&lane);
+        let suspension_timeout = idx.suspension_timeout();
+
+        let keys: [&str; 14] = [
+            &exec_core,
+            &attempt_hash,
+            &stream_meta,
+            &lease_current,
+            &lease_history,
+            &lease_expiry,
+            &worker_leases,
+            &active,
+            &terminal,
+            &attempt_timeout,
+            &execution_deadline,
+            &suspended,
+            &suspension_timeout,
+            &susp_current,
+        ];
+        let argv: [&str; 2] = [eid_str, phase.as_str()];
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_expire_execution", &keys, &argv)
+            .await
+            .map_err(transport_fk)?;
+        Ok(())
+    }
+
+    async fn expire_suspension(
+        &self,
+        partition: Partition,
+        execution_id: &ExecutionId,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        let tag = partition.hash_tag();
+        let eid_str = execution_id.as_str();
+        let idx = IndexKeys::new(&partition);
+
+        let exec_core = format!("ff:exec:{}:{}:core", tag, eid_str);
+        let suspension_current = format!("ff:exec:{}:{}:suspension:current", tag, eid_str);
+
+        let wp_id: Option<String> = self
+            .client
+            .cmd("HGET")
+            .arg(&exec_core)
+            .arg("current_waitpoint_id")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let att_idx: Option<String> = self
+            .client
+            .cmd("HGET")
+            .arg(&exec_core)
+            .arg("current_attempt_index")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let lane: Option<String> = self
+            .client
+            .cmd("HGET")
+            .arg(&exec_core)
+            .arg("lane_id")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+
+        let wp_id = wp_id.unwrap_or_default();
+        let att_idx = att_idx.unwrap_or_else(|| "0".to_string());
+        let lane_str = lane.unwrap_or_else(|| "default".to_string());
+        let lane_id = LaneId::new(&lane_str);
+
+        let waitpoint_hash = format!("ff:wp:{}:{}", tag, wp_id);
+        let wp_condition = format!("ff:wp:{}:{}:condition", tag, wp_id);
+        let attempt_hash = format!("ff:attempt:{}:{}:{}", tag, eid_str, att_idx);
+        let stream_meta = format!("ff:stream:{}:{}:{}:meta", tag, eid_str, att_idx);
+        let suspension_timeout = idx.suspension_timeout();
+        let suspended_zset = idx.lane_suspended(&lane_id);
+        let terminal_zset = idx.lane_terminal(&lane_id);
+        let eligible_zset = idx.lane_eligible(&lane_id);
+        let delayed_zset = idx.lane_delayed(&lane_id);
+        let lease_history = format!("ff:exec:{}:{}:lease:history", tag, eid_str);
+
+        let keys: [&str; 12] = [
+            &exec_core,
+            &suspension_current,
+            &waitpoint_hash,
+            &wp_condition,
+            &attempt_hash,
+            &stream_meta,
+            &suspension_timeout,
+            &suspended_zset,
+            &terminal_zset,
+            &eligible_zset,
+            &delayed_zset,
+            &lease_history,
+        ];
+        let argv: [&str; 1] = [eid_str];
+        let _: ferriskey::Value = self
+            .client
+            .fcall("ff_expire_suspension", &keys, &argv)
+            .await
+            .map_err(transport_fk)?;
+        Ok(())
     }
 }
 

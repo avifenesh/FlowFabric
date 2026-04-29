@@ -7,12 +7,14 @@
 //!
 //! Reference: RFC-010 §6, function #29c
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::{EngineBackend, ExpirePhase};
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
-use ff_core::types::LaneId;
+use ff_core::types::{ExecutionId, LaneId, TimestampMs};
 
 use super::{should_skip_candidate, FailureTracker, ScanResult, Scanner};
 
@@ -38,6 +40,7 @@ pub struct AttemptTimeoutScanner {
     interval: Duration,
     failures: FailureTracker,
     filter: ScannerFilter,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl AttemptTimeoutScanner {
@@ -56,6 +59,22 @@ impl AttemptTimeoutScanner {
             interval,
             failures: FailureTracker::new(),
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 1: wire an `EngineBackend` for trait-routed FCALLs.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        _lanes: Vec<LaneId>,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            failures: FailureTracker::new(),
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -127,11 +146,22 @@ impl Scanner for AttemptTimeoutScanner {
             if self.failures.should_skip(eid_str) {
                 continue;
             }
-            if should_skip_candidate(client, &self.filter, partition, eid_str).await {
+            if should_skip_candidate(self.backend.as_ref(), &self.filter, partition, eid_str).await {
                 continue;
             }
 
-            match expire_execution_raw(client, &p, &idx, eid_str, "attempt_timeout").await {
+            let res = if let Some(ref backend) = self.backend {
+                let Ok(eid) = ExecutionId::parse(eid_str) else { tracing::warn!(execution_id=%eid_str, "malformed eid; skipping"); continue; };
+                backend
+                    .expire_execution(p, &eid, ExpirePhase::AttemptTimeout, TimestampMs(now_ms as i64))
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                expire_execution_raw(client, &p, &idx, eid_str, "attempt_timeout")
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            match res {
                 Ok(()) => {
                     self.failures.record_success(eid_str);
                     processed += 1;
@@ -141,7 +171,7 @@ impl Scanner for AttemptTimeoutScanner {
                         partition,
                         execution_id = eid_str.as_str(),
                         error = %e,
-                        "attempt_timeout: ff_expire_execution failed"
+                        "attempt_timeout: expire_execution failed"
                     );
                     self.failures.record_failure(eid_str, "attempt_timeout");
                     errors += 1;
