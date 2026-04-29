@@ -541,10 +541,18 @@ pub(crate) async fn set_execution_tag_impl(
     value: &str,
 ) -> Result<(), EngineError> {
     let (part, exec_uuid) = split_exec_id(id)?;
-    // json_set path parameters aren't bindable — splice the key into
-    // the SQL fragment. Pre-validation in `validate_tag_key` limits
-    // `key` to `[a-z0-9_.]`, so there's no SQL-injection surface.
-    let path = format!("$.tags.{key}");
+    // SQLite JSON1 treats unquoted `.` inside a path expression as a
+    // segment separator, so `$.tags.cairn.session_id` would write
+    // `{tags: {cairn: {session_id: v}}}` instead of
+    // `{tags: {"cairn.session_id": v}}`. Quote the key segment so the
+    // full dotted key is a single literal member name — this matches
+    // the canonical flat shape used by Valkey HSET + Postgres
+    // `jsonb_set(..., ARRAY['tags', $key::text], ...)` and mirrors the
+    // pattern already in use in `src/queries/{dispatch,attempt,operator,signal}.rs`
+    // (`$.tags."cairn.instance_id"`). `validate_tag_key` restricts
+    // `key` to `[a-z0-9_.]`, so there's no quote/backslash to escape
+    // and no SQL-injection surface.
+    let path = format!("$.tags.\"{key}\"");
 
     let result = sqlx::query(
         r#"
@@ -577,7 +585,10 @@ pub(crate) async fn set_flow_tag_impl(
 ) -> Result<(), EngineError> {
     let part: i64 = 0;
     let flow_uuid: Uuid = flow_id.0;
-    let path = format!("$.{key}");
+    // Quoted key segment — see `set_execution_tag_impl` for rationale.
+    // Flow tags live at the top level of `raw_fields` (no `tags.`
+    // prefix), matching PG's `extract_tags` projection.
+    let path = format!("$.\"{key}\"");
 
     let result = sqlx::query(
         r#"
@@ -606,7 +617,8 @@ pub(crate) async fn get_execution_tag_impl(
     key: &str,
 ) -> Result<Option<String>, EngineError> {
     let (part, exec_uuid) = split_exec_id(id)?;
-    let path = format!("$.tags.{key}");
+    // Quoted key segment — see `set_execution_tag_impl` for rationale.
+    let path = format!("$.tags.\"{key}\"");
 
     let row = sqlx::query(
         r#"
@@ -638,7 +650,8 @@ pub(crate) async fn get_flow_tag_impl(
 ) -> Result<Option<String>, EngineError> {
     let part: i64 = 0;
     let flow_uuid: Uuid = flow_id.0;
-    let path = format!("$.{key}");
+    // Quoted key segment — see `set_flow_tag_impl` for rationale.
+    let path = format!("$.\"{key}\"");
 
     let row = sqlx::query(
         r#"

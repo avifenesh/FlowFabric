@@ -7,7 +7,16 @@
 //!
 //! * `validate_tag_key` rejects malformed keys before the backend call;
 //! * `set_*_tag` returns `NotFound` on a missing entity;
-//! * `get_*_tag` collapses missing-tag + missing-entity to `Ok(None)`.
+//! * `get_*_tag` collapses missing-tag + missing-entity to `Ok(None)`;
+//! * stored tag shape is flat (`raw_fields.tags["cairn.session_id"]`
+//!   on executions, `raw_fields["cairn.archived"]` on flows) — not a
+//!   nested path `raw_fields.tags.cairn.session_id` / `raw_fields.cairn.archived`
+//!   that a dot-split JSON path would produce.
+//!
+//! Every test mutates the process-global `FF_DEV_MODE` env var under
+//! `#[serial(ff_dev_mode)]`. Unguarded parallel env mutation is
+//! unsound under Rust 2024 and races with other SQLite integration
+//! tests that read the same var at `SqliteBackend::new` construction.
 
 #![cfg(feature = "core")]
 
@@ -18,6 +27,8 @@ use ff_core::contracts::{CreateExecutionArgs, CreateFlowArgs};
 use ff_core::engine_backend::EngineBackend;
 use ff_core::engine_error::{EngineError, ValidationKind};
 use ff_core::types::{ExecutionId, FlowId, LaneId, Namespace, TimestampMs};
+use serial_test::serial;
+use sqlx::Row;
 use uuid::Uuid;
 
 fn uuid_like() -> String {
@@ -31,6 +42,9 @@ fn uuid_like() -> String {
 }
 
 async fn fresh_backend() -> Arc<SqliteBackend> {
+    // SAFETY: test-only env mutation; all callers are
+    // `#[serial(ff_dev_mode)]`-gated so no parallel test observes a
+    // torn value. See module docs.
     unsafe {
         std::env::set_var("FF_DEV_MODE", "1");
     }
@@ -80,6 +94,7 @@ async fn seed_flow(backend: &Arc<SqliteBackend>) -> FlowId {
 }
 
 #[tokio::test]
+#[serial(ff_dev_mode)]
 async fn set_and_get_execution_tag_roundtrips() {
     let backend = fresh_backend().await;
     let eid = seed_execution(&backend, "tags-lane-exec").await;
@@ -128,6 +143,7 @@ async fn set_and_get_execution_tag_roundtrips() {
 }
 
 #[tokio::test]
+#[serial(ff_dev_mode)]
 async fn set_and_get_flow_tag_roundtrips() {
     let backend = fresh_backend().await;
     let flow = seed_flow(&backend).await;
@@ -154,11 +170,26 @@ async fn set_and_get_flow_tag_roundtrips() {
 }
 
 #[tokio::test]
+#[serial(ff_dev_mode)]
 async fn invalid_tag_key_rejected() {
     let backend = fresh_backend().await;
     let eid = seed_execution(&backend, "tags-lane-invalid").await;
 
-    for bad in ["", "Cairn.x", "cairn", "cairn.", "cairn..x", "1cairn.x"] {
+    for bad in [
+        "",
+        "Cairn.x",
+        "cairn",
+        "cairn.",
+        "cairn..x",
+        "1cairn.x",
+        // Tightened by Finding 2: the full key must be
+        // lowercase-alphanum-dot-underscore. Suffix-level rejections
+        // below would have silently passed the prefix-only check.
+        "cairn.foo bar",
+        "cairn.foo\"bar",
+        "cairn.Foo",
+        "cairn.foo-bar",
+    ] {
         let err = backend
             .set_execution_tag(&eid, bad, "v")
             .await
@@ -177,6 +208,7 @@ async fn invalid_tag_key_rejected() {
 }
 
 #[tokio::test]
+#[serial(ff_dev_mode)]
 async fn missing_execution_returns_notfound_on_set_and_ok_none_on_get() {
     let backend = fresh_backend().await;
     let phantom = new_exec_id();
@@ -200,6 +232,7 @@ async fn missing_execution_returns_notfound_on_set_and_ok_none_on_get() {
 }
 
 #[tokio::test]
+#[serial(ff_dev_mode)]
 async fn missing_flow_returns_notfound_on_set_and_ok_none_on_get() {
     let backend = fresh_backend().await;
     let phantom = FlowId::new();
@@ -215,4 +248,76 @@ async fn missing_flow_returns_notfound_on_set_and_ok_none_on_get() {
         .await
         .expect("missing flow get collapses");
     assert!(got.is_none());
+}
+
+// ── Stored-shape assertions (Finding 1 regression guard) ────────
+//
+// These tests peek at `raw_fields` directly via the test pool and
+// verify the JSON shape is flat — i.e. the dotted key is a single
+// literal member name, not a nested path segment. A regression to
+// the pre-Finding-1 `$.tags.<key>` / `$.<key>` unquoted-path form
+// would silently fail these assertions.
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn execution_tag_stored_as_flat_key_not_nested() {
+    let backend = fresh_backend().await;
+    let eid = seed_execution(&backend, "tags-lane-shape-exec").await;
+
+    backend
+        .set_execution_tag(&eid, "cairn.session_id", "s-flat")
+        .await
+        .expect("set");
+
+    let exec_uuid: Uuid = eid
+        .as_str()
+        .rsplit_once(':')
+        .map(|(_, u)| Uuid::parse_str(u).expect("parse exec uuid"))
+        .expect("split exec id");
+    let row = sqlx::query("SELECT raw_fields FROM ff_exec_core WHERE execution_id = ?1")
+        .bind(exec_uuid)
+        .fetch_one(backend.pool_for_test())
+        .await
+        .expect("fetch raw_fields");
+    let raw: String = row.try_get("raw_fields").expect("raw_fields col");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+
+    assert!(
+        parsed["tags"]["cairn.session_id"].is_string(),
+        "tag must be stored as flat key; got raw_fields: {raw}"
+    );
+    assert!(
+        parsed["tags"].get("cairn").is_none(),
+        "tag must not be nested under a `cairn` object; got raw_fields: {raw}"
+    );
+}
+
+#[tokio::test]
+#[serial(ff_dev_mode)]
+async fn flow_tag_stored_as_flat_key_not_nested() {
+    let backend = fresh_backend().await;
+    let flow = seed_flow(&backend).await;
+
+    backend
+        .set_flow_tag(&flow, "cairn.archived", "true")
+        .await
+        .expect("set");
+
+    let flow_uuid: Uuid = flow.0;
+    let row = sqlx::query("SELECT raw_fields FROM ff_flow_core WHERE flow_id = ?1")
+        .bind(flow_uuid)
+        .fetch_one(backend.pool_for_test())
+        .await
+        .expect("fetch raw_fields");
+    let raw: String = row.try_get("raw_fields").expect("raw_fields col");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+
+    assert!(
+        parsed["cairn.archived"].is_string(),
+        "flow tag must be stored as flat top-level key; got raw_fields: {raw}"
+    );
+    assert!(
+        parsed.get("cairn").is_none(),
+        "flow tag must not be nested under a `cairn` object; got raw_fields: {raw}"
+    );
 }
