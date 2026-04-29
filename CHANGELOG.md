@@ -32,14 +32,35 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the existing `ff_set_{execution,flow}_tags` Lua contracts on Valkey
   and `raw_fields` JSON(B) upserts on Postgres/SQLite. New trait-side
   `ff_core::engine_backend::validate_tag_key` helper enforces the
-  `^[a-z][a-z0-9_]*\.[^.]` namespace regex on every backend so
-  Postgres/SQLite reject the same keys as Valkey. Read-side
+  `^[a-z][a-z0-9_]*\.[a-z0-9_][a-z0-9_.]*$` namespace regex on every
+  backend so Postgres/SQLite reject the same keys as Valkey.
+  Validation runs end-to-end: the full key (not just the namespace
+  prefix) must be `[a-z0-9_.]` — a tightening over the
+  prefix-only check shipped in the first pass, which would have
+  silently accepted keys containing spaces, uppercase suffix chars,
+  or quotes that break SQLite JSON-path quoting. Read-side
   missing-row collapses to `Ok(None)` (matches Valkey's `HGET`
   semantics); write-side missing entity surfaces as
   `EngineError::NotFound`. Cross-backend parity tests live at
   `crates/ff-test/tests/matrix_engine_backend_tags.rs` (Valkey + PG)
   and `crates/ff-backend-sqlite/tests/engine_backend_tags.rs`
-  (SQLite). No migrations — existing `raw_fields` JSONB already holds
+  (SQLite). **SQLite JSON-path note**: all four paths quote the key
+  segment (`$.tags."<key>"` / `$."<key>"`) so dotted namespaced keys
+  like `cairn.session_id` land as a single flat member rather than
+  nested path segments — matching the Postgres `jsonb_set(...,
+  ARRAY['tags', $key::text], ...)` shape and the
+  `$.tags."cairn.instance_id"` pattern already used by existing
+  SQLite operator queries. **Valkey flow-tag migration note**:
+  `set_flow_tag` on Valkey routes through the existing
+  `ff_set_flow_tags` FCALL, which on the first write against a given
+  flow scans `flow_core` for pre-58.4 inline namespaced fields,
+  moves them to the dedicated `:tags` hash, and stamps a
+  `tags_migrated=1` sentinel so subsequent writes are O(1). This is
+  backward-compat migration, not a new behaviour — existing consumers
+  that only read tags via `ff_set_execution_tags` are unaffected;
+  consumers that were reading flow tags directly off `flow_core`
+  (HGETALL) should migrate to `EngineBackend::get_flow_tag`.
+  No storage migrations — existing `raw_fields` JSONB already holds
   tags on PG/SQLite.
 
 ## [0.12.0] - 2026-04-28
