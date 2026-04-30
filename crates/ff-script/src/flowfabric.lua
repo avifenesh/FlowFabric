@@ -6781,8 +6781,7 @@ redis.register_function('ff_release_budget', function(keys, args)
     by_exec_index = keys[3],
   }
 
-  local _budget_id = args[1]
-  local execution_id = args[2]
+  local execution_id = assert(args[2], "missing execution_id")
 
   local raw = redis.call("HGETALL", K.by_exec_key)
   if #raw == 0 then
