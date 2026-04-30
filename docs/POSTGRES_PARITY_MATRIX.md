@@ -588,6 +588,7 @@ as part of #449's own doc updates. Expected shape:
 | Method | Valkey | Postgres | SQLite | Notes |
 |---|---|---|---|---|
 | `renew_lease` | `impl` | `impl` | `Unavailable` (default, follow-up) | PG: `READ COMMITTED` tx + `FOR UPDATE` on `ff_attempt`. Fence validation is **epoch-only** (PG doesn't persist `lease_id`/`attempt_id` to disk; `lease_epoch` monotonic bump is sufficient to catch the same violations Valkey's full-triple check covers). Error map: `fence_required`→`Validation{InvalidInput}`, `stale_lease`→`State(StaleLease)`, `lease_expired`→`State(LeaseExpired)`, `execution_not_active`→`Contention(ExecutionNotActive{...})`. Integration test: `crates/ff-backend-postgres/tests/typed_renew_lease.rs`. |
+| `complete_execution` | `impl` | `impl` | `Unavailable` (default, follow-up) | PG: `READ COMMITTED` tx with `FOR UPDATE` on `ff_attempt` + `ff_exec_core`. Fence-or-operator-override gate matches Valkey — `source=OperatorOverride` skips epoch fence but lifecycle gate still fires. Flips `ff_exec_core` to terminal/completed + stores result payload; emits `ff_completion_event` (→ pg_notify DAG cascade) + `lease_event::EVENT_REVOKED`. Integration test: `crates/ff-backend-postgres/tests/typed_complete_execution.rs`. |
 
 **PR-7b Wave 0a — backend-agnostic primitives + `start_*` no-panic (cairn #436):**
 
