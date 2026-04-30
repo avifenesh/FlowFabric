@@ -196,7 +196,7 @@ fn now_ms() -> i64 {
 /// Decompose an [`ff_core::types::ExecutionId`] formatted `{fp:N}:<uuid>`
 /// into `(partition_index, uuid_bytes)` — SQLite stores the UUID as a
 /// 16-byte `BLOB` (§4.1) so we bind via `uuid::Uuid`.
-fn split_exec_id(eid: &ff_core::types::ExecutionId) -> Result<(i64, Uuid), EngineError> {
+pub(crate) fn split_exec_id(eid: &ff_core::types::ExecutionId) -> Result<(i64, Uuid), EngineError> {
     let s = eid.as_str();
     let rest = s
         .strip_prefix("{fp:")
@@ -233,7 +233,7 @@ fn split_exec_id(eid: &ff_core::types::ExecutionId) -> Result<(i64, Uuid), Engin
 /// (no `IMMEDIATE` escalation on the public API today); we manage
 /// the lock here manually and the per-op helpers in this file close
 /// the rollback loop.
-async fn begin_immediate(
+pub(crate) async fn begin_immediate(
     pool: &SqlitePool,
 ) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, EngineError> {
     let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
@@ -250,7 +250,7 @@ async fn begin_immediate(
 /// A secondary rollback error is swallowed — SQLite auto-rolls-back
 /// on connection close, which happens when the pool drops an
 /// unhealthy connection, so correctness is preserved.
-async fn commit_or_rollback(
+pub(crate) async fn commit_or_rollback(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
 ) -> Result<(), EngineError> {
     if let Err(e) = sqlx::query("COMMIT")
@@ -266,7 +266,7 @@ async fn commit_or_rollback(
 
 /// Best-effort rollback on an error path. A failed rollback is
 /// swallowed so the original error surfaces unchanged.
-async fn rollback_quiet(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+pub(crate) async fn rollback_quiet(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>) {
     let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
 }
 
@@ -676,7 +676,7 @@ async fn fail_inner(
 /// into the Rust post-commit dispatch landed in Phase 2b.1; durable
 /// replay via `event_id > cursor` continues to ride against this
 /// table.
-async fn insert_lease_event(
+pub(crate) async fn insert_lease_event(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
     part: i64,
     exec_uuid: Uuid,
@@ -699,7 +699,7 @@ async fn insert_lease_event(
 
 /// Insert one completion outbox row (success / failed / cancelled /
 /// retry) and return the `event_id` wrapped in an [`OutboxEvent`].
-async fn insert_completion_event_ev(
+pub(crate) async fn insert_completion_event_ev(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
     part: i64,
     exec_uuid: Uuid,
@@ -2592,6 +2592,83 @@ impl EngineBackend for SqliteBackend {
         let pool = &self.inner.pool;
         let pubsub = &self.inner.pubsub;
         retry_serializable(|| renew_impl(pool, pubsub, handle)).await
+    }
+
+    // ── PR-7b / #453: typed-FCALL trait methods ──
+
+    async fn renew_lease(
+        &self,
+        args: ff_core::contracts::RenewLeaseArgs,
+    ) -> Result<ff_core::contracts::RenewLeaseResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::typed_ops::renew_lease(pool, pubsub, args.clone())).await
+    }
+
+    async fn complete_execution(
+        &self,
+        args: ff_core::contracts::CompleteExecutionArgs,
+    ) -> Result<ff_core::contracts::CompleteExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::typed_ops::complete_execution(pool, pubsub, args.clone()))
+            .await
+    }
+
+    async fn fail_execution(
+        &self,
+        args: ff_core::contracts::FailExecutionArgs,
+    ) -> Result<ff_core::contracts::FailExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::typed_ops::fail_execution(pool, pubsub, args.clone())).await
+    }
+
+    async fn resume_execution(
+        &self,
+        args: ff_core::contracts::ResumeExecutionArgs,
+    ) -> Result<ff_core::contracts::ResumeExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::typed_ops::resume_execution(pool, pubsub, args.clone())).await
+    }
+
+    async fn evaluate_flow_eligibility(
+        &self,
+        args: ff_core::contracts::EvaluateFlowEligibilityArgs,
+    ) -> Result<ff_core::contracts::EvaluateFlowEligibilityResult, EngineError> {
+        // Read-only; no retry_serializable needed.
+        crate::typed_ops::evaluate_flow_eligibility(&self.inner.pool, args).await
+    }
+
+    async fn claim_execution(
+        &self,
+        args: ff_core::contracts::ClaimExecutionArgs,
+    ) -> Result<ff_core::contracts::ClaimExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        let pc = ff_core::partition::PartitionConfig::default();
+        retry_serializable(|| {
+            crate::typed_ops::claim_execution(pool, &pc, pubsub, args.clone())
+        })
+        .await
+    }
+
+    async fn check_admission(
+        &self,
+        quota_policy_id: &ff_core::types::QuotaPolicyId,
+        _dimension: &str,
+        args: ff_core::contracts::CheckAdmissionArgs,
+    ) -> Result<ff_core::contracts::CheckAdmissionResult, EngineError> {
+        let pool = &self.inner.pool;
+        // `partition_config` is ignored inside the body on SQLite
+        // (single-writer, partition_key=0); accepted for cross-backend
+        // signature parity. See typed_ops::check_admission rustdoc.
+        let pc = ff_core::partition::PartitionConfig::default();
+        retry_serializable(|| {
+            crate::typed_ops::check_admission(pool, &pc, quota_policy_id, args.clone())
+        })
+        .await
     }
 
     async fn progress(
