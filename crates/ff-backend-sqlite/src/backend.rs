@@ -3287,6 +3287,29 @@ impl EngineBackend for SqliteBackend {
         // rather than here, matching the PG posture.
         Ok(PrepareOutcome::NoOp)
     }
+
+    // ── PR-7b Wave 0a: clock primitive ──
+
+    async fn server_time_ms(&self) -> Result<u64, EngineError> {
+        // julianday('now') returns UT1 days since 4714 BC noon.
+        // 2440587.5 is julianday at Unix epoch.
+        let ms: i64 = sqlx::query_scalar(
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+        )
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| EngineError::Transport {
+            backend: "sqlite".into(),
+            source: format!("server_time_ms: {e}").into(),
+        })?;
+        if ms < 0 {
+            return Err(EngineError::Transport {
+                backend: "sqlite".into(),
+                source: "server_time_ms: negative epoch".into(),
+            });
+        }
+        Ok(ms as u64)
+    }
 }
 
 #[cfg(test)]

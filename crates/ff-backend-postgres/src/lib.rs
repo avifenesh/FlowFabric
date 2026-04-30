@@ -1586,6 +1586,25 @@ impl EngineBackend for PostgresBackend {
         )
         .await
     }
+
+    // ── PR-7b Wave 0a: clock primitive ──
+
+    async fn server_time_ms(&self) -> Result<u64, EngineError> {
+        let ms: i64 = sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint")
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| EngineError::Transport {
+                backend: "postgres".into(),
+                source: format!("server_time_ms: {e}").into(),
+            })?;
+        if ms < 0 {
+            return Err(EngineError::Transport {
+                backend: "postgres".into(),
+                source: "server_time_ms: negative epoch".into(),
+            });
+        }
+        Ok(ms as u64)
+    }
 }
 
 /// Resolve a `CompletionPayload` to the matching

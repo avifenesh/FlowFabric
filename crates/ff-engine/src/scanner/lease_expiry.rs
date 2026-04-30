@@ -105,7 +105,12 @@ impl Scanner for LeaseExpiryScanner {
         let lease_expiry_key = idx.lease_expiry();
 
         // Get current server time
-        let now_ms = match server_time_ms(client).await {
+        let now_ms_res: Result<u64, String> = if let Some(ref b) = self.backend {
+            b.server_time_ms().await.map_err(|e| e.to_string())
+        } else {
+            crate::scanner::lease_expiry::server_time_ms_legacy(client).await.map_err(|e| e.to_string())
+        };
+        let now_ms = match now_ms_res {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(partition, error = %e, "lease_expiry: failed to get server time");
@@ -215,7 +220,7 @@ impl Scanner for LeaseExpiryScanner {
 }
 
 /// Get server time in milliseconds via the TIME command.
-pub(crate) async fn server_time_ms(client: &ferriskey::Client) -> Result<u64, ferriskey::Error> {
+pub(crate) async fn server_time_ms_legacy(client: &ferriskey::Client) -> Result<u64, ferriskey::Error> {
     let result: Vec<String> = client
         .cmd("TIME")
         .execute()

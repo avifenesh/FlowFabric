@@ -8582,6 +8582,32 @@ impl EngineBackend for ValkeyBackend {
         )
         .await
     }
+
+    // ── PR-7b Wave 0a: clock primitive ──
+
+    async fn server_time_ms(&self) -> Result<u64, EngineError> {
+        let result: Vec<String> = self
+            .client
+            .cmd("TIME")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        if result.len() < 2 {
+            return Err(EngineError::Transport {
+                backend: "valkey".into(),
+                source: "TIME returned fewer than 2 elements".into(),
+            });
+        }
+        let secs: u64 = result[0].parse().map_err(|_| EngineError::Transport {
+            backend: "valkey".into(),
+            source: "TIME: invalid seconds".into(),
+        })?;
+        let micros: u64 = result[1].parse().map_err(|_| EngineError::Transport {
+            backend: "valkey".into(),
+            source: "TIME: invalid microseconds".into(),
+        })?;
+        Ok(secs.saturating_mul(1000).saturating_add(micros / 1000))
+    }
 }
 
 // ── Helpers for Cluster 2b-A reconcilers ─────────────────────────

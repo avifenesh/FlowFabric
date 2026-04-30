@@ -2466,6 +2466,24 @@ pub trait EngineBackend: Send + Sync + 'static {
             op: "trim_retention",
         })
     }
+
+    // ── PR-7b Wave 0a: backend clock primitive ──
+
+    /// Returns the backend's current wall-clock epoch milliseconds.
+    ///
+    /// Used by 15 scanners to compute "due" thresholds before issuing
+    /// per-partition due-scans. Previously a Valkey-only helper at
+    /// `crate::scanner::lease_expiry::server_time_ms(client)` issuing
+    /// `TIME`; this trait method is the backend-agnostic replacement
+    /// (cairn #436 / PR-7b Wave 0a).
+    ///
+    /// Every backend MUST implement — clock is universal. No default.
+    ///
+    /// - **Valkey:** `TIME` command.
+    /// - **Postgres:** `SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint`.
+    /// - **SQLite:** `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`.
+    #[cfg(feature = "core")]
+    async fn server_time_ms(&self) -> Result<u64, EngineError>;
 }
 
 /// RFC-016 Stage D outcome of a single
