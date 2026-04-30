@@ -31,6 +31,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **#453 / PR-7b: `EngineBackend::complete_execution` — Postgres body.**
+  Ports `ff_complete_execution` from `flowfabric.lua` to a PG tx that
+  flips `lifecycle_phase='terminal'`, `public_state='completed'`,
+  stores the result payload, nulls `ff_attempt.lease_expires_at_ms`,
+  and emits a completion outbox event (firing `pg_notify` for
+  downstream DAG dispatch) + RFC-019 Stage B lease-revoked event.
+  Fence-or-operator-override gate mirrors Valkey: `fence=None` +
+  `source != OperatorOverride` → `Validation{fence_required}`; the
+  override path skips the epoch fence but **does** enforce the
+  lifecycle gate (operator cannot re-terminate already-terminal).
+  Integration test at `typed_complete_execution.rs`.
 - **#453 / PR-7b: `EngineBackend::renew_lease` — Postgres body.**
   First typed-FCALL method from cairn's v0.13-blocker list to flip
   from `Unavailable` default to a real PG SQL transaction. Ports
