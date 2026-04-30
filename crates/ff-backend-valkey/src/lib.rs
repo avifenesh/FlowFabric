@@ -5055,9 +5055,11 @@ async fn claim_execution_impl(
 /// pre-read the dispatch bit because TOCTOU risk + re-reading
 /// `current_attempt_index` would require a second round trip (defeating
 /// the whole point of the fused FCALL). `expected_attempt_index` is
-/// read once here for KEYS[6..=8] placeholder construction — the Lua
-/// recomputes the real index internally, so the placeholder is only
-/// read-by-index-0 on the fresh path and unused on the resume path.
+/// passed as a sentinel — the Lua builds attempt keys dynamically
+/// from `total_attempt_count` (fresh) or `current_attempt_index`
+/// (resume), and the corresponding KEYS slots were dropped from the
+/// FCALL signature so no Rust-side round trip is needed to compute
+/// placeholder keys.
 #[tracing::instrument(
     name = "ff.issue_grant_and_claim",
     skip_all,
@@ -5086,26 +5088,13 @@ async fn issue_grant_and_claim_impl(
     let lease_id = LeaseId::new();
     let attempt_id = AttemptId::new();
 
-    // Pre-read `total_attempt_count` so the KEYS[6..=8] placeholder
-    // attempt-key construction matches what the Lua computes on the
-    // fresh-claim branch. Resume branch reads `current_attempt_index`
-    // inside the Lua and builds the attempt key dynamically — the
-    // placeholder we send is unused on that path (same slot-same-hash
-    // property means no cluster-routing problem).
-    let att_idx_str: Option<String> = client
-        .cmd("HGET")
-        .arg(ctx.core())
-        .arg("total_attempt_count")
-        .execute()
-        .await
-        .map_err(transport_fk)?;
-    let expected_attempt_index = AttemptIndex::new(
-        att_idx_str
-            .as_deref()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0),
-    );
-
+    // No pre-read of `total_attempt_count`: the Lua body builds
+    // attempt keys dynamically from the index it reads internally, and
+    // attempt hash / usage / policy keys are no longer declared in the
+    // FCALL's KEYS vector (all attempt keys share the `{tag}` hash so
+    // they live in the same cluster slot as `exec_core`). The
+    // `expected_attempt_index` field on `ClaimExecutionArgs` is unused
+    // by this FCALL — pass a zero sentinel.
     let ce_args = ClaimExecutionArgs::new(
         args.execution_id.clone(),
         worker_id,
@@ -5114,7 +5103,7 @@ async fn issue_grant_and_claim_impl(
         lease_id,
         args.lease_duration_ms,
         attempt_id,
-        expected_attempt_index,
+        AttemptIndex::new(0),
         "{}".to_owned(),
         None,
         None,

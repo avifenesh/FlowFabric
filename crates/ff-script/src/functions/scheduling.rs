@@ -132,7 +132,16 @@ impl FromFcallResult for UpdateProgressResult {
 
 // ─── ff_issue_grant_and_claim (cairn #454 Phase 3d) ────────────────────
 //
-// Lua KEYS (14): same shape as `ff_claim_execution`.
+// Lua KEYS (11): exec_core, claim_grant, eligible_zset, lease_expiry_zset,
+//                worker_leases, attempts_zset, lease_current, lease_history,
+//                active_index, attempt_timeout_zset, execution_deadline_zset.
+//                Attempt hash / usage / policy keys are NOT declared — the
+//                Lua computes the index internally (fresh path reads
+//                `total_attempt_count`, resume path reads
+//                `current_attempt_index`) and builds attempt keys
+//                dynamically. All attempt keys share the same `{tag}` hash
+//                as `exec_core` so they live in the same cluster slot; not
+//                listing them in KEYS is cluster-safe.
 // Lua ARGV (11): execution_id, worker_id, worker_instance_id, lane,
 //                capability_snapshot_hash, lease_id, lease_ttl_ms,
 //                attempt_id, attempt_policy_json, attempt_timeout_ms,
@@ -170,9 +179,6 @@ ff_function! {
             k.idx.lane_eligible(k.lane_id),
             k.idx.lease_expiry(),
             k.idx.worker_leases(k.worker_instance_id),
-            k.ctx.attempt_hash(args.expected_attempt_index),
-            k.ctx.attempt_usage(args.expected_attempt_index),
-            k.ctx.attempt_policy(args.expected_attempt_index),
             k.ctx.attempts(),
             k.ctx.lease_current(),
             k.ctx.lease_history(),

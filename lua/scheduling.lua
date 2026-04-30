@@ -524,14 +524,16 @@ end)
 -- the fresh-claim body creates a new attempt. The caller sees the
 -- unified tuple `{lease_id, lease_epoch, attempt_index}` regardless.
 --
--- KEYS (14): exec_core, claim_grant, eligible_zset, lease_expiry_zset,
---            worker_leases, attempt_hash (placeholder, index 0),
---            attempt_usage (placeholder), attempt_policy (placeholder),
---            attempts_zset, lease_current, lease_history, active_index,
---            attempt_timeout_zset, execution_deadline_zset
---            Superset-union of ff_claim_execution + ff_claim_resumed_execution.
---            Dynamic attempt-key construction for resume-path mirrors
---            the pattern in both source functions (see tag match below).
+-- KEYS (11): exec_core, claim_grant, eligible_zset, lease_expiry_zset,
+--            worker_leases, attempts_zset, lease_current, lease_history,
+--            active_index, attempt_timeout_zset, execution_deadline_zset
+--            Attempt hash / usage / policy keys are NOT declared — the
+--            Lua computes `next_att_idx` (fresh) or reads
+--            `current_attempt_index` (resume) internally and builds the
+--            attempt keys dynamically. Since all attempt keys share the
+--            `{tag}` hash (tag-based slot binding) they live in the same
+--            cluster slot as `exec_core`, so not listing them in KEYS is
+--            cluster-safe.
 -- ARGV (11): execution_id, worker_id, worker_instance_id, lane,
 --            capability_snapshot_hash, lease_id, lease_ttl_ms,
 --            attempt_id, attempt_policy_json, attempt_timeout_ms,
@@ -546,15 +548,12 @@ redis.register_function('ff_issue_grant_and_claim', function(keys, args)
     eligible_zset          = keys[3],
     lease_expiry_key       = keys[4],
     worker_leases_key      = keys[5],
-    attempt_hash_ph        = keys[6],
-    attempt_usage_ph       = keys[7],
-    attempt_policy_ph      = keys[8],
-    attempts_zset          = keys[9],
-    lease_current_key      = keys[10],
-    lease_history_key      = keys[11],
-    active_index_key       = keys[12],
-    attempt_timeout_key    = keys[13],
-    execution_deadline_key = keys[14],
+    attempts_zset          = keys[6],
+    lease_current_key      = keys[7],
+    lease_history_key      = keys[8],
+    active_index_key       = keys[9],
+    attempt_timeout_key    = keys[10],
+    execution_deadline_key = keys[11],
   }
 
   local lease_ttl_n = require_number(args[7], "lease_ttl_ms")
@@ -616,8 +615,16 @@ redis.register_function('ff_issue_grant_and_claim', function(keys, args)
     "admission_summary", "",
     "created_at", tostring(now_ms),
     "grant_expires_at", tostring(grant_expires_at))
-  -- No PEXPIREAT needed — consumed in the same call below. A hard
-  -- DEL follows either branch.
+  -- Set a finite TTL on the grant hash as a safety net: the happy path
+  -- DEL's the key at the end of this FCALL, but if the Lua errors
+  -- between the HSET above and the DEL below (e.g. unpack_policy
+  -- throws, a dynamic attempt-key write hits WRONGTYPE, or TIME goes
+  -- backwards and a downstream call fails), the grant would otherwise
+  -- leak forever and trip the `grant_already_exists` guard on every
+  -- retry. PEXPIRE bounds the leak at `lease_ttl_ms` — the only TTL
+  -- knob this method accepts — matching the single-knob contract
+  -- promised by the trait surface.
+  redis.call("PEXPIRE", K.claim_grant, A.lease_ttl_ms)
 
   -- 4. Dispatch — resume-claim vs fresh-claim. Mirrors the dispatch
   --    on `ff_claim_execution` (`use_claim_resumed_execution` signal).
