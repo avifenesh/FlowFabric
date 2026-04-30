@@ -32,7 +32,7 @@ use ff_core::backend::ScannerFilter;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition};
-use ff_core::types::{BudgetId, LaneId};
+use ff_core::types::{BudgetId, ExecutionId, LaneId, TimestampMs};
 
 use super::{should_skip_candidate, ScanResult, Scanner};
 
@@ -316,12 +316,10 @@ async fn scan_blocked_set(
             continue;
         }
 
-        // Unblock: FCALL ff_unblock_execution on {p:N}
-        let eligible_key = idx.lane_eligible(lane);
-        let keys: [&str; 3] = [&core_key, blocked_key, &eligible_key];
-
+        // Unblock: trait-route → `EngineBackend::unblock_execution`
+        // (Valkey: wraps `ff_unblock_execution` FCALL on {p:N}).
         let now_ms = match crate::scanner::lease_expiry::server_time_ms(client).await {
-            Ok(t) => t.to_string(),
+            Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
                     execution_id = eid_str.as_str(),
@@ -332,13 +330,39 @@ async fn scan_blocked_set(
                 continue;
             }
         };
-        let argv: [&str; 3] = [eid_str, &now_ms, expected_reason];
 
-        match client
-            .fcall::<ferriskey::Value>("ff_unblock_execution", &keys, &argv)
-            .await
-        {
-            Ok(_) => {
+        let res = if let Some(backend_arc) = backend {
+            let Ok(eid) = ExecutionId::parse(eid_str) else {
+                tracing::warn!(execution_id = eid_str.as_str(), "malformed eid; skipping");
+                continue;
+            };
+            backend_arc
+                .unblock_execution(
+                    *partition,
+                    lane,
+                    &eid,
+                    expected_reason,
+                    TimestampMs::from_millis(now_ms as i64),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            // Test-only fallback: direct FCALL on the scanner client.
+            // Mirrors cluster-1 lease_expiry. KEYS(3)/ARGV(3) identical
+            // to the Valkey impl.
+            let eligible_key = idx.lane_eligible(lane);
+            let keys: [&str; 3] = [&core_key, blocked_key, &eligible_key];
+            let now_s = now_ms.to_string();
+            let argv: [&str; 3] = [eid_str, &now_s, expected_reason];
+            client
+                .fcall::<ferriskey::Value>("ff_unblock_execution", &keys, &argv)
+                .await
+                .map(|_: ferriskey::Value| ())
+                .map_err(|e| e.to_string())
+        };
+
+        match res {
+            Ok(()) => {
                 tracing::info!(
                     execution_id = eid_str.as_str(),
                     reason = expected_reason,
@@ -350,7 +374,7 @@ async fn scan_blocked_set(
                 tracing::warn!(
                     execution_id = eid_str.as_str(),
                     error = %e,
-                    "unblock_scanner: ff_unblock_execution failed"
+                    "unblock_scanner: unblock_execution failed"
                 );
                 errors += 1;
             }

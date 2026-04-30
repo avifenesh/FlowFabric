@@ -2162,6 +2162,47 @@ pub trait EngineBackend: Send + Sync + 'static {
             op: "expire_suspension",
         })
     }
+
+    // ── PR-7b Cluster 2 — Reconciler scanner operations ─────────
+    //
+    // Per-execution write hooks invoked by the `unblock` scanner. The
+    // other two cluster-2 scanners (`budget_reset`, `dependency_reconciler`)
+    // route through `reset_budget` + `resolve_dependency`, which are
+    // already part of the RFC-017 service-layer surface and live above.
+
+    /// Unblock-scanner hook — move an execution from a blocked ZSET back
+    /// to `eligible_now` once its blocking condition has cleared (budget
+    /// under limit, quota window drained, or a capable worker has come
+    /// online). `expected_blocking_reason` discriminates which of the
+    /// `blocked:{budget,quota,route}` sets the execution is leaving and
+    /// also fences against a stale unblock (Lua rejects if the core's
+    /// `blocking_reason` no longer matches).
+    ///
+    /// # Backend status
+    ///
+    /// - **Valkey:** wraps `ff_unblock_execution` (RFC-010 §6). Atomic
+    ///   single-slot FCALL on `{p:N}`.
+    /// - **Postgres:** `Unavailable` (structural). PG does not persist a
+    ///   per-reason `blocked:{budget,quota,route}` index — scheduler
+    ///   eligibility is re-evaluated live via SQL predicates on
+    ///   `ff_exec_core` + budget / quota tables (see
+    ///   `ff_backend_postgres::scheduler`). Nothing to reconcile, so the
+    ///   engine's PG scanner loop does not run this path; callers on
+    ///   a PG deployment receive the typed `Unavailable` per PR-7b/final
+    ///   contract.
+    /// - **SQLite:** `Unavailable` for the same reason as Postgres.
+    async fn unblock_execution(
+        &self,
+        _partition: crate::partition::Partition,
+        _lane_id: &LaneId,
+        _execution_id: &ExecutionId,
+        _expected_blocking_reason: &str,
+        _now_ms: TimestampMs,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "unblock_execution",
+        })
+    }
 }
 
 /// Which scanner invoked [`EngineBackend::expire_execution`].
@@ -2665,6 +2706,45 @@ mod tests {
         match b.resolve_dependency(args).await {
             Err(EngineError::Unavailable { op }) => {
                 assert_eq!(op, "resolve_dependency");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    // ── unblock_execution (PR-7b Cluster 2) ──
+
+    /// Default impl returns `Unavailable { op: "unblock_execution" }`
+    /// so non-Valkey deployments get a typed `Unavailable` rather than
+    /// a panic. The engine scanner loop on PG/SQLite skips this path
+    /// entirely (scheduler eligibility is re-evaluated live via SQL
+    /// predicates), but a stray direct call must still fail gracefully.
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_unblock_execution_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+
+        let b = DefaultBackend;
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index: 0,
+        };
+        let eid = ExecutionId::parse(
+            "{fp:0}:55555555-5555-5555-5555-555555555555",
+        )
+        .unwrap();
+        let lane = LaneId::new("default");
+        match b
+            .unblock_execution(
+                partition,
+                &lane,
+                &eid,
+                "waiting_for_budget",
+                TimestampMs::from_millis(0),
+            )
+            .await
+        {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "unblock_execution");
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }

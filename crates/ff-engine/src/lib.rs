@@ -425,9 +425,10 @@ impl Engine {
         // Budget reset scanner (iterates budget partitions).
         // Filter is accepted but not applied (budget partitions don't
         // carry the per-execution namespace / instance_tag shape).
-        let budget_reset = Arc::new(BudgetResetScanner::with_filter(
+        let budget_reset = Arc::new(BudgetResetScanner::with_filter_and_backend(
             config.budget_reset_interval,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             budget_reset,
