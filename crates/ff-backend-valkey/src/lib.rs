@@ -56,7 +56,7 @@ use ff_core::contracts::{
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
-use ff_core::engine_backend::{EngineBackend, ExpirePhase, SiblingCancelReconcileAction};
+use ff_core::engine_backend::{EngineBackend, ExpirePhase, ReconcileCounts, SiblingCancelReconcileAction};
 use ff_core::engine_error::EngineError;
 use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
@@ -638,6 +638,38 @@ impl ValkeyBackend {
             worker_instance_id,
         );
         handle_codec::encode_handle(&fields, kind)
+    }
+
+    /// Apply a `ScannerFilter` to one candidate eid inside the Valkey
+    /// reconciler path. Mirrors `ff_engine::scanner::should_skip_candidate`
+    /// exactly (noop → keep; parse error → skip; namespace mismatch → skip;
+    /// tag mismatch → skip) so cluster 2b-A tally-recompute scanners observe
+    /// the same filter semantics they did before PR-7b trait routing.
+    /// See that helper's rustdoc for fail-closed rationale (§Failure mode).
+    async fn scanner_skip_candidate(
+        &self,
+        filter: &ff_core::backend::ScannerFilter,
+        eid: &str,
+    ) -> bool {
+        if filter.is_noop() {
+            return false;
+        }
+        let Ok(exec_id) = ExecutionId::parse(eid) else {
+            return true;
+        };
+        if let Some(ref want_ns) = filter.namespace {
+            match self.get_execution_namespace(&exec_id).await {
+                Ok(Some(ref got)) if got == want_ns.as_str() => {}
+                _ => return true,
+            }
+        }
+        if let Some((ref tag_key, ref want_value)) = filter.instance_tag {
+            match self.get_execution_tag(&exec_id, tag_key.as_str()).await {
+                Ok(Some(v)) if &v == want_value => {}
+                _ => return true,
+            }
+        }
+        false
     }
 }
 
@@ -8303,6 +8335,532 @@ impl EngineBackend for ValkeyBackend {
             }),
         }
     }
+    // ── PR-7b Cluster 2b-A — Tally-recompute reconciler scanners ─────
+    //
+    // Each method runs a full scan-and-fix pass on one partition using
+    // the same Redis commands (SSCAN / HMGET / HGETALL / ZSCORE /
+    // ZREMRANGEBYSCORE / SREM / GET / SET / HSET / HDEL) the pre-routing
+    // scanner bodies used. The command shapes are preserved verbatim so
+    // this migration is behavioural-parity with the previous direct-client
+    // scanner path. No new Lua functions introduced.
+
+    async fn reconcile_execution_index(
+        &self,
+        partition: Partition,
+        lanes: &[LaneId],
+        filter: &ff_core::backend::ScannerFilter,
+    ) -> Result<ReconcileCounts, EngineError> {
+        const SCAN_COUNT: u32 = 100;
+        let idx = IndexKeys::new(&partition);
+        let all_exec_key = idx.all_executions();
+        let tag = partition.hash_tag();
+
+        let mut cursor = "0".to_string();
+        let mut processed: u32 = 0;
+        let mut errors: u32 = 0;
+
+        loop {
+            let result: ferriskey::Value = match self
+                .client
+                .cmd("SSCAN")
+                .arg(&all_exec_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg(SCAN_COUNT.to_string().as_str())
+                .execute()
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(partition = partition.index, error = %e,
+                        "reconcile_execution_index: SSCAN failed");
+                    return Ok(ReconcileCounts { processed, errors: errors + 1 });
+                }
+            };
+
+            let (next_cursor, members) = parse_sscan_response(&result)
+                .unwrap_or_else(|| ("0".to_string(), vec![]));
+
+            for eid_str in &members {
+                if self.scanner_skip_candidate(filter, eid_str).await {
+                    continue;
+                }
+                match check_execution_index(&self.client, &tag, &idx, eid_str, lanes).await {
+                    Ok(true) => {}
+                    Ok(false) => processed += 1,
+                    Err(e) => {
+                        tracing::warn!(partition = partition.index,
+                            execution_id = eid_str.as_str(), error = %e,
+                            "reconcile_execution_index: check failed");
+                        errors += 1;
+                    }
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
+            }
+        }
+
+        Ok(ReconcileCounts { processed, errors })
+    }
+
+    async fn reconcile_budget_counters(
+        &self,
+        partition: Partition,
+        now_ms: TimestampMs,
+    ) -> Result<ReconcileCounts, EngineError> {
+        let tag = partition.hash_tag();
+        let policies_key = ff_core::keys::budget_policies_index(&tag);
+        let now_ms_u: u64 = now_ms.0.max(0) as u64;
+
+        let mut processed: u32 = 0;
+        let mut errors: u32 = 0;
+        let mut cursor = "0".to_string();
+
+        loop {
+            let result: ferriskey::Value = match self
+                .client
+                .cmd("SSCAN")
+                .arg(&policies_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(partition = partition.index, error = %e,
+                        "reconcile_budget_counters: SSCAN failed");
+                    return Ok(ReconcileCounts { processed, errors: errors + 1 });
+                }
+            };
+
+            let (next_cursor, budget_ids) = parse_sscan_tuple(&result);
+
+            for bid in &budget_ids {
+                match reconcile_one_budget(&self.client, &tag, &policies_key, bid, now_ms_u).await {
+                    Ok(true) => processed += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(partition = partition.index,
+                            budget_id = bid.as_str(), error = %e,
+                            "reconcile_budget_counters: reconcile failed");
+                        errors += 1;
+                    }
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
+            }
+        }
+
+        Ok(ReconcileCounts { processed, errors })
+    }
+
+    async fn reconcile_quota_counters(
+        &self,
+        partition: Partition,
+        now_ms: TimestampMs,
+    ) -> Result<ReconcileCounts, EngineError> {
+        let tag = partition.hash_tag();
+        let policies_key = ff_core::keys::quota_policies_index(&tag);
+        let now_ms_u: u64 = now_ms.0.max(0) as u64;
+
+        let quota_ids: Vec<String> = match self
+            .client
+            .cmd("SMEMBERS")
+            .arg(&policies_key)
+            .execute()
+            .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(partition = partition.index, error = %e,
+                    "reconcile_quota_counters: SMEMBERS failed");
+                return Ok(ReconcileCounts { processed: 0, errors: 1 });
+            }
+        };
+
+        if quota_ids.is_empty() {
+            return Ok(ReconcileCounts::default());
+        }
+
+        let mut processed: u32 = 0;
+        let mut errors: u32 = 0;
+
+        for qid in &quota_ids {
+            match reconcile_one_quota(&self.client, &tag, qid, now_ms_u).await {
+                Ok(true) => processed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(partition = partition.index,
+                        quota_id = qid.as_str(), error = %e,
+                        "reconcile_quota_counters: reconcile failed");
+                    errors += 1;
+                }
+            }
+        }
+
+        Ok(ReconcileCounts { processed, errors })
+    }
+}
+
+// ── Helpers for Cluster 2b-A reconcilers ─────────────────────────
+
+/// Verify an execution's index membership against its core-hash state.
+/// Returns Ok(true) if consistent, Ok(false) if an inconsistency was
+/// logged. Mirrors the pre-routing `index_reconciler::check_execution_index`.
+async fn check_execution_index(
+    client: &ferriskey::Client,
+    tag: &str,
+    idx: &IndexKeys,
+    eid_str: &str,
+    _lanes: &[LaneId],
+) -> Result<bool, ferriskey::Error> {
+    let core_key = format!("ff:exec:{}:{}:core", tag, eid_str);
+
+    let fields: Vec<Option<String>> = client
+        .cmd("HMGET")
+        .arg(&core_key)
+        .arg("lifecycle_phase")
+        .arg("eligibility_state")
+        .arg("ownership_state")
+        .arg("lane_id")
+        .execute()
+        .await?;
+
+    if fields.is_empty() || fields[0].is_none() {
+        tracing::warn!(
+            execution_id = eid_str,
+            "reconcile_execution_index: execution in all_executions but core hash missing"
+        );
+        return Ok(false);
+    }
+
+    let lifecycle = fields[0].as_deref().unwrap_or("");
+    let eligibility = fields[1].as_deref().unwrap_or("");
+    let ownership = fields[2].as_deref().unwrap_or("");
+    let lane_str = fields[3].as_deref().unwrap_or("default");
+
+    let expected_index = match (lifecycle, eligibility, ownership) {
+        ("active", _, "leased") => "active",
+        ("runnable", "eligible_now", _) => "eligible",
+        ("runnable", "not_eligible_until_time", _) => "delayed",
+        ("runnable", "blocked_by_dependencies", _) => "blocked:dependencies",
+        ("runnable", "blocked_by_budget", _) => "blocked:budget",
+        ("runnable", "blocked_by_quota", _) => "blocked:quota",
+        ("runnable", "blocked_by_route", _) => "blocked:route",
+        ("runnable", "blocked_by_operator", _) => "blocked:operator",
+        ("suspended", _, _) => "suspended",
+        ("terminal", _, _) => "terminal",
+        _ => "unknown",
+    };
+
+    if expected_index == "unknown" {
+        return Ok(true);
+    }
+
+    let lane = LaneId::new(lane_str);
+    let expected_key = match expected_index {
+        "active" => idx.lane_active(&lane),
+        "eligible" => idx.lane_eligible(&lane),
+        "delayed" => idx.lane_delayed(&lane),
+        "blocked:dependencies" => idx.lane_blocked_dependencies(&lane),
+        "blocked:budget" => idx.lane_blocked_budget(&lane),
+        "blocked:quota" => idx.lane_blocked_quota(&lane),
+        "blocked:route" => idx.lane_blocked_route(&lane),
+        "blocked:operator" => idx.lane_blocked_operator(&lane),
+        "suspended" => idx.lane_suspended(&lane),
+        "terminal" => idx.lane_terminal(&lane),
+        _ => return Ok(true),
+    };
+
+    let score: Option<String> = client
+        .cmd("ZSCORE")
+        .arg(&expected_key)
+        .arg(eid_str)
+        .execute()
+        .await?;
+
+    if score.is_none() {
+        tracing::warn!(
+            execution_id = eid_str,
+            expected_index,
+            expected_key = expected_key.as_str(),
+            lifecycle,
+            eligibility,
+            ownership,
+            "reconcile_execution_index: execution missing from expected index"
+        );
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+/// Reconcile one budget (non-resetting only). Returns Ok(true) if the
+/// breach marker flipped.
+async fn reconcile_one_budget(
+    client: &ferriskey::Client,
+    tag: &str,
+    policies_key: &str,
+    budget_id: &str,
+    now_ms: u64,
+) -> Result<bool, ferriskey::Error> {
+    let def_key = format!("ff:budget:{}:{}", tag, budget_id);
+    let usage_key = format!("ff:budget:{}:{}:usage", tag, budget_id);
+    let limits_key = format!("ff:budget:{}:{}:limits", tag, budget_id);
+
+    // Fail-closed on transport errors (see pre-routing scanner rustdoc).
+    let def_raw: Vec<String> = client.cmd("HGETALL").arg(&def_key).execute().await?;
+    if def_raw.is_empty() {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(policies_key)
+            .arg(budget_id)
+            .execute()
+            .await
+            .unwrap_or(None);
+        return Ok(false);
+    }
+
+    let def_map = pairs_to_map(&def_raw);
+    let reset_interval = def_map.get("reset_interval_ms").copied();
+    if let Some(ri) = reset_interval
+        && !ri.is_empty()
+        && ri != "0"
+    {
+        return Ok(false);
+    }
+
+    let usage_raw: Vec<String> = client.cmd("HGETALL").arg(&usage_key).execute().await?;
+    let limits_raw: Vec<String> = client.cmd("HGETALL").arg(&limits_key).execute().await?;
+    if limits_raw.is_empty() {
+        return Ok(false);
+    }
+
+    let usage = pairs_to_map(&usage_raw);
+    let limits = pairs_to_map(&limits_raw);
+
+    let mut any_breached = false;
+    for (field, limit_str) in &limits {
+        let dim = match field.strip_prefix("hard:") {
+            Some(d) => d,
+            None => continue,
+        };
+        let limit: i64 = limit_str.parse().unwrap_or(i64::MAX);
+        if limit <= 0 {
+            continue;
+        }
+        let current: i64 = usage.get(dim).and_then(|v| v.parse().ok()).unwrap_or(0);
+        if current > limit {
+            any_breached = true;
+            break;
+        }
+    }
+
+    let currently_breached = usage.contains_key("breached_at");
+
+    if any_breached && !currently_breached {
+        let _: () = client
+            .cmd("HSET")
+            .arg(&usage_key)
+            .arg("breached_at")
+            .arg(now_ms.to_string().as_str())
+            .execute()
+            .await?;
+        tracing::info!(budget_id, "reconcile_budget_counters: marked budget as breached");
+    } else if !any_breached && currently_breached {
+        let _: u32 = client
+            .cmd("HDEL")
+            .arg(&usage_key)
+            .arg("breached_at")
+            .execute()
+            .await?;
+        tracing::info!(budget_id, "reconcile_budget_counters: cleared budget breach");
+    }
+
+    Ok(any_breached != currently_breached)
+}
+
+/// Reconcile one quota policy. Returns Ok(true) if anything was
+/// trimmed / counter-corrected.
+async fn reconcile_one_quota(
+    client: &ferriskey::Client,
+    tag: &str,
+    quota_id: &str,
+    now_ms: u64,
+) -> Result<bool, ferriskey::Error> {
+    let mut did_work = false;
+    let def_key = format!("ff:quota:{}:{}", tag, quota_id);
+
+    let window_secs: Option<String> = client
+        .cmd("HGET")
+        .arg(&def_key)
+        .arg("requests_per_window_seconds")
+        .execute()
+        .await?;
+
+    if let Some(ref ws) = window_secs
+        && let Ok(secs) = ws.parse::<u64>()
+        && secs > 0
+    {
+        let window_ms = secs * 1000;
+        let window_key = format!("ff:quota:{}:{}:window:requests_per_window", tag, quota_id);
+        let cutoff = now_ms.saturating_sub(window_ms);
+
+        let removed: u32 = client
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(&window_key)
+            .arg("-inf")
+            .arg(cutoff.to_string().as_str())
+            .execute()
+            .await
+            .unwrap_or(0);
+
+        if removed > 0 {
+            did_work = true;
+            tracing::debug!(quota_id, removed,
+                "reconcile_quota_counters: trimmed expired window entries");
+        }
+    }
+
+    let concurrency_cap: Option<String> = client
+        .cmd("HGET")
+        .arg(&def_key)
+        .arg("active_concurrency_cap")
+        .execute()
+        .await?;
+
+    if let Some(ref cap_str) = concurrency_cap
+        && let Ok(cap) = cap_str.parse::<u64>()
+        && cap > 0
+    {
+        let counter_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
+        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id);
+
+        let mut live_count: u64 = 0;
+        let mut cursor = "0".to_string();
+        loop {
+            let result: ferriskey::Value = client
+                .cmd("SSCAN")
+                .arg(&admitted_set_key)
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg("100")
+                .execute()
+                .await?;
+
+            let (next_cursor, members) = parse_sscan_tuple(&result);
+
+            for eid in &members {
+                let guard_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id, eid);
+                let exists: bool = client.exists(&guard_key).await.unwrap_or(false);
+                if exists {
+                    live_count += 1;
+                } else {
+                    let _: () = client
+                        .cmd("SREM")
+                        .arg(&admitted_set_key)
+                        .arg(eid.as_str())
+                        .execute()
+                        .await
+                        .unwrap_or_default();
+                }
+            }
+
+            cursor = next_cursor;
+            if cursor == "0" {
+                break;
+            }
+        }
+
+        let stored: Option<String> = client.cmd("GET").arg(&counter_key).execute().await?;
+        let stored_count: i64 = stored.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        if stored_count != live_count as i64 {
+            let _: () = client
+                .cmd("SET")
+                .arg(&counter_key)
+                .arg(live_count.to_string().as_str())
+                .execute()
+                .await?;
+            tracing::info!(
+                quota_id,
+                stored = stored_count,
+                actual = live_count,
+                "reconcile_quota_counters: corrected concurrency counter drift"
+            );
+            did_work = true;
+        }
+    }
+
+    Ok(did_work)
+}
+
+fn pairs_to_map(flat: &[String]) -> std::collections::HashMap<&str, &str> {
+    let mut map = std::collections::HashMap::new();
+    let mut i = 0;
+    while i + 1 < flat.len() {
+        map.insert(flat[i].as_str(), flat[i + 1].as_str());
+        i += 2;
+    }
+    map
+}
+
+/// Parse an `SSCAN` reply `[cursor, [member, ...]]`. Returns
+/// `("0", vec![])` on any unexpected shape (matches pre-routing
+/// scanner helper behaviour).
+fn parse_sscan_tuple(val: &ferriskey::Value) -> (String, Vec<String>) {
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return ("0".to_string(), vec![]),
+    };
+
+    let mut members = Vec::new();
+    match &arr[1] {
+        Ok(ferriskey::Value::Array(inner)) => {
+            for item in inner {
+                if let Ok(ferriskey::Value::BulkString(b)) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        Ok(ferriskey::Value::Set(inner)) => {
+            for item in inner {
+                if let ferriskey::Value::BulkString(b) = item {
+                    members.push(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (cursor, members)
+}
+
+/// Parse `SSCAN` into `Option<(cursor, members)>` — variant used by
+/// the index reconciler which treats an unparsable reply as an error
+/// rather than an empty page.
+fn parse_sscan_response(val: &ferriskey::Value) -> Option<(String, Vec<String>)> {
+    let (cursor, members) = parse_sscan_tuple(val);
+    // `parse_sscan_tuple` returns `("0", vec![])` on malformed input.
+    // Distinguish by re-checking the outer Array shape.
+    if !matches!(val, ferriskey::Value::Array(a) if a.len() >= 2) {
+        return None;
+    }
+    Some((cursor, members))
 }
 
 /// Aggregate partition-level lease-history stream key. RFC-019 Stage A

@@ -87,6 +87,29 @@ impl Scanner for IndexReconciler {
             family: PartitionFamily::Execution,
             index: partition,
         };
+
+        // PR-7b Cluster 2b-A: when a backend is wired (normal engine
+        // path), delegate the whole scan-and-verify pass to the trait
+        // so the scanner does not touch `ferriskey::Client`. Legacy
+        // unit tests that construct via `IndexReconciler::new` keep
+        // the direct-client fallback below.
+        if let Some(backend) = self.backend.as_ref() {
+            return match backend
+                .reconcile_execution_index(p, &self.lanes, &self.filter)
+                .await
+            {
+                Ok(counts) => ScanResult {
+                    processed: counts.processed,
+                    errors: counts.errors,
+                },
+                Err(e) => {
+                    tracing::warn!(partition, error = %e,
+                        "index_reconciler: reconcile_execution_index trait call failed");
+                    ScanResult { processed: 0, errors: 1 }
+                }
+            };
+        }
+
         let idx = IndexKeys::new(&p);
         let all_exec_key = idx.all_executions();
 

@@ -11,11 +11,14 @@
 //!
 //! Reference: RFC-008 §Budget Reconciliation, RFC-010 §6.5
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys;
 use ff_core::partition::{Partition, PartitionFamily};
+use ff_core::types::TimestampMs;
 
 use super::{ScanResult, Scanner};
 
@@ -24,6 +27,11 @@ pub struct BudgetReconciler {
     /// Issue #122: accepted for uniform API; not applied. See
     /// [`Self::with_filter`] rustdoc.
     filter: ScannerFilter,
+    /// PR-7b Cluster 2b-A: when set, `scan_partition` delegates the
+    /// whole pass to `EngineBackend::reconcile_budget_counters`.
+    /// `None` keeps the legacy direct-client path for unit tests that
+    /// construct via [`Self::new`] / [`Self::with_filter`].
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl BudgetReconciler {
@@ -40,7 +48,26 @@ impl BudgetReconciler {
     /// single `EngineConfig.scanner_filter` to every scanner
     /// constructor without special-casing.
     pub fn with_filter(interval: Duration, filter: ScannerFilter) -> Self {
-        Self { interval, filter }
+        Self {
+            interval,
+            filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 2b-A: wire an `EngineBackend` so the scan-and-fix
+    /// pass routes through `EngineBackend::reconcile_budget_counters`
+    /// instead of issuing Redis commands directly.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            filter,
+            backend: Some(backend),
+        }
     }
 }
 
@@ -75,6 +102,27 @@ impl Scanner for BudgetReconciler {
                 return ScanResult { processed: 0, errors: 1 };
             }
         };
+
+        // PR-7b Cluster 2b-A: delegate the whole pass to the trait
+        // when a backend is wired. The `now_ms` fetched above feeds
+        // both the trait path and the legacy fallback so the breach
+        // timestamp is consistent regardless of which arm runs.
+        if let Some(backend) = self.backend.as_ref() {
+            return match backend
+                .reconcile_budget_counters(p, TimestampMs::from_millis(now_ms as i64))
+                .await
+            {
+                Ok(counts) => ScanResult {
+                    processed: counts.processed,
+                    errors: counts.errors,
+                },
+                Err(e) => {
+                    tracing::warn!(partition, error = %e,
+                        "budget_reconciler: reconcile_budget_counters trait call failed");
+                    ScanResult { processed: 0, errors: 1 }
+                }
+            };
+        }
 
         // Discover budgets via partition-level index SET (cluster-safe).
         // Stream in SSCAN batches so partitions with many budgets do not

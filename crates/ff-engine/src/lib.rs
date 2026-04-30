@@ -440,10 +440,11 @@ impl Engine {
 
         // Budget reconciler (iterates budget partitions). Filter
         // accepted but not applied — see BudgetReconciler::with_filter
-        // rustdoc.
-        let budget_reconciler = Arc::new(BudgetReconciler::with_filter(
+        // rustdoc. PR-7b Cluster 2b-A: routed through the trait.
+        let budget_reconciler = Arc::new(BudgetReconciler::with_filter_and_backend(
             config.budget_reconciler_interval,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             budget_reconciler,
@@ -487,10 +488,11 @@ impl Engine {
 
         // Quota reconciler (iterates quota partitions). Filter
         // accepted but not applied — see QuotaReconciler::with_filter
-        // rustdoc.
-        let quota_reconciler = Arc::new(QuotaReconciler::with_filter(
+        // rustdoc. PR-7b Cluster 2b-A: routed through the trait.
+        let quota_reconciler = Arc::new(QuotaReconciler::with_filter_and_backend(
             config.quota_reconciler_interval,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             quota_reconciler,
