@@ -456,6 +456,19 @@ async fn cascade_skipped_children(
     counters: &mut CascadeCounters,
 ) {
     for (child_eid, child_flow_id) in skipped {
+        // Don't count children we're about to short-circuit at the
+        // depth guard — `cascaded_children` is a "descended into"
+        // counter, not a "discovered" counter. Checking the bound
+        // here mirrors the `run_inner` guard at call entry so the
+        // metric matches the recursion that actually fires.
+        if cascade_depth + 1 > MAX_CASCADE_DEPTH {
+            tracing::warn!(
+                execution_id = %child_eid,
+                cascade_depth = cascade_depth + 1,
+                "cascade: depth limit reached; skipping child cascade"
+            );
+            continue;
+        }
         counters.cascaded_children += 1;
         Box::pin(run_inner(
             client,

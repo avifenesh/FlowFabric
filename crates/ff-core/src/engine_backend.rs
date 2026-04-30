@@ -2846,6 +2846,33 @@ mod tests {
         }
     }
 
+    // ── cascade_completion (PR-7b Cluster 4) ──
+
+    /// Default impl returns `Unavailable { op: "cascade_completion" }`
+    /// so pre-migration / non-core builds surface a typed error rather
+    /// than panic. The push-based completion listener routes through
+    /// this method; the default is the safety net for deployments
+    /// whose backend doesn't cascade (e.g. SQLite in the current
+    /// Wave 9 scope).
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_cascade_completion_is_unavailable() {
+        use crate::backend::CompletionPayload;
+
+        let b = DefaultBackend;
+        let eid = ExecutionId::parse(
+            "{fp:0}:66666666-6666-6666-6666-666666666666",
+        )
+        .unwrap();
+        let payload = CompletionPayload::new(eid, "success", None, TimestampMs::now());
+        match b.cascade_completion(&payload).await {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "cascade_completion");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
     // ── unblock_execution (PR-7b Cluster 2) ──
 
     /// Default impl returns `Unavailable { op: "unblock_execution" }`

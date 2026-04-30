@@ -10,8 +10,13 @@
 --
 -- The composite (partition_key, execution_id, occurred_at_ms) is
 -- scoped to one hash-partition and matches the predicate column-for-
--- column, so the planner can drive the `ORDER BY event_id ASC LIMIT 1`
--- via an index scan on the per-partition local index.
+-- column, so the planner drives the lookup via an index scan on the
+-- per-partition local index. `event_id` is not in the index, so the
+-- `ORDER BY event_id ASC LIMIT 1` still requires an explicit sort on
+-- the matching rows — but the triple is ~unique in practice
+-- (typically one row per payload), so the sort is effectively free.
+-- A four-column composite including `event_id` would not pay for
+-- itself under that cardinality.
 --
 -- `IF NOT EXISTS` is defensive: in case a deployment already applied
 -- this via a manual DBA-side fix, the migration is still safely
