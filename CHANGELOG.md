@@ -34,7 +34,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **PR-7b Cluster 2b-B: flow projector + retention trimmer scanners
   trait-routed (cairn #436).** Two new `EngineBackend` trait methods —
   `project_flow_summary(partition, flow_id, now_ms)` and
-  `trim_retention(partition, lane_id, retention_ms, now_ms, batch_size)`
+  `trim_retention(partition, lane_id, retention_ms, now_ms, batch_size, filter)`
   — route the two remaining non-FCALL scanners (`flow_projector` and
   `retention_trimmer`) off the raw `ferriskey::Client` surface.
   Valkey lifts the pre-PR-7b Rust-composed paths verbatim (SRANDMEMBER

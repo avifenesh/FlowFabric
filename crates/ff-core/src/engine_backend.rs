@@ -2398,13 +2398,13 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// `ff_flow_core.public_flow_state` — the former is a rollup
     /// dashboard field, the latter is the authoritative mutation-guard
     /// state owned by `create_flow` / `cancel_flow`. See
-    /// [`scanner::flow_projector`](../ff_engine/scanner/flow_projector)
-    /// module doc for the two-sources contract.
+    /// `ff_engine::scanner::flow_projector` module doc for the
+    /// two-sources contract.
     ///
     /// # Backend status
     ///
     /// - **Valkey:** lifts the pre-PR-7b Rust-composed
-    ///   SMEMBERS/SRANDMEMBER + per-member HGET + HSET summary pattern.
+    ///   SCARD + SRANDMEMBER + per-member HGET + HSET summary pattern.
     ///   No new Lua function; the aggregation is inherently
     ///   multi-round-trip (cross-partition member reads) and atomicity
     ///   is neither required nor achievable against 256 partitions.

@@ -10103,7 +10103,9 @@ async fn trim_retention_impl(
             continue;
         }
         // false = custom retention not yet expired; do not count.
-        if purge_retention_execution(
+        // Log-and-continue on per-execution purge failures so one bad
+        // entry can't abort the whole batch (pre-refactor behavior).
+        match purge_retention_execution(
             client,
             &partition,
             &idx,
@@ -10112,9 +10114,18 @@ async fn trim_retention_impl(
             now_ms_u64,
             retention_ms,
         )
-        .await?
+        .await
         {
-            processed += 1;
+            Ok(true) => processed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    partition = partition.index,
+                    execution_id = %eid_str,
+                    error = %e,
+                    "retention purge failed; continuing batch",
+                );
+            }
         }
     }
 

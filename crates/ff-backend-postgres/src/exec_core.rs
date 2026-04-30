@@ -1202,21 +1202,31 @@ pub(super) async fn get_execution_namespace_impl(
 /// alongside `ff_exec_core`. Kept here so a new table with an
 /// `execution_id` column triggers an explicit edit — silent schema
 /// drift (new table, stale retention) would orphan rows.
-const RETENTION_SIBLING_TABLES: &[&str] = &[
+///
+/// Split by `execution_id` column type so the deletion loop can bind
+/// a `uuid[]` directly against uuid-backed tables (preserving the
+/// btree index on `(partition_key, execution_id)`) and only fall back
+/// to a text cast for tables whose column is still `text`. The prior
+/// unified `execution_id::text = ANY($2::text[])` form worked but
+/// defeated the uuid index on the majority (uuid-backed) side.
+const RETENTION_SIBLING_TABLES_UUID: &[&str] = &[
     "ff_attempt",
-    "ff_cancel_backlog_member",
     "ff_claim_grant",
     "ff_completion_event",
-    "ff_lease_event",
-    "ff_operator_event",
-    "ff_quota_admitted",
-    "ff_quota_window",
-    "ff_signal_event",
     "ff_stream_frame",
     "ff_stream_meta",
     "ff_stream_summary",
     "ff_suspension_current",
     "ff_waitpoint_pending",
+];
+
+const RETENTION_SIBLING_TABLES_TEXT: &[&str] = &[
+    "ff_cancel_backlog_member",
+    "ff_lease_event",
+    "ff_operator_event",
+    "ff_quota_admitted",
+    "ff_quota_window",
+    "ff_signal_event",
 ];
 
 /// Delete a batch of terminal executions past the retention cutoff
@@ -1286,23 +1296,32 @@ pub(super) async fn trim_retention_impl(
     }
 
     let eids: Vec<Uuid> = rows.into_iter().map(|(e,)| e).collect();
-    // Sibling tables split `execution_id` between `uuid` (e.g.
-    // `ff_exec_core`, `ff_attempt`, `ff_claim_grant`,
-    // `ff_completion_event`, `ff_stream_*`, `ff_suspension_current`,
-    // `ff_waitpoint_pending`) and `text` (e.g. `ff_lease_event`,
-    // `ff_signal_event`, `ff_operator_event`, `ff_quota_*`,
-    // `ff_cancel_backlog_member`). Compare on `execution_id::text` so
-    // a single bind of `text[]` works uniformly.
+    // Sibling tables split `execution_id` between `uuid` and `text`.
+    // Bind per-type against the matching allowlist so each DELETE
+    // hits the native index on its table.
     let eid_texts: Vec<String> = eids.iter().map(Uuid::to_string).collect();
 
     // Cascade siblings first; exec_core last. Mirrors the Valkey
     // ordering rationale: if a sibling delete fails mid-batch the
     // whole tx rolls back and the next pass rebuilds the full delete
     // set by re-reading exec_core. Table names are injected from the
-    // allowlist above — no caller influence on table identity.
-    for table in RETENTION_SIBLING_TABLES {
+    // allowlists above — no caller influence on table identity.
+    for table in RETENTION_SIBLING_TABLES_UUID {
         let sql = format!(
-            "DELETE FROM {} WHERE partition_key = $1 AND execution_id::text = ANY($2::text[])",
+            "DELETE FROM {} WHERE partition_key = $1 AND execution_id = ANY($2::uuid[])",
+            table
+        );
+        sqlx::query(&sql)
+            .bind(partition_key)
+            .bind(&eids)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+    }
+
+    for table in RETENTION_SIBLING_TABLES_TEXT {
+        let sql = format!(
+            "DELETE FROM {} WHERE partition_key = $1 AND execution_id = ANY($2::text[])",
             table
         );
         sqlx::query(&sql)
