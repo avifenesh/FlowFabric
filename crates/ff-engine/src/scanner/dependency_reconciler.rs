@@ -262,21 +262,37 @@ async fn reconcile_one_execution(
                 tracing::warn!(upstream_id = %upstream_id, "malformed upstream eid; skipping");
                 continue;
             };
-            let flow_id_parsed = flow_id_str
-                .as_deref()
-                .and_then(|s| if s.is_empty() { None } else { FlowId::parse(s).ok() });
-            // `resolve_dependency` requires a flow_id; standalone
-            // executions have no flow deps so skip — the Lua path's
-            // `_nil_` sentinel only works when the FCALL is issued
-            // anyway with a matching slot key. The trait surface uses
-            // a typed `FlowId` (no sentinel); defer standalones to the
-            // fallback path below.
-            let Some(flow_id) = flow_id_parsed else {
-                // No flow → no dep edges. Shouldn't happen here since
-                // we've just read `deps:unresolved` for this exec, but
-                // be defensive — skip silently rather than fabricate a
-                // nil flow id.
-                continue;
+            // `resolve_dependency` requires a typed `FlowId`. Standalone
+            // executions (`flow_id` absent / empty) cannot have dep
+            // edges, so an entry in `deps:unresolved` for such an
+            // execution indicates data corruption or a partial write —
+            // skip with a warn rather than fabricating a sentinel flow
+            // id. The legacy FCALL path used a `_nil_` sentinel key,
+            // but that only worked because the Lua body's `EXISTS`
+            // guard silently no-ops on nil-shaped keys; the trait
+            // surface has no sentinel and forces us to diagnose the
+            // invariant violation instead.
+            let flow_id = match flow_id_str.as_deref() {
+                Some(s) if !s.is_empty() => match FlowId::parse(s) {
+                    Ok(fid) => fid,
+                    Err(_) => {
+                        tracing::warn!(
+                            execution_id = eid_str,
+                            flow_id = s,
+                            "dependency_reconciler: malformed flow_id; skipping"
+                        );
+                        continue;
+                    }
+                },
+                _ => {
+                    tracing::warn!(
+                        execution_id = eid_str,
+                        edge_id = edge_id.as_str(),
+                        "dependency_reconciler: unresolved dep edge on standalone execution \
+                         (missing flow_id) — likely data corruption; skipping"
+                    );
+                    continue;
+                }
             };
             let Ok(edge_id_parsed) = EdgeId::parse(edge_id) else {
                 tracing::warn!(edge_id = edge_id.as_str(), "malformed edge_id; skipping");

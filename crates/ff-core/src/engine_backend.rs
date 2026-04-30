@@ -2711,6 +2711,45 @@ mod tests {
         }
     }
 
+    // ── unblock_execution (PR-7b Cluster 2) ──
+
+    /// Default impl returns `Unavailable { op: "unblock_execution" }`
+    /// so non-Valkey deployments get a typed `Unavailable` rather than
+    /// a panic. The engine scanner loop on PG/SQLite skips this path
+    /// entirely (scheduler eligibility is re-evaluated live via SQL
+    /// predicates), but a stray direct call must still fail gracefully.
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_unblock_execution_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+
+        let b = DefaultBackend;
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index: 0,
+        };
+        let eid = ExecutionId::parse(
+            "{fp:0}:55555555-5555-5555-5555-555555555555",
+        )
+        .unwrap();
+        let lane = LaneId::new("default");
+        match b
+            .unblock_execution(
+                partition,
+                &lane,
+                &eid,
+                "waiting_for_budget",
+                TimestampMs::from_millis(0),
+            )
+            .await
+        {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "unblock_execution");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
     // ── validate_tag_key (issue #433) ──
 
     #[test]
