@@ -1587,6 +1587,103 @@ impl EngineBackend for PostgresBackend {
         .await
     }
 
+    // ── PR-7b Wave 0a: exec_core field read ──
+
+    async fn read_exec_core_fields(
+        &self,
+        _partition: ff_core::partition::Partition,
+        execution_id: &ff_core::types::ExecutionId,
+        fields: &[&str],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
+        if fields.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let partition_key: i16 = execution_id.partition() as i16;
+        let exec_uuid = crate::exec_core::eid_uuid(execution_id);
+
+        // Build a single SELECT that projects each requested field to
+        // a text value. Fields are classified:
+        //  - canonical column (lane_id, lifecycle_phase, ...): CAST the
+        //    column to text.
+        //  - `raw_fields` JSONB resident (current_attempt_index,
+        //    current_waitpoint_id, current_worker_instance_id,
+        //    budget_ids, quota_policy_id, completed_at, cancel_reason,
+        //    cancelled_by, required_capabilities-csv, public_state-extras,
+        //    etc.): `raw_fields ->> '<field>'`.
+        // Unknown fields project NULL (absent-field parity with Valkey
+        // HMGET).
+        let mut projections: Vec<String> = Vec::with_capacity(fields.len());
+        for field in fields {
+            let expr = match *field {
+                // Canonical exec_core columns.
+                "lane_id" | "lifecycle_phase" | "ownership_state" | "eligibility_state"
+                | "public_state" | "attempt_state" | "blocking_reason" | "cancellation_reason"
+                | "cancelled_by" => format!("{f}::text", f = field),
+                "attempt_index" => "attempt_index::text".to_string(),
+                "flow_id" => "flow_id::text".to_string(),
+                "priority" => "priority::text".to_string(),
+                "created_at_ms" => "created_at_ms::text".to_string(),
+                "terminal_at_ms" => "terminal_at_ms::text".to_string(),
+                "deadline_at_ms" => "deadline_at_ms::text".to_string(),
+                // Scanner-facing aliases that scan the same data from
+                // different angles.
+                "current_attempt_index" => "attempt_index::text".to_string(),
+                "completed_at" => "terminal_at_ms::text".to_string(),
+                "cancel_reason" => "cancellation_reason::text".to_string(),
+                // required_capabilities is `text[]` on PG; scanner
+                // callers expect a CSV string on Valkey. Convert.
+                "required_capabilities" => {
+                    "array_to_string(required_capabilities, ',')".to_string()
+                }
+                // Everything else lives under raw_fields JSONB.
+                other => {
+                    // Strict allowlist of raw_fields names the scanner
+                    // code reads. Any other name returns NULL.
+                    match other {
+                        "current_waitpoint_id"
+                        | "current_worker_instance_id"
+                        | "budget_ids"
+                        | "quota_policy_id" => format!("raw_fields ->> '{other}'"),
+                        _ => "NULL".to_string(),
+                    }
+                }
+            };
+            projections.push(expr);
+        }
+        let projection_sql = projections.join(", ");
+        let query = format!(
+            "SELECT {projection_sql} FROM ff_exec_core \
+             WHERE partition_key = $1 AND execution_id = $2"
+        );
+        let row_opt = sqlx::query(&query)
+            .bind(partition_key)
+            .bind(exec_uuid)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| EngineError::Transport {
+                backend: "postgres".into(),
+                source: format!("read_exec_core_fields: {e}").into(),
+            })?;
+
+        let mut out = std::collections::HashMap::with_capacity(fields.len());
+        if let Some(row) = row_opt {
+            use sqlx::Row;
+            for (idx, field) in fields.iter().enumerate() {
+                let val: Option<String> =
+                    row.try_get(idx).map_err(|e| EngineError::Transport {
+                        backend: "postgres".into(),
+                        source: format!("read_exec_core_fields[{field}]: {e}").into(),
+                    })?;
+                out.insert((*field).to_string(), val);
+            }
+        } else {
+            for field in fields {
+                out.insert((*field).to_string(), None);
+            }
+        }
+        Ok(out)
+    }
+
     // ── PR-7b Wave 0a: clock primitive ──
 
     async fn server_time_ms(&self) -> Result<u64, EngineError> {

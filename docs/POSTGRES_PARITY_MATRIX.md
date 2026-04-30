@@ -583,6 +583,24 @@ as part of #449's own doc updates. Expected shape:
   [`CONSUMER_MIGRATION_0.13.md`](CONSUMER_MIGRATION_0.13.md) §Known
   limitations.
 
+**PR-7b Wave 0a — backend-agnostic primitives + `start_*` no-panic (cairn #436):**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `server_time_ms` | `impl` | `impl` | `impl` | Backend-agnostic wall-clock primitive. Valkey: `TIME` command. Postgres: `SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint`. SQLite: `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`. Default falls back to `SystemTime::now()` so out-of-tree impls (cairn mocks, test doubles) remain source-compatible. Used by 15 scanners to compute "due" thresholds. |
+| `read_exec_core_fields` | `impl` | `impl` | `impl` | Backend-agnostic exec_core field read returning `HashMap<String, Option<String>>`. Valkey: HMGET on the `{p:N}:core` hash. Postgres: dynamic SELECT from `ff_exec_core` with per-field CAST routing + `raw_fields ->>` for JSONB-resident fields (current_waitpoint_id, current_worker_instance_id, budget_ids, quota_policy_id). SQLite: mirrors PG with `json_extract(raw_fields, '$.field')`. Unknown fields project NULL (Valkey HMGET absent-field parity). Scanners continue to use direct HGETs on the Valkey-only fallback path; trait-ified rewrites are Wave 0b. |
+
+Additionally, `Engine::start_with_completions` / `start_with_metrics` /
+`start` no longer panic on non-Valkey `EngineBackend` implementations.
+Prior to PR-7b the constructor downcast to `ValkeyBackend` and
+`panic!`d on `None`; now non-Valkey backends skip the in-tree scanner
+spawn block and only wire the partition router + optional completion
+dispatch loop. Consumers embedding `Engine` with a custom backend are
+expected to own their reconciler supervisor (the shape shipped by
+`PostgresBackend::with_scanners` and `SqliteBackend`). Regression
+guard: `engine_start_does_not_panic_on_non_valkey_backend` in
+`crates/ff-engine/tests/scanner_namespace_point_read.rs`.
+
 **cairn #434 — waitpoint-token read (#438):**
 
 | Method | Valkey | Postgres | SQLite | Notes |

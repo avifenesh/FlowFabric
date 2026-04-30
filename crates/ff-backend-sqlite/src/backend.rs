@@ -3288,6 +3288,89 @@ impl EngineBackend for SqliteBackend {
         Ok(PrepareOutcome::NoOp)
     }
 
+    // ── PR-7b Wave 0a: exec_core field read ──
+
+    async fn read_exec_core_fields(
+        &self,
+        _partition: ff_core::partition::Partition,
+        execution_id: &ff_core::types::ExecutionId,
+        fields: &[&str],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
+        if fields.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let (part, exec_uuid) = split_exec_id(execution_id)?;
+
+        // Classify fields: canonical columns CAST to text; known
+        // raw_fields JSON names via json_extract; unknown names → NULL.
+        let mut projections: Vec<String> = Vec::with_capacity(fields.len());
+        for field in fields {
+            let expr = match *field {
+                "lane_id" | "lifecycle_phase" | "ownership_state" | "eligibility_state"
+                | "public_state" | "attempt_state" | "blocking_reason" | "cancellation_reason"
+                | "cancelled_by" => format!("CAST({field} AS TEXT)"),
+                "attempt_index" => "CAST(attempt_index AS TEXT)".to_string(),
+                "flow_id" => "CAST(flow_id AS TEXT)".to_string(),
+                "priority" => "CAST(priority AS TEXT)".to_string(),
+                "created_at_ms" => "CAST(created_at_ms AS TEXT)".to_string(),
+                "terminal_at_ms" => "CAST(terminal_at_ms AS TEXT)".to_string(),
+                "deadline_at_ms" => "CAST(deadline_at_ms AS TEXT)".to_string(),
+                "current_attempt_index" => "CAST(attempt_index AS TEXT)".to_string(),
+                "completed_at" => "CAST(terminal_at_ms AS TEXT)".to_string(),
+                "cancel_reason" => "CAST(cancellation_reason AS TEXT)".to_string(),
+                "required_capabilities" => {
+                    // Mirror PG CSV projection from junction table.
+                    "(SELECT group_concat(capability, ',') \
+                      FROM ff_execution_capabilities \
+                      WHERE execution_id = ff_exec_core.execution_id)"
+                        .to_string()
+                }
+                other => match other {
+                    "current_waitpoint_id"
+                    | "current_worker_instance_id"
+                    | "budget_ids"
+                    | "quota_policy_id" => {
+                        format!("json_extract(raw_fields, '$.{other}')")
+                    }
+                    _ => "NULL".to_string(),
+                },
+            };
+            projections.push(expr);
+        }
+        let projection_sql = projections.join(", ");
+        let query = format!(
+            "SELECT {projection_sql} FROM ff_exec_core \
+             WHERE partition_key = ?1 AND execution_id = ?2"
+        );
+        let row_opt = sqlx::query(&query)
+            .bind(part)
+            .bind(exec_uuid)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| EngineError::Transport {
+                backend: "sqlite".into(),
+                source: format!("read_exec_core_fields: {e}").into(),
+            })?;
+
+        let mut out = std::collections::HashMap::with_capacity(fields.len());
+        if let Some(row) = row_opt {
+            use sqlx::Row;
+            for (idx, field) in fields.iter().enumerate() {
+                let val: Option<String> =
+                    row.try_get(idx).map_err(|e| EngineError::Transport {
+                        backend: "sqlite".into(),
+                        source: format!("read_exec_core_fields[{field}]: {e}").into(),
+                    })?;
+                out.insert((*field).to_string(), val);
+            }
+        } else {
+            for field in fields {
+                out.insert((*field).to_string(), None);
+            }
+        }
+        Ok(out)
+    }
+
     // ── PR-7b Wave 0a: clock primitive ──
 
     async fn server_time_ms(&self) -> Result<u64, EngineError> {

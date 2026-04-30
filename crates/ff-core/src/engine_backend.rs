@@ -2467,6 +2467,38 @@ pub trait EngineBackend: Send + Sync + 'static {
         })
     }
 
+    // ── PR-7b Wave 0a: exec_core field read primitive ──
+
+    /// Point-read N fields from the `exec_core` hash for a given
+    /// execution. Returns a map of field-name → Option<String>
+    /// (None for fields absent or stored as NULL). Scanner call
+    /// sites formerly issuing raw `HGET`/`HMGET` on `ExecKeyContext::core()`
+    /// route through this trait method (cairn #436 / PR-7b Wave 0a).
+    ///
+    /// Field values are coerced to String at the trait boundary for
+    /// wire compatibility with the Valkey HGET shape. Consumers parse
+    /// specific fields (`lane_id`, `current_attempt_index`, etc.) from
+    /// the returned strings as needed.
+    ///
+    /// - **Valkey:** `HMGET exec_core_key f1 f2 ...`, zipping names to values.
+    /// - **Postgres:** `SELECT` against `ff_exec_core` with dynamic column
+    ///   extraction; fields in `raw_fields` JSONB are extracted via `->>`.
+    /// - **SQLite:** equivalent with `json_extract(raw_fields, '$.field')`.
+    ///
+    /// Default body returns `Unavailable` so non-v0.13 backends remain
+    /// compile-compatible.
+    #[cfg(feature = "core")]
+    async fn read_exec_core_fields(
+        &self,
+        _partition: crate::partition::Partition,
+        _execution_id: &crate::types::ExecutionId,
+        _fields: &[&str],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_exec_core_fields",
+        })
+    }
+
     // ── PR-7b Wave 0a: backend clock primitive ──
 
     /// Returns the backend's current wall-clock epoch milliseconds.
@@ -2477,13 +2509,25 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// `TIME`; this trait method is the backend-agnostic replacement
     /// (cairn #436 / PR-7b Wave 0a).
     ///
-    /// Every backend MUST implement — clock is universal. No default.
+    /// Every in-tree backend overrides. The default falls back to
+    /// `SystemTime::now()` so out-of-tree `EngineBackend` impls (e.g.
+    /// cairn mocks, test doubles) stay source-compatible across v0.12
+    /// → v0.13.
     ///
     /// - **Valkey:** `TIME` command.
     /// - **Postgres:** `SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint`.
     /// - **SQLite:** `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`.
     #[cfg(feature = "core")]
-    async fn server_time_ms(&self) -> Result<u64, EngineError>;
+    async fn server_time_ms(&self) -> Result<u64, EngineError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| EngineError::Transport {
+                backend: "system-clock".into(),
+                source: format!("server_time_ms default: {e}").into(),
+            })?;
+        Ok(d.as_millis() as u64)
+    }
 }
 
 /// RFC-016 Stage D outcome of a single

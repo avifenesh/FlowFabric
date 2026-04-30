@@ -8583,6 +8583,35 @@ impl EngineBackend for ValkeyBackend {
         .await
     }
 
+    // ── PR-7b Wave 0a: exec_core field read ──
+
+    async fn read_exec_core_fields(
+        &self,
+        partition: ff_core::partition::Partition,
+        execution_id: &ff_core::types::ExecutionId,
+        fields: &[&str],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
+        use ff_core::keys::ExecKeyContext;
+        if fields.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let core_key = ctx.core();
+        let values: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(core_key.as_str())
+            .arg(fields)
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let mut out = std::collections::HashMap::with_capacity(fields.len());
+        for (name, val) in fields.iter().zip(values.into_iter()) {
+            out.insert((*name).to_string(), val);
+        }
+        Ok(out)
+    }
+
     // ── PR-7b Wave 0a: clock primitive ──
 
     async fn server_time_ms(&self) -> Result<u64, EngineError> {
