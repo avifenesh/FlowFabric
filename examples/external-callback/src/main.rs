@@ -401,9 +401,14 @@ async fn signal_bridge_verify_and_deliver(
         .map_err(|e| SignalBridgeError::Backend(e.into()))?
         .ok_or(SignalBridgeError::UnknownWaitpoint)?;
 
-    // Constant-time compare (truncated to length of shorter — the real
-    // bridge uses `subtle::ConstantTimeEq`; this example keeps the
-    // dependency footprint minimal).
+    // Constant-time compare — returns false immediately on length
+    // mismatch (acceptable leak: token length is not a secret, and all
+    // valid tokens share the `<kid>:<hex-digest>` shape with a
+    // fixed-size digest). The real bridge uses `subtle::ConstantTimeEq`;
+    // this example keeps the dependency footprint minimal and the
+    // `xor-accumulator` body below is constant-time for equal-length
+    // inputs, which is the security-relevant case (guarding against
+    // byte-timing oracles on the digest bytes).
     if !constant_time_eq(stored.as_bytes(), presented.as_str().as_bytes()) {
         return Err(SignalBridgeError::TokenMismatch);
     }
@@ -443,13 +448,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Flip one hex character of the signed digest so the HMAC compare
-/// fails. Keeps the `kid:` prefix intact — a realistic tamper pattern
-/// (attacker preserves structure, mutates payload).
+/// fails. Keeps the `<kid>:` prefix intact — a realistic tamper pattern
+/// (attacker preserves structure, mutates payload). The token shape is
+/// `<kid>:<hex-digest>`; we split on the first `:` and mutate only the
+/// digest half so kids like `kid-external-callback` (which contain
+/// ASCII hex digits themselves) aren't accidentally rewritten.
 fn tamper(token: &WaitpointToken) -> WaitpointToken {
     let raw = token.as_str();
-    let mut out = String::with_capacity(raw.len());
+    let Some((kid, digest)) = raw.split_once(':') else {
+        // No kid prefix — fall back to flipping the first hex char in
+        // the whole string. Shouldn't happen on a well-formed token.
+        return WaitpointToken::new(flip_first_hex(raw));
+    };
+    WaitpointToken::new(format!("{kid}:{}", flip_first_hex(digest)))
+}
+
+fn flip_first_hex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
     let mut flipped = false;
-    for c in raw.chars() {
+    for c in s.chars() {
         if !flipped && c.is_ascii_hexdigit() {
             out.push(if c == '0' { 'f' } else { '0' });
             flipped = true;
@@ -457,7 +474,7 @@ fn tamper(token: &WaitpointToken) -> WaitpointToken {
             out.push(c);
         }
     }
-    WaitpointToken::new(out)
+    out
 }
 
 // ────────────────────────────── helpers ──────────────────────────────
