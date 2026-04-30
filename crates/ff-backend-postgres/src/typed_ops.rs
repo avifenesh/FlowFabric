@@ -258,11 +258,70 @@ pub(crate) async fn complete_execution(
     }
 
     let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
-    let attempt_index = i32::try_from(args.attempt_index.0).unwrap_or(i32::MAX);
+    let attempt_index =
+        i32::try_from(args.attempt_index.0).map_err(|_| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "attempt_index {} exceeds PG i32 column bound",
+                args.attempt_index.0
+            ),
+        })?;
 
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-    // 2. Lock attempt row + epoch fence (when caller supplied one).
+    // 2. Lock exec_core FIRST (parity with Lua: lifecycle/ownership
+    // gates are the authoritative pre-conditions, checked before the
+    // attempt-row fence).
+    let exec_row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase, ownership_state, flow_id,
+               COALESCE(raw_fields->>'current_attempt_id', '') AS current_attempt_id
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+         FOR UPDATE
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+    let Some(exec_row) = exec_row else {
+        return Err(EngineError::NotFound { entity: "execution" });
+    };
+    let lifecycle_phase: String = exec_row
+        .try_get("lifecycle_phase")
+        .map_err(map_sqlx_error)?;
+    let ownership_state: String = exec_row
+        .try_get("ownership_state")
+        .map_err(map_sqlx_error)?;
+    // Valkey's `validate_lease_and_mark_expired` rejects revoked
+    // leases ahead of the lifecycle/attempt checks. PG signals
+    // revocation via `ownership_state = 'lease_revoked'`.
+    if ownership_state == "lease_revoked" {
+        return Err(EngineError::State(StateKind::LeaseRevoked));
+    }
+    if lifecycle_phase != "active" {
+        let current_attempt_id: String = exec_row
+            .try_get("current_attempt_id")
+            .map_err(map_sqlx_error)?;
+        // Terminal outcome for PG is derived from `ff_attempt.outcome`
+        // (schema of record — `raw_fields.terminal_outcome` is a
+        // denormalisation legacy row that not every migration has).
+        // Leave the wire-level detail blank when unknown rather than
+        // fabricating a stale string from raw_fields.
+        return Err(EngineError::Contention(ContentionKind::ExecutionNotActive {
+            terminal_outcome: String::new(),
+            lease_epoch: String::new(),
+            lifecycle_phase,
+            attempt_id: current_attempt_id,
+        }));
+    }
+
+    // 3. Lock attempt row + epoch fence (when caller supplied one) +
+    // lease-live check. Lua's `validate_lease_and_mark_expired` rejects
+    // expired leases with `lease_expired`; PG mirrors that by checking
+    // `lease_expires_at_ms <= now` under the same lock.
     let attempt_row = sqlx::query(
         r#"
         SELECT lease_epoch, lease_expires_at_ms
@@ -284,6 +343,9 @@ pub(crate) async fn complete_execution(
 
     let observed_epoch_i: i64 = attempt_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
     let observed_epoch = u64::try_from(observed_epoch_i).unwrap_or(0);
+    let observed_expires_at: Option<i64> = attempt_row
+        .try_get("lease_expires_at_ms")
+        .map_err(map_sqlx_error)?;
 
     if let Some(fence) = &args.fence
         && observed_epoch != fence.lease_epoch.0
@@ -291,44 +353,16 @@ pub(crate) async fn complete_execution(
         return Err(EngineError::State(StateKind::StaleLease));
     }
 
-    // 3. Lifecycle gate (fires for both fence + operator-override paths).
-    let exec_row = sqlx::query(
-        r#"
-        SELECT lifecycle_phase,
-               COALESCE(raw_fields->>'current_attempt_id', '') AS current_attempt_id,
-               COALESCE(raw_fields->>'terminal_outcome', 'none') AS terminal_outcome
-          FROM ff_exec_core
-         WHERE partition_key = $1 AND execution_id = $2
-         FOR UPDATE
-        "#,
-    )
-    .bind(part)
-    .bind(exec_uuid)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(map_sqlx_error)?;
-
-    let Some(exec_row) = exec_row else {
-        return Err(EngineError::NotFound { entity: "execution" });
-    };
-    let lifecycle_phase: String = exec_row
-        .try_get("lifecycle_phase")
-        .map_err(map_sqlx_error)?;
-    if lifecycle_phase != "active" {
-        let terminal_outcome: String =
-            exec_row.try_get("terminal_outcome").map_err(map_sqlx_error)?;
-        let current_attempt_id: String = exec_row
-            .try_get("current_attempt_id")
-            .map_err(map_sqlx_error)?;
-        return Err(EngineError::Contention(ContentionKind::ExecutionNotActive {
-            terminal_outcome,
-            lease_epoch: observed_epoch.to_string(),
-            lifecycle_phase,
-            attempt_id: current_attempt_id,
-        }));
+    // Prefer the caller-supplied `args.now` for scanner/cluster time
+    // skew — PG-local `SystemTime::now()` is fine only if the caller
+    // hasn't passed a timestamp. All typed-contract call sites DO
+    // populate `args.now`, so this path is the norm.
+    let now = args.now.0;
+    if let Some(exp) = observed_expires_at
+        && exp <= now
+    {
+        return Err(EngineError::State(StateKind::LeaseExpired));
     }
-
-    let now = now_ms();
 
     // 4. Mark attempt terminal.
     sqlx::query(
@@ -348,7 +382,12 @@ pub(crate) async fn complete_execution(
     .await
     .map_err(map_sqlx_error)?;
 
-    // 5. Flip exec_core to terminal + store result payload.
+    // 5. Flip exec_core to terminal + store result payload + stamp
+    // `terminal_outcome=success` into `raw_fields` for backfills /
+    // legacy readers that still look at the denormalised copy.
+    let raw_patch = serde_json::json!({
+        "terminal_outcome": "success",
+    });
     sqlx::query(
         r#"
         UPDATE ff_exec_core
@@ -358,12 +397,14 @@ pub(crate) async fn complete_execution(
                attempt_state = 'attempt_terminal',
                public_state = 'completed',
                terminal_at_ms = $1,
-               result = $2
-         WHERE partition_key = $3 AND execution_id = $4
+               result = $2,
+               raw_fields = raw_fields || $3::jsonb
+         WHERE partition_key = $4 AND execution_id = $5
         "#,
     )
     .bind(now)
     .bind(args.result_payload.as_deref())
+    .bind(raw_patch)
     .bind(part)
     .bind(exec_uuid)
     .execute(&mut *tx)
@@ -371,6 +412,9 @@ pub(crate) async fn complete_execution(
     .map_err(map_sqlx_error)?;
 
     // 6. Completion outbox → pg_notify cascade for DAG dispatch.
+    // Carry `namespace` + `instance_tag` forward from `ff_exec_core`
+    // so downstream subscribers (RFC-019 filtered subscriptions)
+    // receive the events instead of silently dropping on NULL.
     sqlx::query(
         r#"
         INSERT INTO ff_completion_event (
@@ -378,7 +422,9 @@ pub(crate) async fn complete_execution(
             namespace, instance_tag, occurred_at_ms
         )
         SELECT partition_key, execution_id, flow_id, 'success',
-               NULL, NULL, $3
+               raw_fields->>'namespace',
+               raw_fields->>'instance_tag',
+               $3
           FROM ff_exec_core
          WHERE partition_key = $1 AND execution_id = $2
         "#,
