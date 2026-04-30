@@ -31,6 +31,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **#453 / PR-7b: `EngineBackend::renew_lease` — Postgres body.**
+  First typed-FCALL method from cairn's v0.13-blocker list to flip
+  from `Unavailable` default to a real PG SQL transaction. Ports
+  `ff_renew_lease` from `flowfabric.lua` to a `READ COMMITTED` tx
+  with `FOR UPDATE` on the target `ff_attempt` row. Fence validation
+  covers `lease_epoch` only (documented asymmetry vs Valkey's
+  full-triple check — PG schema doesn't persist `lease_id` /
+  `attempt_id` to disk; `lease_epoch` monotonic bump catches the
+  same violations). Error mapping: `fence_required` →
+  `Validation{InvalidInput}`, `stale_lease` → `State(StaleLease)`,
+  `lease_expired` → `State(LeaseExpired)`, `execution_not_active` →
+  `Contention(ExecutionNotActive{...})`. Integration tests at
+  `crates/ff-backend-postgres/tests/typed_renew_lease.rs` cover the
+  full error matrix (ignore-gated on `FF_PG_TEST_URL`). SQLite
+  follow-up tracked separately.
 - **PR-7b Wave 0a: `Engine::start_*` no longer panics on non-Valkey
   backends (cairn #436).** The v0.12 PR-7a transitional downcast —
   `backend.as_any().downcast_ref::<ValkeyBackend>()` followed by
