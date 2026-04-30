@@ -4832,12 +4832,17 @@ impl ReportUsageAdminArgs {
 
 /// Args for [`crate::engine_backend::EngineBackend::record_spend`].
 ///
-/// Carries an **open-set** `HashMap<String, u64>` of dimension deltas
+/// Carries an **open-set** `BTreeMap<String, u64>` of dimension deltas
 /// per cairn's ground-truth shape at
 /// `cairn-fabric/src/engine/control_plane_types.rs`. Cairn budgets are
 /// per-tenant open-schema (tenant A tracks `"tokens"` + `"cost_cents"`,
 /// tenant B tracks `"egress_bytes"`), distinct from FF's fixed-shape
 /// [`UsageDimensions`] which encodes the internal usage-report surface.
+///
+/// `BTreeMap` (not `HashMap`) gives stable iteration order — consistent
+/// with `UsageDimensions::custom`, and critical for the PG body which
+/// updates multiple dimension rows per call (deterministic ordering
+/// prevents deadlocks under concurrent spend).
 ///
 /// Return shape reuses [`ReportUsageResult`] — same four variants
 /// (`Ok` / `SoftBreach` / `HardBreach` / `AlreadyApplied`) cairn's UI
@@ -4847,8 +4852,9 @@ impl ReportUsageAdminArgs {
 pub struct RecordSpendArgs {
     pub budget_id: BudgetId,
     pub execution_id: ExecutionId,
-    /// Per-dimension positive deltas. Tenant-defined keys.
-    pub deltas: std::collections::HashMap<String, u64>,
+    /// Per-dimension positive deltas. Tenant-defined keys; stable
+    /// iteration order.
+    pub deltas: BTreeMap<String, u64>,
     /// Caller-computed idempotency key (cairn uses SHA-256 hex of
     /// `budget_id || execution_id || sorted(deltas)`). FF does not
     /// interpret the bytes — dedup is a simple equality check against
@@ -4860,14 +4866,14 @@ impl RecordSpendArgs {
     pub fn new(
         budget_id: BudgetId,
         execution_id: ExecutionId,
-        deltas: std::collections::HashMap<String, u64>,
-        idempotency_key: String,
+        deltas: BTreeMap<String, u64>,
+        idempotency_key: impl Into<String>,
     ) -> Self {
         Self {
             budget_id,
             execution_id,
             deltas,
-            idempotency_key,
+            idempotency_key: idempotency_key.into(),
         }
     }
 }
@@ -4927,9 +4933,13 @@ pub struct DeliverApprovalSignalArgs {
     /// Dedup TTL in milliseconds.
     pub signal_dedup_ttl_ms: u64,
     /// Signal stream MAXLEN for the suspension stream.
-    pub maxlen: u64,
+    /// `None` ⇒ backend default (matches [`DeliverSignalArgs::signal_maxlen`]).
+    #[serde(default)]
+    pub maxlen: Option<u64>,
     /// Per-execution max signal cap (operator quota).
-    pub max_signals_per_execution: u64,
+    /// `None` ⇒ backend default (matches [`DeliverSignalArgs::max_signals_per_execution`]).
+    #[serde(default)]
+    pub max_signals_per_execution: Option<u64>,
 }
 
 impl DeliverApprovalSignalArgs {
@@ -4938,18 +4948,18 @@ impl DeliverApprovalSignalArgs {
         execution_id: ExecutionId,
         lane_id: LaneId,
         waitpoint_id: WaitpointId,
-        signal_name: String,
-        idempotency_suffix: String,
+        signal_name: impl Into<String>,
+        idempotency_suffix: impl Into<String>,
         signal_dedup_ttl_ms: u64,
-        maxlen: u64,
-        max_signals_per_execution: u64,
+        maxlen: Option<u64>,
+        max_signals_per_execution: Option<u64>,
     ) -> Self {
         Self {
             execution_id,
             lane_id,
             waitpoint_id,
-            signal_name,
-            idempotency_suffix,
+            signal_name: signal_name.into(),
+            idempotency_suffix: idempotency_suffix.into(),
             signal_dedup_ttl_ms,
             maxlen,
             max_signals_per_execution,

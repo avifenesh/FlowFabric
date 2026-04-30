@@ -1700,7 +1700,7 @@ pub trait EngineBackend: Send + Sync + 'static {
 
     /// Per-execution budget spend with tenant-open dimensions.
     ///
-    /// Cairn #454 Q1/Q2: takes an open-set `HashMap<String, u64>` of
+    /// Cairn #454 Q1/Q2: takes an open-set `BTreeMap<String, u64>` of
     /// deltas (distinct from the fixed-shape
     /// [`Self::report_usage`]/[`Self::report_usage_admin`] which use
     /// [`UsageDimensions`]). Return shape reuses [`ReportUsageResult`]
@@ -3589,8 +3589,8 @@ mod tests {
         let args = RecordSpendArgs::new(
             BudgetId::new(),
             eid,
-            std::collections::HashMap::new(),
-            "k".into(),
+            std::collections::BTreeMap::new(),
+            "k",
         );
         match b.record_spend(args).await.unwrap_err() {
             EngineError::Unavailable { op } => assert_eq!(op, "record_spend"),
@@ -3625,11 +3625,11 @@ mod tests {
             eid,
             LaneId::new("default"),
             WaitpointId::new(),
-            "approved".into(),
-            "sfx".into(),
+            "approved",
+            "sfx",
             1_000,
-            100,
-            10,
+            Some(100),
+            Some(10),
         );
         match b.deliver_approval_signal(args).await.unwrap_err() {
             EngineError::Unavailable { op } => assert_eq!(op, "deliver_approval_signal"),

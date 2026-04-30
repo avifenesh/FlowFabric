@@ -482,16 +482,19 @@ from the default impl so out-of-tree backends compile unchanged.
 
 | Method | Args | Return |
 |---|---|---|
-| `record_spend` | [`RecordSpendArgs`] | [`ReportUsageResult`] |
-| `release_budget` | [`ReleaseBudgetArgs`] | `()` |
-| `deliver_approval_signal` | [`DeliverApprovalSignalArgs`] | [`DeliverSignalResult`] |
-| `issue_grant_and_claim` | [`IssueGrantAndClaimArgs`] | [`ClaimGrantOutcome`] |
+| `record_spend` | `RecordSpendArgs` | `ReportUsageResult` |
+| `release_budget` | `ReleaseBudgetArgs` | `()` |
+| `deliver_approval_signal` | `DeliverApprovalSignalArgs` | `DeliverSignalResult` |
+| `issue_grant_and_claim` | `IssueGrantAndClaimArgs` | `ClaimGrantOutcome` |
 
 **Shape notes (why these types, not the existing peers).**
 
-- `RecordSpendArgs.deltas` is `HashMap<String, u64>` — **open-set**
-  tenant-defined dimension keys, distinct from the fixed-shape
-  `UsageDimensions` used by `report_usage` / `report_usage_admin`.
+- `RecordSpendArgs.deltas` is `BTreeMap<String, u64>` — **open-set**
+  tenant-defined dimension keys with stable iteration order, distinct
+  from the fixed-shape `UsageDimensions` used by `report_usage` /
+  `report_usage_admin`. Stable ordering matches `UsageDimensions::custom`
+  and lets the PG body update multiple dimension rows in a fixed order
+  (avoids deadlocks under concurrent spend).
   Cairn budgets are per-tenant open-schema (tenant A tracks
   `"tokens"` + `"cost_cents"`; tenant B tracks `"egress_bytes"`).
   Return reuses `ReportUsageResult` — same four variants cairn's UI
@@ -532,9 +535,9 @@ per-backend phases merge.
 **After (v0.13):**
 
 ```rust,ignore
-let deltas = std::collections::HashMap::from([
-    ("tokens".into(), 1_500),
-    ("cost_cents".into(), 12),
+let deltas = std::collections::BTreeMap::from([
+    ("tokens".to_string(), 1_500),
+    ("cost_cents".to_string(), 12),
 ]);
 let outcome = backend
     .record_spend(RecordSpendArgs::new(
