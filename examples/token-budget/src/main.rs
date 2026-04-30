@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     // use below for `create_budget` / `get_budget_status` / `cancel_flow`
     // — no second Valkey connection.
     let worker = FlowFabricWorker::connect(WorkerConfig {
-        backend: flowfabric::core::backend::BackendConfig::valkey(host.clone(), port),
+        backend: Some(flowfabric::core::backend::BackendConfig::valkey(host.clone(), port)),
         worker_id: WorkerId::new(WORKER_POOL),
         worker_instance_id: WorkerInstanceId::new(format!(
             "{WORKER_POOL}-{}",

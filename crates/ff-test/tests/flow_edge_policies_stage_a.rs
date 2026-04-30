@@ -78,7 +78,7 @@ async fn start_server(
 
 async fn build_worker() -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: WorkerId::new("edgepol-worker"),
         worker_instance_id: WorkerInstanceId::new("edgepol-inst"),
         namespace: Namespace::new(NS),

@@ -182,10 +182,10 @@ async fn drive_worker(
     use std::sync::atomic::Ordering;
 
     let config = WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(
+        backend: Some(ff_core::backend::BackendConfig::valkey(
             env.valkey_host.clone(),
             env.valkey_port,
-        ),
+        )),
         worker_id: ff_core::types::WorkerId::new(format!("bench-worker-{wi}")),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
             "bench-worker-{wi}-{}",

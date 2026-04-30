@@ -132,7 +132,7 @@ async fn lifecycle_retry_backoff() {
 
     // 6. Spawn in-process SDK worker.
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_readiness_tests::valkey::backend_config_from_env(),
+        backend: Some(ff_readiness_tests::valkey::backend_config_from_env()),
         worker_id: WorkerId::new("readiness-retry-worker"),
         worker_instance_id: WorkerInstanceId::new("readiness-retry-inst"),
         namespace: Namespace::new(NS),

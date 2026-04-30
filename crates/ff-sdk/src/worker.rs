@@ -41,7 +41,7 @@ use crate::SdkError;
 /// use ff_sdk::{FlowFabricWorker, WorkerConfig};
 ///
 /// let config = WorkerConfig {
-///     backend: BackendConfig::valkey("localhost", 6379),
+///     backend: Some(BackendConfig::valkey("localhost", 6379)),
 ///     worker_id: WorkerId::new("w1"),
 ///     worker_instance_id: WorkerInstanceId::new("w1-i1"),
 ///     namespace: Namespace::new("default"),
@@ -219,7 +219,22 @@ impl FlowFabricWorker {
         // Delegates to `ff_backend_valkey::build_client` so host/port +
         // TLS + cluster + `BackendTimeouts::request` + `BackendRetry`
         // wiring lives in exactly one place (RFC-012 Stage 1c tranche 1).
-        let client = ff_backend_valkey::build_client(&config.backend).await?;
+        //
+        // v0.13 ergonomics fix (feedback_sdk_reclaim_ergonomics
+        // Finding 2): `WorkerConfig.backend` is `Option<BackendConfig>`
+        // because `connect_with` ignores it. The URL-based `connect`
+        // path still requires a concrete `BackendConfig` to dial;
+        // reject `None` up front with a typed Config error instead of
+        // silently using a default that would hide a caller mistake.
+        let backend_config = config.backend.as_ref().ok_or_else(|| SdkError::Config {
+            context: "worker_config".into(),
+            field: Some("backend".into()),
+            message: "FlowFabricWorker::connect requires WorkerConfig.backend = \
+                Some(BackendConfig::...); use FlowFabricWorker::connect_with for \
+                the backend-agnostic path that takes a pre-built \
+                Arc<dyn EngineBackend>".into(),
+        })?;
+        let client = ff_backend_valkey::build_client(backend_config).await?;
 
         // v0.12 PR-6: the Valkey-specific preamble (PING, alive-key
         // SET-NX, `ff:config:partitions` HGETALL, caps ingress +
@@ -383,6 +398,22 @@ impl FlowFabricWorker {
                 field: None,
                 message: "at least one lane is required".into(),
             });
+        }
+
+        // v0.13 ergonomics fix (feedback_sdk_reclaim_ergonomics
+        // Finding 2): `WorkerConfig.backend` is ignored on this path —
+        // the caller-supplied `Arc<dyn EngineBackend>` is authoritative.
+        // If the caller left behind a `Some(..)` from an earlier
+        // `connect(..)` template, warn so the ambiguity is visible.
+        if config.backend.is_some() {
+            tracing::warn!(
+                worker_id = %config.worker_id,
+                instance_id = %config.worker_instance_id,
+                "WorkerConfig.backend is Some(..) but FlowFabricWorker::connect_with \
+                 was invoked — BackendConfig is ignored, the injected \
+                 Arc<dyn EngineBackend> is authoritative. Set WorkerConfig.backend = \
+                 None on the connect_with path to silence this warning."
+            );
         }
 
         let max_tasks = config.max_concurrent_tasks.max(1);

@@ -55,7 +55,7 @@ async fn bug_b_resume_via_server_claim() {
 
     // Worker config. Server-routed claim — no direct-valkey-claim feature reliance.
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_readiness_tests::valkey::backend_config_from_env(),
+        backend: Some(ff_readiness_tests::valkey::backend_config_from_env()),
         worker_id: WorkerId::new("bug-b-worker"),
         worker_instance_id: WorkerInstanceId::new("bug-b-inst"),
         namespace: Namespace::new(NS),

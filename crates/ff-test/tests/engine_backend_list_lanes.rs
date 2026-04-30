@@ -48,7 +48,7 @@ async fn seed_lanes(tc: &TestCluster, lanes: &[&str]) {
 
 async fn build_sdk_worker() -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new("list-lanes-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("list-lanes-inst"),
         namespace: ff_core::types::Namespace::new("list-lanes-ns"),

@@ -24,7 +24,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), ff_sdk::SdkError> {
 //!     let config = WorkerConfig {
-//!         backend: BackendConfig::valkey("localhost", 6379),
+//!         backend: Some(BackendConfig::valkey("localhost", 6379)),
 //!         worker_id: WorkerId::new("my-worker"),
 //!         worker_instance_id: WorkerInstanceId::new("my-worker-instance-1"),
 //!         namespace: Namespace::new("default"),

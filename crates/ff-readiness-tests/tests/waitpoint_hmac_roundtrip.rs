@@ -80,7 +80,7 @@ async fn waitpoint_hmac_roundtrip() {
 
     // 2. Spawn the SDK worker once — all four executions below share it.
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_readiness_tests::valkey::backend_config_from_env(),
+        backend: Some(ff_readiness_tests::valkey::backend_config_from_env()),
         worker_id: WorkerId::new("readiness-hmac-worker"),
         worker_instance_id: WorkerInstanceId::new("readiness-hmac-inst"),
         namespace: Namespace::new(NS),

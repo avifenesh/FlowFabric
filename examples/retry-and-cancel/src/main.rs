@@ -297,7 +297,7 @@ async fn run_worker(
     done: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(host, port),
+        backend: Some(ff_core::backend::BackendConfig::valkey(host, port)),
         worker_id: ff_core::types::WorkerId::new(WORKER_POOL),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
             "{WORKER_POOL}-{}",

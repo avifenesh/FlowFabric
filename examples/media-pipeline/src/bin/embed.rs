@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
     let instance_id = format!("embed-{}", uuid::Uuid::new_v4());
     let config = WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(&args.host, args.port),
+        backend: Some(ff_core::backend::BackendConfig::valkey(&args.host, args.port)),
         worker_id: ff_core::types::WorkerId::new("embed"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(&instance_id),
         namespace: ff_core::types::Namespace::new(&args.namespace),

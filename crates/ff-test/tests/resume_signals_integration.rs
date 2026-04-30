@@ -26,7 +26,7 @@ const NS: &str = "resume-sig-ns";
 
 async fn build_worker(name_suffix: &str) -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new(format!("resume-sig-worker-{name_suffix}")),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
             "resume-sig-inst-{name_suffix}"

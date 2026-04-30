@@ -1,11 +1,15 @@
 # Consumer migration — v0.12 → v0.13
 
 **Scope.** v0.13 is an ergonomics release on top of v0.12. This doc
-covers the one consumer-visible SDK change in the release:
-`FlowFabricAdminClient` is now a **backend-agnostic facade**,
-constructible either over HTTP (existing behaviour) or directly over
-a backend trait object (new). No breaking changes — existing
-`connect` / `with_token` call-sites compile and behave identically.
+covers two consumer-visible SDK changes in the release:
+1. `FlowFabricAdminClient` is now a **backend-agnostic facade**,
+   constructible either over HTTP (existing behaviour) or directly
+   over a backend trait object (new). No breaking changes — existing
+   `connect` / `with_token` call-sites compile and behave identically.
+2. `WorkerConfig.backend` is now `Option<BackendConfig>` so
+   `FlowFabricWorker::connect_with` callers no longer need a
+   placeholder `BackendConfig`. Breaking for struct-literal
+   `connect` callers (wrap existing `BackendConfig` in `Some(...)`).
 
 A per-change CHANGELOG listing is the source of truth; this doc
 focuses on the ergonomic upgrade path.
@@ -223,6 +227,69 @@ The extra `engine_backend` argument is mechanical (pass the same
 - `rotate_waitpoint_hmac_secret_all_partitions` free fn stays
   Valkey-gated (Valkey-specific FCALL fan-out; use the facade's
   `rotate_waitpoint_secret` for the agnostic path).
-- `WorkerConfig.backend: BackendConfig` dead-field under
-  `connect_with` — unresolved from v0.12 `feedback_sdk_reclaim_ergonomics.md`
-  Finding 2; separate follow-up.
+(Closed in this release: `WorkerConfig.backend: BackendConfig` dead
+under `connect_with` — see the dedicated section below.)
+
+## What also changed
+
+### `WorkerConfig.backend` is now `Option<BackendConfig>` (SC-10 follow-up)
+
+**Motivation.** The v0.12 SC-10 `incident-remediation` example
+surfaced a second rough edge on top of the admin-HTTP-only one:
+`WorkerConfig.backend` was eagerly required, but only consumed by
+`FlowFabricWorker::connect` (URL-based Valkey dial). The
+`connect_with` path — backend-agnostic, takes a pre-built
+`Arc<dyn EngineBackend>` — ignored the field entirely, forcing
+every `connect_with` caller (including the SC-10 SQLite supervisor)
+to carry a placeholder `BackendConfig::valkey("127.0.0.1", 6379)`
+just to satisfy the struct literal. Cairn flagged this as Finding 2
+in `feedback_sdk_reclaim_ergonomics.md`; v0.13 closes it.
+
+**Shape.** The field type changes from `BackendConfig` to
+`Option<BackendConfig>`. Semantics:
+
+- `Some(cfg)` + `FlowFabricWorker::connect` — unchanged. `cfg`
+  drives the dial.
+- `None` + `FlowFabricWorker::connect` — rejected with
+  `SdkError::Config { context: "worker_config", field:
+  Some("backend"), .. }`. The URL-based path needs a
+  `BackendConfig` to dial; silently defaulting would hide caller
+  mistakes.
+- `None` + `FlowFabricWorker::connect_with` — the clean path.
+  The injected backend is authoritative.
+- `Some(cfg)` + `FlowFabricWorker::connect_with` — accepted, but
+  logs a `tracing::warn!` noting that `cfg` is ignored. Useful
+  for callers mid-migration; set the field to `None` to silence.
+
+**Before (v0.12, `connect_with` path):**
+
+```rust,ignore
+let config = WorkerConfig {
+    backend: BackendConfig::valkey("127.0.0.1", 6379), // placeholder — ignored
+    worker_id: WorkerId::new("w1"),
+    // …
+};
+FlowFabricWorker::connect_with(config, backend, None).await?;
+```
+
+**After (v0.13, `connect_with` path):**
+
+```rust,ignore
+let config = WorkerConfig {
+    backend: None, // explicit: this path takes the injected backend
+    worker_id: WorkerId::new("w1"),
+    // …
+};
+FlowFabricWorker::connect_with(config, backend, None).await?;
+```
+
+**After (v0.13, `connect` path — minimal change):**
+
+```rust,ignore
+let config = WorkerConfig {
+    backend: Some(BackendConfig::valkey("localhost", 6379)), // wrap in Some
+    worker_id: WorkerId::new("w1"),
+    // …
+};
+FlowFabricWorker::connect(config).await?;
+```

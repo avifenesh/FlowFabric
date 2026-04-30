@@ -100,7 +100,7 @@ async fn lifecycle_happy_path() {
 
     // 6. Spawn in-process SDK worker using direct-valkey-claim.
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_readiness_tests::valkey::backend_config_from_env(),
+        backend: Some(ff_readiness_tests::valkey::backend_config_from_env()),
         worker_id: WorkerId::new("readiness-happy-worker"),
         worker_instance_id: WorkerInstanceId::new("readiness-happy-inst"),
         namespace: Namespace::new(NS),
