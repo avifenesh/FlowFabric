@@ -8378,14 +8378,38 @@ impl EngineBackend for ValkeyBackend {
                 }
             };
 
-            let (next_cursor, members) = parse_sscan_response(&result)
-                .unwrap_or_else(|| ("0".to_string(), vec![]));
+            let (next_cursor, members) = match parse_sscan_response(&result) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Malformed SSCAN reply is a hard transport error —
+                    // surfacing it lets the next reconciler cycle retry
+                    // with a real error signal rather than silently
+                    // ending the scan and hiding index drift.
+                    tracing::warn!(
+                        partition = partition.index,
+                        hash_tag = %tag,
+                        error = %e,
+                        "reconcile_execution_index: malformed SSCAN reply; \
+                         aborting cycle to surface error"
+                    );
+                    return Err(e);
+                }
+            };
 
             for eid_str in &members {
                 if self.scanner_skip_candidate(filter, eid_str).await {
                     continue;
                 }
-                match check_execution_index(&self.client, &tag, &idx, eid_str, lanes).await {
+                match check_execution_index(
+                    &self.client,
+                    &partition,
+                    &tag,
+                    &idx,
+                    eid_str,
+                    lanes,
+                )
+                .await
+                {
                     Ok(true) => {}
                     Ok(false) => processed += 1,
                     Err(e) => {
@@ -8517,6 +8541,7 @@ impl EngineBackend for ValkeyBackend {
 /// logged. Mirrors the pre-routing `index_reconciler::check_execution_index`.
 async fn check_execution_index(
     client: &ferriskey::Client,
+    partition: &Partition,
     tag: &str,
     idx: &IndexKeys,
     eid_str: &str,
@@ -8536,6 +8561,8 @@ async fn check_execution_index(
 
     if fields.is_empty() || fields[0].is_none() {
         tracing::warn!(
+            partition = partition.index,
+            hash_tag = %tag,
             execution_id = eid_str,
             "reconcile_execution_index: execution in all_executions but core hash missing"
         );
@@ -8589,6 +8616,8 @@ async fn check_execution_index(
 
     if score.is_none() {
         tracing::warn!(
+            partition = partition.index,
+            hash_tag = %tag,
             execution_id = eid_str,
             expected_index,
             expected_key = expected_key.as_str(),
@@ -8850,17 +8879,70 @@ fn parse_sscan_tuple(val: &ferriskey::Value) -> (String, Vec<String>) {
     (cursor, members)
 }
 
-/// Parse `SSCAN` into `Option<(cursor, members)>` — variant used by
-/// the index reconciler which treats an unparsable reply as an error
-/// rather than an empty page.
-fn parse_sscan_response(val: &ferriskey::Value) -> Option<(String, Vec<String>)> {
-    let (cursor, members) = parse_sscan_tuple(val);
-    // `parse_sscan_tuple` returns `("0", vec![])` on malformed input.
-    // Distinguish by re-checking the outer Array shape.
-    if !matches!(val, ferriskey::Value::Array(a) if a.len() >= 2) {
-        return None;
+/// Parse `SSCAN` into a strict `(cursor, members)` tuple — variant
+/// used by the index reconciler which treats an unparsable reply as a
+/// hard transport error rather than silently ending the scan (which
+/// would hide index drift). Any unexpected outer shape, cursor
+/// variant, or member variant maps to `EngineError::Transport`.
+fn parse_sscan_response(
+    val: &ferriskey::Value,
+) -> Result<(String, Vec<String>), EngineError> {
+    fn transport(detail: &'static str) -> EngineError {
+        EngineError::Transport {
+            backend: "valkey",
+            source: format!("parse_sscan_response: {detail}").into(),
+        }
     }
-    Some((cursor, members))
+
+    let arr = match val {
+        ferriskey::Value::Array(a) if a.len() >= 2 => a,
+        _ => return Err(transport("expected Array(len >= 2) reply")),
+    };
+
+    let cursor = match &arr[0] {
+        Ok(ferriskey::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
+        Ok(ferriskey::Value::SimpleString(s)) => s.clone(),
+        _ => return Err(transport("cursor element has unexpected variant")),
+    };
+
+    let mut members = Vec::new();
+    match &arr[1] {
+        Ok(ferriskey::Value::Array(inner)) => {
+            for item in inner {
+                match item {
+                    Ok(ferriskey::Value::BulkString(b)) => {
+                        members.push(String::from_utf8_lossy(b).into_owned());
+                    }
+                    _ => {
+                        return Err(transport(
+                            "member element has unexpected variant",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(ferriskey::Value::Set(inner)) => {
+            for item in inner {
+                match item {
+                    ferriskey::Value::BulkString(b) => {
+                        members.push(String::from_utf8_lossy(b).into_owned());
+                    }
+                    _ => {
+                        return Err(transport(
+                            "member element has unexpected variant",
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(transport(
+                "members element has unexpected variant (expected Array/Set)",
+            ));
+        }
+    }
+
+    Ok((cursor, members))
 }
 
 /// Aggregate partition-level lease-history stream key. RFC-019 Stage A
