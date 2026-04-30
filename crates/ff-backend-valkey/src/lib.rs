@@ -46,7 +46,7 @@ use ff_core::contracts::{
     IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
     ListSuspendedPage, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
-    ScanEligibleArgs,
+    RecordSpendArgs, ReleaseBudgetArgs, ScanEligibleArgs,
     ReportUsageResult, ResumeCondition, ResumePolicy, ResumeTarget,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
     RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretArgs, SeedOutcome,
@@ -81,7 +81,7 @@ use ff_script::functions::quota::ff_check_admission_and_record;
 use ff_script::functions::scheduling::{
     ChangePriorityResultPartial, SchedOpKeys, ff_change_priority,
 };
-use ff_script::functions::budget::{BudgetOpKeys, ff_create_budget, ff_report_usage_and_check, ff_reset_budget};
+use ff_script::functions::budget::{BudgetOpKeys, ff_create_budget, ff_record_spend, ff_release_budget, ff_report_usage_and_check, ff_reset_budget};
 use ff_script::functions::quota::{QuotaOpKeys, ff_create_quota_policy};
 use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_deliver_signal};
 use ff_script::result::{FcallResult, FromFcallResult};
@@ -2942,6 +2942,83 @@ fn parse_u64_field(
     })
 }
 
+/// cairn #454 Phase 3a — `record_spend` Valkey body.
+///
+/// Open-set spend recording. Dispatches to the `ff_record_spend` FCALL,
+/// which shares the check-then-increment semantics of
+/// `ff_report_usage_and_check` but accepts a `BTreeMap<String, u64>` of
+/// tenant-defined dimension deltas. Return shape is `ReportUsageResult`
+/// verbatim so `parse_report_usage` is reused.
+#[tracing::instrument(
+    name = "ff.record_spend",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        budget_id = %args.budget_id,
+        dim_count = args.deltas.len(),
+    )
+)]
+async fn record_spend_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: RecordSpendArgs,
+) -> Result<ReportUsageResult, EngineError> {
+    use ff_core::keys::BudgetKeyContext;
+    use ff_core::partition::budget_partition;
+
+    let partition = budget_partition(&args.budget_id, partition_config);
+    let bctx = BudgetKeyContext::new(&partition, &args.budget_id);
+    let usage = bctx.usage();
+    let limits = bctx.limits();
+    let definition = bctx.definition();
+    let by_exec = bctx.by_exec(&args.execution_id.to_string());
+    let by_exec_index = bctx.by_exec_index();
+    let hash_tag = bctx.hash_tag().to_string();
+    let keys = BudgetOpKeys {
+        usage_key: &usage,
+        limits_key: &limits,
+        def_key: &definition,
+        hash_tag: &hash_tag,
+    };
+    let now = now_ms_timestamp();
+    ff_record_spend(client, &keys, &by_exec, &by_exec_index, &args, now)
+        .await
+        .map_err(EngineError::from)
+}
+
+/// cairn #454 Phase 3b - release_budget Valkey body.
+///
+/// Reverses this execution's attribution by reading the per-execution
+/// ledger written during record_spend and negating each dim on the
+/// aggregate usage. Idempotent - replays are safe no-ops.
+#[tracing::instrument(
+    name = "ff.release_budget",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        budget_id = %args.budget_id,
+    )
+)]
+async fn release_budget_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: ReleaseBudgetArgs,
+) -> Result<(), EngineError> {
+    use ff_core::keys::BudgetKeyContext;
+    use ff_core::partition::budget_partition;
+
+    let partition = budget_partition(&args.budget_id, partition_config);
+    let bctx = BudgetKeyContext::new(&partition, &args.budget_id);
+    let usage = bctx.usage();
+    let by_exec = bctx.by_exec(&args.execution_id.to_string());
+    let by_exec_index = bctx.by_exec_index();
+    ff_release_budget(client, &usage, &by_exec, &by_exec_index, &args)
+        .await
+        .map_err(EngineError::from)
+}
+
 // ── Tranche 2: terminal writes (delay, wait_children, complete, fail, cancel) ──
 
 /// Stage 1b — `delay` FCALL body. Migrated from
@@ -5725,6 +5802,36 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "report_usage: FCALL ff_report_usage_and_check",
+                )
+            })
+    }
+
+    /// cairn #454 Phase 3a — open-set spend recording.
+    async fn record_spend(
+        &self,
+        args: RecordSpendArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        record_spend_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "record_spend: FCALL ff_record_spend",
+                )
+            })
+    }
+
+    /// cairn #454 Phase 3b - per-execution budget attribution release.
+    async fn release_budget(
+        &self,
+        args: ReleaseBudgetArgs,
+    ) -> Result<(), EngineError> {
+        release_budget_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "release_budget: FCALL ff_release_budget",
                 )
             })
     }
