@@ -11,11 +11,14 @@
 //!
 //! Reference: RFC-008 §Quota Reconciliation, RFC-010 §6.6
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys;
 use ff_core::partition::{Partition, PartitionFamily};
+use ff_core::types::TimestampMs;
 
 use super::{ScanResult, Scanner};
 
@@ -23,6 +26,10 @@ pub struct QuotaReconciler {
     interval: Duration,
     /// Issue #122: accepted for uniform API; not applied.
     filter: ScannerFilter,
+    /// PR-7b Cluster 2b-A: when set, `scan_partition` delegates the
+    /// whole pass to `EngineBackend::reconcile_quota_counters`.
+    /// `None` keeps the legacy direct-client path for unit tests.
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl QuotaReconciler {
@@ -36,7 +43,26 @@ impl QuotaReconciler {
     /// `namespace` / `instance_tag` filter dimensions do not map
     /// onto quota partitions.
     pub fn with_filter(interval: Duration, filter: ScannerFilter) -> Self {
-        Self { interval, filter }
+        Self {
+            interval,
+            filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 2b-A: wire an `EngineBackend` so the scan-and-fix
+    /// pass routes through `EngineBackend::reconcile_quota_counters`
+    /// instead of issuing Redis commands directly.
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            filter,
+            backend: Some(backend),
+        }
     }
 }
 
@@ -71,6 +97,26 @@ impl Scanner for QuotaReconciler {
                 return ScanResult { processed: 0, errors: 1 };
             }
         };
+
+        // PR-7b Cluster 2b-A: delegate to the trait when a backend is
+        // wired. Fetched `now_ms` is passed through so window cutoffs
+        // match the legacy path exactly.
+        if let Some(backend) = self.backend.as_ref() {
+            return match backend
+                .reconcile_quota_counters(p, TimestampMs::from_millis(now_ms as i64))
+                .await
+            {
+                Ok(counts) => ScanResult {
+                    processed: counts.processed,
+                    errors: counts.errors,
+                },
+                Err(e) => {
+                    tracing::warn!(partition, error = %e,
+                        "quota_reconciler: reconcile_quota_counters trait call failed");
+                    ScanResult { processed: 0, errors: 1 }
+                }
+            };
+        }
 
         // Discover quota policies via partition-level index SET (cluster-safe)
         let policies_key = keys::quota_policies_index(&tag);

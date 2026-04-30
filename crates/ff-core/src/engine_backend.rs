@@ -2307,6 +2307,79 @@ pub trait EngineBackend: Send + Sync + 'static {
             op: "reconcile_sibling_cancel_group",
         })
     }
+
+    // ── PR-7b Cluster 2b-A — Tally-recompute reconciler scanners ─────
+    //
+    // Coarse trait methods: each runs a full scan-and-fix pass over
+    // one partition. Unlike cluster-2's per-candidate write hooks,
+    // these scanners do multi-round-trip discovery (SSCAN / HMGET /
+    // HGETALL / ZSCORE / ZREMRANGEBYSCORE) interleaved with conditional
+    // writes. Moving the whole pass into the trait impl achieves the
+    // PR-7b/final contract ("scanner trait leaks no `ferriskey::Client`")
+    // without atomising operations that are inherently not atomic.
+    //
+    // Backend status (all three methods):
+    //
+    // - **Valkey:** real scan-loop in the trait impl; identical command
+    //   shape to the pre-routing scanner path.
+    // - **Postgres:** default `Unavailable`. PG mutates budget / quota
+    //   counters and scheduling state inside SERIALIZABLE transactions,
+    //   and the scheduler evaluates eligibility via live SQL predicates
+    //   on `ff_exec_core` + budget / quota tables — no persistent index
+    //   or counter hash that can drift, hence nothing to reconcile. The
+    //   engine's PG scanner supervisor does not run these paths.
+    // - **SQLite:** same as Postgres (RFC-023: SQLite runs its own
+    //   scanner supervisor; these FF-owned tally-recompute scanners
+    //   are not registered).
+
+    /// Index-reconciler pass — walks `ff:idx:{p:N}:all_executions`
+    /// and verifies each execution appears in the correct scheduling
+    /// sorted set (`eligible` / `delayed` / `blocked:*` / `active` /
+    /// `suspended` / `terminal`) for its current `(lifecycle_phase,
+    /// eligibility_state, ownership_state)` triple. Phase 1 is
+    /// log-only; auto-fix is deferred to a later phase (RFC-010 §6.14).
+    async fn reconcile_execution_index(
+        &self,
+        _partition: crate::partition::Partition,
+        _lanes: &[LaneId],
+        _filter: &crate::backend::ScannerFilter,
+    ) -> Result<ReconcileCounts, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "reconcile_execution_index",
+        })
+    }
+
+    /// Budget-reconciler pass — walks `ff:budget:{b:M}:policies_idx`,
+    /// reads each budget's definition / usage / limits, and reconciles
+    /// the `breached_at` marker against hard limits. Resetting budgets
+    /// (non-zero `reset_interval_ms`) are skipped — they are handled
+    /// by the `budget_reset` scanner (cluster 2). Drops index entries
+    /// for budgets whose definition hash has been deleted (retention
+    /// purge / manual). RFC-008 §Budget Reconciliation, RFC-010 §6.5.
+    async fn reconcile_budget_counters(
+        &self,
+        _partition: crate::partition::Partition,
+        _now_ms: TimestampMs,
+    ) -> Result<ReconcileCounts, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "reconcile_budget_counters",
+        })
+    }
+
+    /// Quota-reconciler pass — walks `ff:quota:{q:M}:policies_idx`,
+    /// trims expired entries from rate-limit sliding windows, and
+    /// recomputes each policy's concurrency counter by walking its
+    /// `admitted_set` and pruning entries whose admission guard key
+    /// has TTLed out. RFC-008 §Quota Reconciliation, RFC-010 §6.6.
+    async fn reconcile_quota_counters(
+        &self,
+        _partition: crate::partition::Partition,
+        _now_ms: TimestampMs,
+    ) -> Result<ReconcileCounts, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "reconcile_quota_counters",
+        })
+    }
 }
 
 /// RFC-016 Stage D outcome of a single
@@ -2338,6 +2411,23 @@ impl SiblingCancelReconcileAction {
             Self::NoOp => "no_op",
         }
     }
+}
+
+/// Result of one reconciler scan pass over a single partition.
+///
+/// `processed` counts candidates where the reconciler detected a
+/// correctable condition (drift, breach flip, stale guard). `errors`
+/// counts transport / parse failures. Scanners sum these into the
+/// engine's per-pass metrics exactly as they did before PR-7b/2b-A.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileCounts {
+    /// Items the scanner corrected (drift fix, breach flip, guard
+    /// eviction). Zero when the partition is healthy.
+    pub processed: u32,
+    /// Items the scanner could not process due to transport or parse
+    /// errors. Non-zero values surface through scanner metrics and
+    /// should be investigated.
+    pub errors: u32,
 }
 
 /// Which scanner invoked [`EngineBackend::expire_execution`].
@@ -3097,6 +3187,59 @@ mod tests {
         let args = EvaluateFlowEligibilityArgs { execution_id: eid };
         match b.evaluate_flow_eligibility(args).await.unwrap_err() {
             EngineError::Unavailable { op } => assert_eq!(op, "evaluate_flow_eligibility"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    // ── Cluster 2b-A tally-recompute reconcilers ──
+
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_reconcile_execution_index_is_unavailable() {
+        use crate::backend::ScannerFilter;
+        use crate::partition::{Partition, PartitionFamily};
+        let b = DefaultBackend;
+        let partition = Partition { family: PartitionFamily::Execution, index: 0 };
+        let lanes = [LaneId::new("default")];
+        let filter = ScannerFilter::default();
+        match b
+            .reconcile_execution_index(partition, &lanes, &filter)
+            .await
+            .unwrap_err()
+        {
+            EngineError::Unavailable { op } => assert_eq!(op, "reconcile_execution_index"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_reconcile_budget_counters_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+        let b = DefaultBackend;
+        let partition = Partition { family: PartitionFamily::Budget, index: 0 };
+        match b
+            .reconcile_budget_counters(partition, TimestampMs::from_millis(0))
+            .await
+            .unwrap_err()
+        {
+            EngineError::Unavailable { op } => assert_eq!(op, "reconcile_budget_counters"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_reconcile_quota_counters_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+        let b = DefaultBackend;
+        let partition = Partition { family: PartitionFamily::Quota, index: 0 };
+        match b
+            .reconcile_quota_counters(partition, TimestampMs::from_millis(0))
+            .await
+            .unwrap_err()
+        {
+            EngineError::Unavailable { op } => assert_eq!(op, "reconcile_quota_counters"),
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }
