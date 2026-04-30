@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // produces events.
     let done = Arc::new(Notify::new());
     let worker = FlowFabricWorker::connect(WorkerConfig {
-        backend: BackendConfig::valkey(host.clone(), port),
+        backend: Some(BackendConfig::valkey(host.clone(), port)),
         worker_id: WorkerId::new(WORKER_POOL),
         worker_instance_id: WorkerInstanceId::new(format!(
             "{WORKER_POOL}-{}",

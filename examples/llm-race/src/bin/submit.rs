@@ -193,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RFC-016 Stage B requires the policy be set BEFORE the first
     // `add_dependency(... -> aggregator)` edge lands.
     let sdk = FlowFabricWorker::connect(WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(&args.host, args.port),
+        backend: Some(ff_core::backend::BackendConfig::valkey(&args.host, args.port)),
         worker_id: WorkerId::new("llm-race-submit"),
         worker_instance_id: WorkerInstanceId::new(format!(
             "llm-race-submit-{}",

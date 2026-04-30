@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let config = WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(&args.host, args.port),
+        backend: Some(ff_core::backend::BackendConfig::valkey(&args.host, args.port)),
         worker_id: ff_core::types::WorkerId::new("llm-race-provider"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
             "llm-race-provider-{}",

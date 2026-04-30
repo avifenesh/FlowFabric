@@ -32,7 +32,7 @@ fn suffix() -> String {
 
 async fn spawn_worker(lane: &str, ns: &str, sfx: &str) -> ff_sdk::FlowFabricWorker {
     let cfg = WorkerConfig {
-        backend: ff_readiness_tests::valkey::backend_config_from_env(),
+        backend: Some(ff_readiness_tests::valkey::backend_config_from_env()),
         worker_id: WorkerId::new(format!("rs-smoke-w-{sfx}")),
         worker_instance_id: WorkerInstanceId::new(format!("rs-smoke-i-{sfx}")),
         namespace: Namespace::new(ns),

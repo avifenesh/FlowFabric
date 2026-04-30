@@ -523,10 +523,10 @@ async fn echo_worker_loop(
     shutdown_rx: Arc<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     let config = WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(
+        backend: Some(ff_core::backend::BackendConfig::valkey(
             env.valkey_host.clone(),
             env.valkey_port,
-        ),
+        )),
         worker_id: ff_core::types::WorkerId::new(format!("bench-echo-{wi}")),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
             "bench-echo-{wi}-{}",

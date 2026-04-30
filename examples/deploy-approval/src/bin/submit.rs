@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Default AllOf policy on all inbound edge groups (RFC-007). Seed
     // graph_revision from describe_flow (SDK, no REST route).
     let sdk = FlowFabricWorker::connect(WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(&args.host, args.port),
+        backend: Some(ff_core::backend::BackendConfig::valkey(&args.host, args.port)),
         worker_id: WorkerId::new("deploy-submit"),
         worker_instance_id: WorkerInstanceId::new(format!(
             "deploy-submit-{}",

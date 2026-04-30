@@ -99,7 +99,7 @@ async fn drive_one_execution(tag: &str) {
         .expect("add_execution_to_flow");
 
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_readiness_tests::valkey::backend_config_from_env(),
+        backend: Some(ff_readiness_tests::valkey::backend_config_from_env()),
         worker_id: WorkerId::new(format!("readiness-multi-worker-{tag}")),
         worker_instance_id: WorkerInstanceId::new(format!("readiness-multi-inst-{tag}")),
         namespace: Namespace::new(NS),
