@@ -1537,6 +1537,55 @@ impl EngineBackend for PostgresBackend {
         )
         .await
     }
+
+    // PR-7b Cluster 2b-B: flow summary projection on Postgres.
+    // Aggregates member public_state from ff_exec_core and UPSERTs the
+    // derived summary into ff_flow_summary (migration 0019). One SQL
+    // round-trip for the aggregation + one for the upsert.
+    #[cfg(feature = "core")]
+    async fn project_flow_summary(
+        &self,
+        partition: Partition,
+        flow_id: &FlowId,
+        now_ms: TimestampMs,
+    ) -> Result<bool, EngineError> {
+        let partition_key = partition_index_to_i16(partition)?;
+        let flow_uuid: sqlx::types::Uuid = flow_id.0;
+        flow::project_flow_summary_impl(
+            &self.pool,
+            partition_key,
+            flow_uuid,
+            now_ms.0,
+        )
+        .await
+    }
+
+    // PR-7b Cluster 2b-B: retention trim on Postgres.
+    // SELECTs a batch of terminal executions past the cutoff, then
+    // per-execution DELETEs across every sibling table (no FK CASCADE
+    // in the schema, so this is explicit). One transaction per batch.
+    #[cfg(feature = "core")]
+    async fn trim_retention(
+        &self,
+        partition: Partition,
+        lane_id: &LaneId,
+        retention_ms: u64,
+        now_ms: TimestampMs,
+        batch_size: u32,
+        filter: &ff_core::backend::ScannerFilter,
+    ) -> Result<u32, EngineError> {
+        let partition_key = partition_index_to_i16(partition)?;
+        exec_core::trim_retention_impl(
+            &self.pool,
+            partition_key,
+            lane_id.as_str(),
+            retention_ms,
+            now_ms.0,
+            batch_size,
+            filter,
+        )
+        .await
+    }
 }
 
 /// Resolve a `CompletionPayload` to the matching

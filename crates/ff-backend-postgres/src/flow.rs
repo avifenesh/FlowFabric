@@ -953,3 +953,139 @@ pub(super) async fn get_flow_tag_impl(
 
     Ok(row.and_then(|(tag,)| tag))
 }
+
+// ── PR-7b Cluster 2b-B — flow summary projection ─────────────────────
+//
+// One SQL round-trip aggregates member `public_state` counts from
+// `ff_exec_core` (partition-local via RFC-011 exec-flow co-location),
+// a second round-trip UPSERTs into `ff_flow_summary` (migration 0019).
+// Distinct from `ff_flow_core.public_flow_state`: the summary
+// `public_flow_state` is a DERIVED rollup, not the authoritative
+// mutation-guard state. See RFC-007 §Flow Summary Projection.
+
+/// Derive + UPSERT the flow summary row. Returns `Ok(true)` when the
+/// summary was written, `Ok(false)` when the flow has no members yet
+/// (nothing to project).
+pub(super) async fn project_flow_summary_impl(
+    pool: &PgPool,
+    partition_key: i16,
+    flow_uuid: Uuid,
+    now_ms: i64,
+) -> Result<bool, EngineError> {
+    // Aggregate per-state member counts for this flow. `partition_key`
+    // + `flow_id` hits `ff_exec_core_flow_idx`; no cross-partition
+    // fan-out. Every state bucket consumed by the summary projection
+    // is enumerated as a separate COUNT so the resulting row is
+    // unambiguous even when `public_state` is a state not known to
+    // this scanner version.
+    let row = sqlx::query_as::<_, (
+        i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+    )>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE public_state = 'completed'),
+            COUNT(*) FILTER (WHERE public_state = 'failed'),
+            COUNT(*) FILTER (WHERE public_state = 'cancelled'),
+            COUNT(*) FILTER (WHERE public_state = 'expired'),
+            COUNT(*) FILTER (WHERE public_state = 'skipped'),
+            COUNT(*) FILTER (WHERE public_state = 'active'),
+            COUNT(*) FILTER (WHERE public_state = 'suspended'),
+            COUNT(*) FILTER (WHERE public_state = 'waiting'),
+            COUNT(*) FILTER (WHERE public_state = 'delayed'),
+            COUNT(*) FILTER (WHERE public_state = 'rate_limited'),
+            COUNT(*) FILTER (WHERE public_state = 'waiting_children'),
+            COUNT(*)
+        FROM ff_exec_core
+        WHERE partition_key = $1 AND flow_id = $2
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let (completed, failed, cancelled, expired, skipped, active, suspended,
+         waiting, delayed, rate_limited, waiting_children, total_members) = row;
+
+    if total_members == 0 {
+        return Ok(false);
+    }
+
+    // PG aggregates every member in one SELECT so `sampled == total`
+    // by construction — the Valkey "sample-based" shape is a
+    // constant-memory workaround we don't need on SQL.
+    let sampled_i32 = i32::try_from(total_members).unwrap_or(i32::MAX);
+    let terminal_count = completed + failed + cancelled + expired + skipped;
+    let all_terminal = terminal_count == total_members;
+
+    let flow_state: &str = if all_terminal {
+        if failed > 0 || cancelled > 0 || expired > 0 {
+            "failed"
+        } else {
+            "completed"
+        }
+    } else if active > 0 {
+        "running"
+    } else if suspended > 0 || delayed > 0 || rate_limited > 0 || waiting_children > 0 {
+        "blocked"
+    } else {
+        "open"
+    };
+
+    // INSERT ... ON CONFLICT DO UPDATE — idempotent re-projection.
+    sqlx::query(
+        r#"
+        INSERT INTO ff_flow_summary (
+            partition_key, flow_id,
+            total_members, sampled_members,
+            members_completed, members_failed, members_cancelled,
+            members_expired, members_skipped, members_active,
+            members_suspended, members_waiting, members_delayed,
+            members_rate_limited, members_waiting_children,
+            public_flow_state, last_summary_update_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17
+        )
+        ON CONFLICT (partition_key, flow_id) DO UPDATE SET
+            total_members = EXCLUDED.total_members,
+            sampled_members = EXCLUDED.sampled_members,
+            members_completed = EXCLUDED.members_completed,
+            members_failed = EXCLUDED.members_failed,
+            members_cancelled = EXCLUDED.members_cancelled,
+            members_expired = EXCLUDED.members_expired,
+            members_skipped = EXCLUDED.members_skipped,
+            members_active = EXCLUDED.members_active,
+            members_suspended = EXCLUDED.members_suspended,
+            members_waiting = EXCLUDED.members_waiting,
+            members_delayed = EXCLUDED.members_delayed,
+            members_rate_limited = EXCLUDED.members_rate_limited,
+            members_waiting_children = EXCLUDED.members_waiting_children,
+            public_flow_state = EXCLUDED.public_flow_state,
+            last_summary_update_at = EXCLUDED.last_summary_update_at
+        "#,
+    )
+    .bind(partition_key)
+    .bind(flow_uuid)
+    .bind(total_members)
+    .bind(sampled_i32)
+    .bind(i32::try_from(completed).unwrap_or(i32::MAX))
+    .bind(i32::try_from(failed).unwrap_or(i32::MAX))
+    .bind(i32::try_from(cancelled).unwrap_or(i32::MAX))
+    .bind(i32::try_from(expired).unwrap_or(i32::MAX))
+    .bind(i32::try_from(skipped).unwrap_or(i32::MAX))
+    .bind(i32::try_from(active).unwrap_or(i32::MAX))
+    .bind(i32::try_from(suspended).unwrap_or(i32::MAX))
+    .bind(i32::try_from(waiting).unwrap_or(i32::MAX))
+    .bind(i32::try_from(delayed).unwrap_or(i32::MAX))
+    .bind(i32::try_from(rate_limited).unwrap_or(i32::MAX))
+    .bind(i32::try_from(waiting_children).unwrap_or(i32::MAX))
+    .bind(flow_state)
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    Ok(true)
+}

@@ -31,6 +31,22 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **PR-7b Cluster 2b-B: flow projector + retention trimmer scanners
+  trait-routed (cairn #436).** Two new `EngineBackend` trait methods —
+  `project_flow_summary(partition, flow_id, now_ms)` and
+  `trim_retention(partition, lane_id, retention_ms, now_ms, batch_size, filter)`
+  — route the two remaining non-FCALL scanners (`flow_projector` and
+  `retention_trimmer`) off the raw `ferriskey::Client` surface.
+  Valkey lifts the pre-PR-7b Rust-composed paths verbatim (SRANDMEMBER
+  + cross-partition HGET aggregation for flow projection; ZRANGEBYSCORE
+  + per-execution cascade-delete for retention). Postgres aggregates
+  member `public_state` via `COUNT(*) FILTER` on `ff_exec_core` +
+  INSERT...ON CONFLICT DO UPDATE into `ff_flow_summary` (new migration
+  `0019_flow_summary`), and cascades retention DELETEs across every
+  execution-scoped sibling table inside one transaction. SQLite returns
+  `Unavailable` for both per RFC-023 Phase 3.5 (neither is required for
+  single-tenant local deployments). Both scanners retain a test-only
+  direct-client fallback path for instantiations without a backend.
 - **`examples/external-callback` — SC-09 headline demo for the v0.13
   waitpoint consumer surface.** A workflow suspends against an
   HMAC-signed pending waitpoint, an asynchronous external actor POSTs

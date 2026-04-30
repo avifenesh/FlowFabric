@@ -1,39 +1,41 @@
 //! Flow summary projector scanner.
 //!
-//! Scans flow partitions ({fp:N}). For each flow: samples up to BATCH_SIZE
-//! member executions (SRANDMEMBER), reads each member's public_state
-//! (cross-partition), and updates the flow summary hash with aggregate
-//! counts and derived public_flow_state.
+//! Scans flow partitions ({fp:N}). For each flow: delegates the per-flow
+//! sample + summary-hash write to `EngineBackend::project_flow_summary`.
+//! The engine-side scanner body is thin by design — enumeration of flows
+//! is Valkey-specific (SSCAN on an index SET), but the projection itself
+//! lives behind the trait.
 //!
 //! Interval: 15s (catchup mode — event-driven in production).
 //!
-//! Cluster-safe: uses SMEMBERS on a partition-level index SET instead of SCAN.
+//! Cluster-safe: uses SSCAN on a partition-level index SET instead of SCAN.
 //!
 //! # Two sources of `public_flow_state`
 //!
 //! This scanner writes a DERIVED `public_flow_state` field to the flow
-//! summary hash (`ff:flow:{fp:N}:<flow_id>:summary`). It does NOT touch
-//! `flow_core.public_flow_state` — that field is owned exclusively by
-//! `ff_create_flow` and `ff_cancel_flow` and is the authoritative
-//! state used for mutation guards (e.g. `ff_add_execution_to_flow`
-//! rejects adds when `flow_core.public_flow_state` is terminal).
+//! summary projection. It does NOT touch `flow_core.public_flow_state`
+//! — that field is owned exclusively by `ff_create_flow` and
+//! `ff_cancel_flow` and is the authoritative state used for mutation
+//! guards (e.g. `ff_add_execution_to_flow` rejects adds when
+//! `flow_core.public_flow_state` is terminal).
 //!
 //! Consumer guidance:
 //! - Mutation-guard / authoritative state → read `flow_core.public_flow_state`.
-//! - Dashboards / projected rollups → read `:summary.public_flow_state`.
+//! - Dashboards / projected rollups → read the summary projection.
 //!
 //! Reference: RFC-007 §Flow Summary Projection, RFC-010 §6.7
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
+use ff_core::engine_error::EngineError;
 use ff_core::keys::FlowIndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily};
+use ff_core::types::{FlowId, TimestampMs};
 
 use super::{ScanResult, Scanner};
-
-const BATCH_SIZE: usize = 50;
 
 pub struct FlowProjector {
     interval: Duration,
@@ -41,6 +43,7 @@ pub struct FlowProjector {
     /// Issue #122: accepted for uniform API; not applied. See
     /// [`Self::with_filter`] rustdoc.
     filter: ScannerFilter,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl FlowProjector {
@@ -67,6 +70,25 @@ impl FlowProjector {
             interval,
             partition_config,
             filter,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 2b-B: wire an `EngineBackend` so the per-flow
+    /// projection runs through the trait (Valkey: lifted scanner
+    /// body; Postgres: migration 0019 `ff_flow_summary` UPSERT;
+    /// SQLite: `Unavailable` per RFC-023).
+    pub fn with_filter_and_backend(
+        interval: Duration,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            partition_config,
+            filter,
+            backend: Some(backend),
         }
     }
 }
@@ -93,7 +115,6 @@ impl Scanner for FlowProjector {
             family: PartitionFamily::Flow,
             index: partition,
         };
-        let tag = p.hash_tag();
         let fidx = FlowIndexKeys::new(&p);
         let flow_index_key = fidx.flow_index();
 
@@ -104,6 +125,7 @@ impl Scanner for FlowProjector {
                 return ScanResult { processed: 0, errors: 1 };
             }
         };
+        let now_ts = TimestampMs::from_millis(now_ms as i64);
 
         let mut processed: u32 = 0;
         let mut errors: u32 = 0;
@@ -114,6 +136,13 @@ impl Scanner for FlowProjector {
         // materialise every flow_id into one Vec<String> before we could
         // project the first one; SSCAN bounds memory to one batch and
         // keeps the Valkey command's server-side work bounded per call.
+        //
+        // Flow-id enumeration itself stays on the scanner client — it's
+        // a Valkey-shape concern (the `ff:idx:{fp:N}:flow_index` SET
+        // doesn't exist on Postgres, which resolves flow membership
+        // via the `ff_exec_core_flow_idx` index directly). PR-7b
+        // Cluster 2b-B scope: the per-flow projection goes through the
+        // trait; the iteration remains Valkey-shaped.
         loop {
             let result: ferriskey::Value = match client
                 .cmd("SSCAN")
@@ -134,9 +163,16 @@ impl Scanner for FlowProjector {
             let (next_cursor, flow_ids) = parse_sscan_response(&result);
 
             for fid_str in &flow_ids {
-                match project_flow_summary(
-                    client, &tag, &flow_index_key, fid_str, now_ms, &self.partition_config,
-                ).await {
+                let res = project_one_flow(
+                    client,
+                    self.backend.as_ref(),
+                    &p,
+                    &self.partition_config,
+                    fid_str,
+                    now_ts,
+                )
+                .await;
+                match res {
                     Ok(true) => processed += 1,
                     Ok(false) => {} // no members or already up-to-date
                     Err(e) => {
@@ -161,26 +197,67 @@ impl Scanner for FlowProjector {
     }
 }
 
-/// Project the summary for one flow. Returns Ok(true) if updated.
-async fn project_flow_summary(
+/// Project one flow through the trait when a backend is wired;
+/// otherwise fall back to a direct-client path for test builds that
+/// instantiate the scanner without a backend (mirrors cluster-1
+/// lease_expiry / cluster-2 reconciler patterns). Returns the
+/// trait-shape `Result<bool>` unchanged.
+async fn project_one_flow(
     client: &ferriskey::Client,
-    tag: &str,
-    flow_index_key: &str,
+    backend: Option<&Arc<dyn EngineBackend>>,
+    partition: &Partition,
+    partition_config: &PartitionConfig,
     fid_str: &str,
-    now_ms: u64,
+    now_ms: TimestampMs,
+) -> Result<bool, String> {
+    let flow_id = match FlowId::parse(fid_str) {
+        Ok(id) => id,
+        Err(e) => {
+            return Err(format!("malformed flow_id {fid_str:?}: {e}"));
+        }
+    };
+
+    if let Some(backend_arc) = backend {
+        return backend_arc
+            .project_flow_summary(*partition, &flow_id, now_ms)
+            .await
+            .map_err(|e: EngineError| e.to_string());
+    }
+
+    // Test-only fallback: direct composition on the scanner client.
+    // Mirrors the pre-PR-7b body so existing unit tests continue to
+    // pass when instantiated without an EngineBackend.
+    project_direct_fallback(client, partition, partition_config, fid_str, now_ms)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Direct-client projection used only when the scanner is
+/// constructed without an `EngineBackend`. Matches the
+/// pre-PR-7b behaviour closely enough for test fixtures.
+async fn project_direct_fallback(
+    client: &ferriskey::Client,
+    partition: &Partition,
     config: &PartitionConfig,
+    fid_str: &str,
+    now_ms: TimestampMs,
 ) -> Result<bool, ferriskey::Error> {
+    use std::collections::HashMap;
+
+    const BATCH_SIZE: usize = 50;
+    let tag = partition.hash_tag();
+    let fidx = FlowIndexKeys::new(partition);
+    let flow_index_key = fidx.flow_index();
+
     let core_key = format!("ff:flow:{}:{}:core", tag, fid_str);
     let members_key = format!("ff:flow:{}:{}:members", tag, fid_str);
     let summary_key = format!("ff:flow:{}:{}:summary", tag, fid_str);
 
-    // Defensive prune: index entry for a flow whose core is gone (manual
-    // delete / retention purge) — drop it so SMEMBERS stays correct.
     let core_exists: bool = client.exists(&core_key).await.unwrap_or(true);
     if !core_exists {
         let _: Option<i64> = client
             .cmd("SREM")
-            .arg(flow_index_key)
+            .arg(&flow_index_key)
             .arg(fid_str)
             .execute()
             .await
@@ -188,21 +265,16 @@ async fn project_flow_summary(
         return Ok(false);
     }
 
-    // Get true membership count for accurate total_members reporting.
     let true_total: u64 = client
         .cmd("SCARD")
         .arg(&members_key)
         .execute()
         .await
         .unwrap_or(0);
-
     if true_total == 0 {
         return Ok(false);
     }
 
-    // Sample up to BATCH_SIZE member execution IDs (avoids loading the
-    // entire membership set into memory for large flows).
-    // SRANDMEMBER key count returns up to `count` distinct members.
     let member_eids: Vec<String> = client
         .cmd("SRANDMEMBER")
         .arg(&members_key)
@@ -210,38 +282,33 @@ async fn project_flow_summary(
         .execute()
         .await
         .unwrap_or_default();
-
     if member_eids.is_empty() {
         return Ok(false);
     }
 
-    // Count public_state for each sampled member (cross-partition reads)
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut sampled: u32 = 0;
-
     for eid_str in &member_eids {
         let eid = match ff_core::types::ExecutionId::parse(eid_str) {
             Ok(id) => id,
             Err(_) => continue,
         };
-        let partition = ff_core::partition::execution_partition(&eid, config);
-        let ctx_tag = partition.hash_tag();
-        let core_key = format!("ff:exec:{}:{}:core", ctx_tag, eid_str);
+        let member_partition = ff_core::partition::execution_partition(&eid, config);
+        let ctx_tag = member_partition.hash_tag();
+        let member_core = format!("ff:exec:{}:{}:core", ctx_tag, eid_str);
 
         let ps: Option<String> = client
             .cmd("HGET")
-            .arg(&core_key)
+            .arg(&member_core)
             .arg("public_state")
             .execute()
             .await
             .unwrap_or(None);
-
         let state = ps.unwrap_or_else(|| "unknown".to_string());
         *counts.entry(state).or_insert(0) += 1;
         sampled += 1;
     }
 
-    // Derive public_flow_state from sample
     let completed = *counts.get("completed").unwrap_or(&0);
     let skipped = *counts.get("skipped").unwrap_or(&0);
     let failed = *counts.get("failed").unwrap_or(&0);
@@ -253,10 +320,8 @@ async fn project_flow_summary(
     let delayed = *counts.get("delayed").unwrap_or(&0);
     let rate_limited = *counts.get("rate_limited").unwrap_or(&0);
     let waiting_children = *counts.get("waiting_children").unwrap_or(&0);
-
     let terminal_count = completed + skipped + failed + cancelled + expired;
     let all_terminal = terminal_count == sampled && sampled > 0;
-
     let flow_state = if all_terminal {
         if failed > 0 || cancelled > 0 || expired > 0 {
             "failed"
@@ -271,7 +336,7 @@ async fn project_flow_summary(
         "open"
     };
 
-    // Update summary hash
+    let now_s = now_ms.0.to_string();
     let _: () = client
         .cmd("HSET")
         .arg(&summary_key)
@@ -289,28 +354,14 @@ async fn project_flow_summary(
         .arg("members_rate_limited").arg(rate_limited.to_string().as_str())
         .arg("members_waiting_children").arg(waiting_children.to_string().as_str())
         .arg("public_flow_state").arg(flow_state)
-        .arg("last_summary_update_at").arg(now_ms.to_string().as_str())
+        .arg("last_summary_update_at").arg(now_s.as_str())
         .execute()
         .await?;
 
-    // Prune the index entry only when we've observed EVERY member in this
-    // cycle and all of them are terminal. Gating on the full walk (not the
-    // sample) matters for two reasons:
-    //   1. For flows larger than BATCH_SIZE, a sample being "all terminal"
-    //      does not imply the flow is actually done; unsampled members
-    //      may still be running. Pruning on the sample would freeze the
-    //      summary mid-flight.
-    //   2. ff_replay_execution runs on {p:N}, so it cannot re-SADD the
-    //      {fp:N} flow_index when a terminal flow member is revived.
-    //      If we SREM while any revival path is reachable, the flow never
-    //      comes back into the projector's view.
-    // For large flows that never satisfy sampled == true_total, the
-    // defensive HGETALL-empty prune and retention deletion still clean up
-    // eventually. We accept a modest cardinality cost for correctness.
     if all_terminal && (sampled as u64) == true_total {
         let _: Option<i64> = client
             .cmd("SREM")
-            .arg(flow_index_key)
+            .arg(&flow_index_key)
             .arg(fid_str)
             .execute()
             .await
@@ -356,4 +407,3 @@ fn parse_sscan_response(val: &ferriskey::Value) -> (String, Vec<String>) {
 
     (cursor, members)
 }
-
