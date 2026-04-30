@@ -983,3 +983,406 @@ pub(crate) async fn check_admission(
     commit_or_rollback(&mut conn).await?;
     Ok(CheckAdmissionResult::Admitted)
 }
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::evaluate_flow_eligibility`].
+///
+/// Read-only; no tx needed. Mirrors PG at
+/// `ff-backend-postgres/src/typed_ops.rs::evaluate_flow_eligibility`.
+/// Returns one of: `not_found`, `not_runnable`, `owned`, `terminal`,
+/// `impossible`, `blocked_by_dependencies`, `eligible`.
+///
+/// Required-edge counts derived live via JOIN on `ff_edge` + upstream
+/// `ff_exec_core.raw_fields.terminal_outcome`. SQLite swaps:
+///
+/// - `policy->>'kind'` → `json_extract(e.policy, '$.kind')`
+/// - `raw_fields->>'terminal_outcome'` → `json_extract(up.raw_fields,
+///   '$.terminal_outcome')`
+/// - `flow_id` is BLOB on SQLite (uuid-bytes stored raw)
+pub(crate) async fn evaluate_flow_eligibility(
+    pool: &SqlitePool,
+    args: ff_core::contracts::EvaluateFlowEligibilityArgs,
+) -> Result<ff_core::contracts::EvaluateFlowEligibilityResult, EngineError> {
+    use ff_core::contracts::EvaluateFlowEligibilityResult;
+
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+
+    let exec_row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase, ownership_state, flow_id,
+               COALESCE(json_extract(raw_fields, '$.terminal_outcome'), 'none')
+                   AS terminal_outcome
+          FROM ff_exec_core
+         WHERE partition_key = ?1 AND execution_id = ?2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(exec_row) = exec_row else {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "not_found".into(),
+        });
+    };
+    let lifecycle_phase: String = exec_row
+        .try_get("lifecycle_phase")
+        .map_err(map_sqlx_error)?;
+    if lifecycle_phase != "runnable" {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "not_runnable".into(),
+        });
+    }
+    let ownership_state: String = exec_row
+        .try_get("ownership_state")
+        .map_err(map_sqlx_error)?;
+    if ownership_state != "unowned" {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "owned".into(),
+        });
+    }
+    let terminal_outcome: String = exec_row
+        .try_get("terminal_outcome")
+        .map_err(map_sqlx_error)?;
+    if terminal_outcome != "none" {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "terminal".into(),
+        });
+    }
+    let flow_id_opt: Option<uuid::Uuid> = exec_row.try_get("flow_id").map_err(map_sqlx_error)?;
+    let Some(flow_id) = flow_id_opt else {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "eligible".into(),
+        });
+    };
+
+    // Walk incoming edges + classify upstreams.
+    let counts = sqlx::query(
+        r#"
+        SELECT
+          SUM(CASE
+                WHEN is_required = 1
+                  AND COALESCE(json_extract(up.raw_fields, '$.terminal_outcome'), 'none') = 'failed'
+                THEN 1 ELSE 0 END) AS impossible_count,
+          SUM(CASE
+                WHEN is_required = 1
+                  AND COALESCE(json_extract(up.raw_fields, '$.terminal_outcome'), 'none') NOT IN ('failed', 'success')
+                THEN 1 ELSE 0 END) AS unsatisfied_count
+        FROM (
+          SELECT e.upstream_eid,
+                 CASE WHEN json_extract(e.policy, '$.kind') IN ('required', 'AllOf', 'all_of')
+                      THEN 1 ELSE 0 END AS is_required
+            FROM ff_edge e
+           WHERE e.partition_key = ?1
+             AND e.flow_id = ?2
+             AND e.downstream_eid = ?3
+        ) edges
+        LEFT JOIN ff_exec_core up
+          ON up.partition_key = ?1 AND up.execution_id = edges.upstream_eid
+        "#,
+    )
+    .bind(part)
+    .bind(flow_id)
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let impossible: Option<i64> = counts.try_get("impossible_count").map_err(map_sqlx_error)?;
+    let unsatisfied: Option<i64> =
+        counts.try_get("unsatisfied_count").map_err(map_sqlx_error)?;
+    let status = if impossible.unwrap_or(0) > 0 {
+        "impossible"
+    } else if unsatisfied.unwrap_or(0) > 0 {
+        "blocked_by_dependencies"
+    } else {
+        "eligible"
+    };
+    Ok(EvaluateFlowEligibilityResult::Status {
+        status: status.into(),
+    })
+}
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::claim_execution`].
+///
+/// Mirrors PG at `ff-backend-postgres/src/typed_ops.rs::claim_execution`.
+/// Consumes a claim grant, creates a new attempt row, transitions
+/// `runnable → active`.
+///
+/// Validates in order:
+/// 1. `lifecycle_phase == 'runnable'` → else `ExecutionNotActive`.
+/// 2. `ownership_state == 'unowned'` → else `LeaseConflict`.
+/// 3. `eligibility_state == 'eligible_now'` → else `ExecutionNotLeaseable`.
+/// 4. `attempt_state != 'running_attempt'` (defense-in-depth) →
+///    else `Conflict(ActiveAttemptExists)`.
+/// 5. `attempt_state != 'attempt_interrupted'` → else
+///    `ExecutionNotLeaseable` (caller must use
+///    `claim_resumed_execution`).
+/// 6. `ff_claim_grant` row exists for this (partition, exec_uuid,
+///    kind='claim') → else `InvalidClaimGrant`.
+/// 7. Grant's `worker_id` matches → else `InvalidClaimGrant`.
+/// 8. Grant's `expires_at_ms > now` (when set) → else
+///    `ClaimGrantExpired`.
+///
+/// On success: DELETE grant, INSERT/UPSERT ff_attempt with lease
+/// identity in raw_fields, flip exec_core to active/leased/running,
+/// emit lease-acquired outbox.
+pub(crate) async fn claim_execution(
+    pool: &SqlitePool,
+    _partition_config: &PartitionConfig,
+    pubsub: &PubSub,
+    args: ff_core::contracts::ClaimExecutionArgs,
+) -> Result<ff_core::contracts::ClaimExecutionResult, EngineError> {
+    use ff_core::contracts::{ClaimExecutionResult, ClaimedExecution};
+    use ff_core::state::AttemptType;
+    use ff_core::types::LeaseEpoch;
+
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let attempt_index = i64::from(args.expected_attempt_index.0);
+    let lease_ttl_i64 = i64::try_from(args.lease_ttl_ms).unwrap_or(i64::MAX);
+    let now = args.now.0;
+    let new_expires = now.saturating_add(lease_ttl_i64);
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let result = async {
+        let exec_row = sqlx::query(
+            r#"
+            SELECT lifecycle_phase, ownership_state, eligibility_state,
+                   attempt_state,
+                   COALESCE(json_extract(raw_fields, '$.terminal_outcome'), 'none')
+                       AS terminal_outcome,
+                   COALESCE(json_extract(raw_fields, '$.current_attempt_id'), '')
+                       AS current_attempt_id
+              FROM ff_exec_core
+             WHERE partition_key = ?1 AND execution_id = ?2
+            "#,
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+        let Some(exec_row) = exec_row else {
+            return Err(EngineError::NotFound { entity: "execution" });
+        };
+        let lifecycle_phase: String =
+            exec_row.try_get("lifecycle_phase").map_err(map_sqlx_error)?;
+        let ownership_state: String = exec_row
+            .try_get("ownership_state")
+            .map_err(map_sqlx_error)?;
+        let eligibility_state: String = exec_row
+            .try_get("eligibility_state")
+            .map_err(map_sqlx_error)?;
+        let attempt_state: String =
+            exec_row.try_get("attempt_state").map_err(map_sqlx_error)?;
+
+        if lifecycle_phase != "runnable" {
+            let terminal_outcome: String =
+                exec_row.try_get("terminal_outcome").map_err(map_sqlx_error)?;
+            let current_attempt_id: String = exec_row
+                .try_get("current_attempt_id")
+                .map_err(map_sqlx_error)?;
+            return Err(EngineError::Contention(ContentionKind::ExecutionNotActive {
+                terminal_outcome,
+                lease_epoch: String::new(),
+                lifecycle_phase,
+                attempt_id: current_attempt_id,
+            }));
+        }
+        if ownership_state != "unowned" {
+            return Err(EngineError::Contention(ContentionKind::LeaseConflict));
+        }
+        if eligibility_state != "eligible_now" {
+            return Err(EngineError::Contention(
+                ContentionKind::ExecutionNotLeaseable,
+            ));
+        }
+        if attempt_state == "running_attempt" {
+            return Err(EngineError::Conflict(
+                ff_core::engine_error::ConflictKind::ActiveAttemptExists,
+            ));
+        }
+        if attempt_state == "attempt_interrupted" {
+            return Err(EngineError::Contention(
+                ContentionKind::ExecutionNotLeaseable,
+            ));
+        }
+
+        // Validate + consume claim grant.
+        let grant_row = sqlx::query(
+            "SELECT worker_id, expires_at_ms FROM ff_claim_grant \
+             WHERE partition_key = ?1 AND execution_id = ?2 AND kind = 'claim'",
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+        let Some(grant_row) = grant_row else {
+            return Err(EngineError::Contention(ContentionKind::InvalidClaimGrant));
+        };
+        let grant_worker_id: String =
+            grant_row.try_get("worker_id").map_err(map_sqlx_error)?;
+        if grant_worker_id != args.worker_id.as_str() {
+            return Err(EngineError::Contention(ContentionKind::InvalidClaimGrant));
+        }
+        let grant_expires_at: i64 = grant_row
+            .try_get("expires_at_ms")
+            .map_err(map_sqlx_error)?;
+        if grant_expires_at > 0 && grant_expires_at < now {
+            return Err(EngineError::Contention(ContentionKind::ClaimGrantExpired));
+        }
+        sqlx::query(
+            "DELETE FROM ff_claim_grant \
+             WHERE partition_key = ?1 AND execution_id = ?2 AND kind = 'claim'",
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Attempt type from existing attempt_state.
+        let attempt_type = if attempt_state == "pending_retry_attempt" {
+            AttemptType::Retry
+        } else if attempt_state == "pending_replay_attempt" {
+            AttemptType::Replay
+        } else {
+            AttemptType::Initial
+        };
+        let attempt_type_str = match attempt_type {
+            AttemptType::Initial => "initial",
+            AttemptType::Retry => "retry",
+            AttemptType::Reclaim => "reclaim",
+            AttemptType::Replay => "replay",
+            AttemptType::Fallback => "fallback",
+        };
+
+        // Insert / upsert the attempt row. SQLite `json_set(?, '$.k', v)`
+        // for multi-key patch; NULLIF for empty-policy.
+        sqlx::query(
+            r#"
+            INSERT INTO ff_attempt (
+                partition_key, execution_id, attempt_index,
+                worker_id, worker_instance_id,
+                lease_epoch, lease_expires_at_ms, started_at_ms,
+                policy, raw_fields
+            ) VALUES (
+                ?1, ?2, ?3,
+                ?4, ?5,
+                1, ?6, ?7,
+                NULLIF(?8, ''),
+                json_set('{}', '$.attempt_type', ?9, '$.attempt_id', ?10, '$.lease_id', ?11)
+            )
+            ON CONFLICT (partition_key, execution_id, attempt_index)
+            DO UPDATE SET
+                worker_id = excluded.worker_id,
+                worker_instance_id = excluded.worker_instance_id,
+                lease_epoch = ff_attempt.lease_epoch + 1,
+                lease_expires_at_ms = excluded.lease_expires_at_ms,
+                started_at_ms = COALESCE(ff_attempt.started_at_ms, excluded.started_at_ms),
+                policy = excluded.policy,
+                raw_fields = json_patch(ff_attempt.raw_fields, excluded.raw_fields),
+                terminal_at_ms = NULL,
+                outcome = NULL
+            "#,
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .bind(args.worker_id.as_str())
+        .bind(args.worker_instance_id.as_str())
+        .bind(new_expires)
+        .bind(now)
+        .bind(&args.attempt_policy_json)
+        .bind(attempt_type_str)
+        .bind(args.attempt_id.to_string())
+        .bind(args.lease_id.to_string())
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Read back the epoch (may be +1 on the conflict path).
+        let epoch_row = sqlx::query(
+            "SELECT lease_epoch FROM ff_attempt \
+             WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3",
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+        let new_epoch_i: i64 = epoch_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+        let new_epoch = u64::try_from(new_epoch_i).unwrap_or(0);
+
+        // Flip exec_core to active + stash lease identity in raw_fields.
+        let next_attempt_index = attempt_index.saturating_add(1);
+        sqlx::query(
+            r#"
+            UPDATE ff_exec_core
+               SET lifecycle_phase = 'active',
+                   ownership_state = 'leased',
+                   eligibility_state = 'not_applicable',
+                   attempt_state = 'running_attempt',
+                   public_state = 'active',
+                   attempt_index = ?1,
+                   deadline_at_ms = COALESCE(?2, deadline_at_ms),
+                   raw_fields = json_set(
+                       raw_fields,
+                       '$.current_attempt_id', ?3,
+                       '$.current_lease_id', ?4,
+                       '$.current_worker_id', ?5,
+                       '$.current_worker_instance_id', ?6,
+                       '$.pending_retry_reason', '',
+                       '$.pending_replay_reason', '',
+                       '$.pending_replay_requested_by', '',
+                       '$.pending_previous_attempt_index', ''
+                   )
+             WHERE partition_key = ?7 AND execution_id = ?8
+            "#,
+        )
+        .bind(next_attempt_index)
+        .bind(args.execution_deadline_at)
+        .bind(args.attempt_id.to_string())
+        .bind(args.lease_id.to_string())
+        .bind(args.worker_id.as_str())
+        .bind(args.worker_instance_id.as_str())
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Outbox: lease acquired.
+        let ev = insert_lease_event(&mut conn, part, exec_uuid, "acquired", now).await?;
+        let emits = vec![(OutboxChannel::LeaseHistory, ev)];
+
+        Ok::<_, EngineError>((new_epoch, attempt_type, emits))
+    }
+    .await;
+
+    match result {
+        Ok((new_epoch, attempt_type, emits)) => {
+            commit_or_rollback(&mut conn).await?;
+            dispatch_emits(pubsub, emits);
+            let claimed = ClaimedExecution::new(
+                args.execution_id,
+                args.lease_id,
+                LeaseEpoch(new_epoch),
+                args.expected_attempt_index,
+                args.attempt_id,
+                attempt_type,
+                TimestampMs::from_millis(new_expires),
+                ff_core::backend::stub_handle_fresh(),
+            );
+            Ok(ClaimExecutionResult::Claimed(claimed))
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}

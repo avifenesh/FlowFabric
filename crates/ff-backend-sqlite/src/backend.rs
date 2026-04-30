@@ -2633,6 +2633,27 @@ impl EngineBackend for SqliteBackend {
         retry_serializable(|| crate::typed_ops::resume_execution(pool, pubsub, args.clone())).await
     }
 
+    async fn evaluate_flow_eligibility(
+        &self,
+        args: ff_core::contracts::EvaluateFlowEligibilityArgs,
+    ) -> Result<ff_core::contracts::EvaluateFlowEligibilityResult, EngineError> {
+        // Read-only; no retry_serializable needed.
+        crate::typed_ops::evaluate_flow_eligibility(&self.inner.pool, args).await
+    }
+
+    async fn claim_execution(
+        &self,
+        args: ff_core::contracts::ClaimExecutionArgs,
+    ) -> Result<ff_core::contracts::ClaimExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        let pc = ff_core::partition::PartitionConfig::default();
+        retry_serializable(|| {
+            crate::typed_ops::claim_execution(pool, &pc, pubsub, args.clone())
+        })
+        .await
+    }
+
     async fn check_admission(
         &self,
         quota_policy_id: &ff_core::types::QuotaPolicyId,
