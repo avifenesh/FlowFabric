@@ -257,6 +257,66 @@ impl FromFcallResult for ReportUsageResult {
     }
 }
 
+// ─── ff_record_spend ──────────────────────────────────────────────────
+//
+// Open-set (cairn #454 Phase 3a) variant of `ff_report_usage_and_check`.
+// Accepts a `BTreeMap<String, u64>` of tenant-defined dimension deltas
+// and reuses `ReportUsageResult` — the four-variant outcome space is
+// identical.
+//
+// Lua KEYS (3): budget_usage, budget_limits, budget_def
+// Lua ARGV: pair_count, dim_1, delta_1, ..., dim_N, delta_N, now_ms, dedup_key
+
+pub async fn ff_record_spend(
+    conn: &ferriskey::Client,
+    k: &BudgetOpKeys<'_>,
+    args: &RecordSpendArgs,
+    now: ff_core::types::TimestampMs,
+) -> Result<ReportUsageResult, ScriptError> {
+    let keys: Vec<String> = vec![
+        k.usage_key.to_string(),
+        k.limits_key.to_string(),
+        k.def_key.to_string(),
+    ];
+
+    let pair_count = args.deltas.len();
+    if pair_count > MAX_BUDGET_DIMENSIONS {
+        return Err(ScriptError::Parse {
+            fcall: "ff_record_spend".into(),
+            execution_id: Some(args.execution_id.to_string()),
+            message: format!(
+                "too_many_dimensions: limit={}, got={}",
+                MAX_BUDGET_DIMENSIONS, pair_count
+            ),
+        });
+    }
+
+    let mut argv: Vec<String> = Vec::with_capacity(3 + pair_count * 2);
+    argv.push(pair_count.to_string());
+    for (dim, delta) in &args.deltas {
+        argv.push(dim.clone());
+        argv.push(delta.to_string());
+    }
+    argv.push(now.to_string());
+    // Wrap the caller-supplied idempotency key with the budget hash-tag
+    // so it co-locates on the same cluster slot as the usage/limits/def
+    // keys — matches `ff_report_usage_and_check` dedup behaviour (#108).
+    let dedup_key_val = if args.idempotency_key.is_empty() {
+        String::new()
+    } else {
+        usage_dedup_key(k.hash_tag, &args.idempotency_key)
+    };
+    argv.push(dedup_key_val);
+
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let raw = conn
+        .fcall::<ferriskey::Value>("ff_record_spend", &key_refs, &argv_refs)
+        .await
+        .map_err(ScriptError::Valkey)?;
+    <ReportUsageResult as FromFcallResult>::from_fcall_result(&raw)
+}
+
 // ─── ff_reset_budget ──────────────────────────────────────────────────
 //
 // Lua KEYS (3): budget_def, budget_usage, budget_resets_zset

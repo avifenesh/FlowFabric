@@ -1292,7 +1292,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '28'
+  return '29'
 end)
 
 
@@ -6633,6 +6633,98 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
   redis.call("HSET", K.def_key, "last_updated_at", now_ms)
 
   -- Mark dedup key after successful increment (24h TTL)
+  if dedup_key ~= "" then
+    redis.call("SET", dedup_key, "1", "PX", 86400000)
+  end
+
+  if breached_soft then
+    redis.call("HINCRBY", K.def_key, "soft_breach_count", 1)
+    local soft_val = tonumber(redis.call("HGET", K.limits_key, "soft:" .. breached_soft) or "0")
+    local cur_val = tonumber(redis.call("HGET", K.usage_key, breached_soft) or "0")
+    return {1, "SOFT_BREACH", breached_soft, tostring(cur_val), tostring(soft_val)}
+  end
+
+  return {1, "OK"}
+end)
+
+---------------------------------------------------------------------------
+-- #30b ff_record_spend  (on {b:M})  (cairn #454 Phase 3a)
+--
+-- Open-set spend recording for cairn's per-tenant budgets. Same
+-- check-then-increment semantics as `ff_report_usage_and_check`, but
+-- ARGV carries (dim, delta) pairs instead of parallel arrays — the
+-- upstream `RecordSpendArgs.deltas` is a `BTreeMap<String, u64>` with
+-- deterministic iteration order, and the pair encoding keeps the
+-- serialisation site trivial. Returns the same 4-variant status shape
+-- so `parse_report_usage` on the backend side is reused verbatim.
+--
+-- KEYS (3): budget_usage, budget_limits, budget_def
+-- ARGV (variable): pair_count, dim_1, delta_1, ..., dim_N, delta_N,
+--                  now_ms, dedup_key
+---------------------------------------------------------------------------
+redis.register_function('ff_record_spend', function(keys, args)
+  local K = {
+    usage_key  = keys[1],
+    limits_key = keys[2],
+    def_key    = keys[3],
+  }
+
+  local pair_count = require_number(args[1], "pair_count")
+  if type(pair_count) == "table" then return pair_count end
+  local now_ms = args[2 + 2 * pair_count]
+  local dedup_key = args[3 + 2 * pair_count] or ""
+
+  -- Idempotency: if dedup_key provided, check for prior application.
+  if dedup_key ~= "" then
+    local existing = redis.call("GET", dedup_key)
+    if existing then
+      return {1, "ALREADY_APPLIED"}
+    end
+  end
+
+  -- Phase 1: CHECK all dimensions BEFORE any increment. If any hard
+  -- limit would be breached, reject the entire spend.
+  for i = 1, pair_count do
+    local dim = args[2 * i]
+    local delta = tonumber(args[2 * i + 1])
+    local current = tonumber(redis.call("HGET", K.usage_key, dim) or "0")
+    local new_total = current + delta
+
+    local hard_limit = redis.call("HGET", K.limits_key, "hard:" .. dim)
+    if hard_limit and hard_limit ~= "" and hard_limit ~= false then
+      local limit_val = tonumber(hard_limit)
+      if limit_val > 0 and new_total > limit_val then
+        redis.call("HINCRBY", K.def_key, "breach_count", 1)
+        redis.call("HSET", K.def_key,
+          "last_breach_at", now_ms,
+          "last_breach_dim", dim,
+          "last_updated_at", now_ms)
+        return {1, "HARD_BREACH", dim, tostring(current), tostring(hard_limit)}
+      end
+    end
+  end
+
+  -- Phase 2: no hard breach — safe to increment all dimensions.
+  local breached_soft = nil
+  for i = 1, pair_count do
+    local dim = args[2 * i]
+    local delta = tonumber(args[2 * i + 1])
+    local new_val = redis.call("HINCRBY", K.usage_key, dim, delta)
+
+    local soft_limit = redis.call("HGET", K.limits_key, "soft:" .. dim)
+    if soft_limit and soft_limit ~= "" and soft_limit ~= false then
+      local limit_val = tonumber(soft_limit)
+      if limit_val > 0 and new_val > limit_val then
+        if not breached_soft then
+          breached_soft = dim
+        end
+      end
+    end
+  end
+
+  redis.call("HSET", K.def_key, "last_updated_at", now_ms)
+
+  -- Stamp dedup key after successful increment (24h TTL).
   if dedup_key ~= "" then
     redis.call("SET", dedup_key, "1", "PX", 86400000)
   end
