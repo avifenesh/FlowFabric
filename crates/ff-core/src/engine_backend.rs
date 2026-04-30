@@ -2523,7 +2523,7 @@ pub trait EngineBackend: Send + Sync + 'static {
         let d = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| EngineError::Transport {
-                backend: "system-clock".into(),
+                backend: "system-clock",
                 source: format!("server_time_ms default: {e}").into(),
             })?;
         Ok(d.as_millis() as u64)
