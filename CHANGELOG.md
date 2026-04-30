@@ -31,6 +31,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **#453 / PR-7b: `EngineBackend::fail_execution` — Postgres body.**
+  Ports `ff_fail_execution` from `flowfabric.lua` with both retry and
+  terminal branches. Parses the retry policy JSON envelope (fixed /
+  exponential backoff), computes the backoff, and branches:
+  `retry_count < max_retries` → `RetryScheduled { delay_until,
+  next_attempt_index }` (flips to runnable/delayed, stores pending
+  lineage); otherwise `TerminalFailed` (flips to terminal/failed,
+  emits completion outbox with `outcome='failed'`). Fence-or-override
+  gate mirrors `complete_execution`. Integration test:
+  `typed_fail_execution.rs`.
 - **#453 / PR-7b: `EngineBackend::complete_execution` — Postgres body.**
   Ports `ff_complete_execution` from `flowfabric.lua` to a PG tx that
   flips `lifecycle_phase='terminal'`, `public_state='completed'`,
