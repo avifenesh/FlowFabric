@@ -293,3 +293,329 @@ let config = WorkerConfig {
 };
 FlowFabricWorker::connect(config).await?;
 ```
+
+## Tag methods — `set_execution_tag` / `set_flow_tag` / `get_execution_tag` / `get_flow_tag` (#439 / cairn #433)
+
+**Motivation.** Pre-v0.13 consumers setting caller-namespaced tags
+(e.g. `cairn.session_id`) had to drop down to raw `ferriskey::Client`
+`HSET` calls against internal partition layouts. That bypassed
+FlowFabric's namespace validation, coupled cairn to the Valkey wire
+shape, and was unreachable from PG/SQLite consumers. v0.13 adds four
+trait-routed tag methods with identical shape across all three
+backends.
+
+**Namespace rule.** Tag keys MUST match the regex
+`^[a-z][a-z0-9_]*\.[a-z0-9_][a-z0-9_.]*$` — i.e. `<caller>.<field>`
+with a literal dot separator. The key carries its own namespace
+(`cairn.session_id`, not `session_id` + a separate namespace arg).
+Values are arbitrary UTF-8. The trait-side
+`ff_core::engine_backend::validate_tag_key` is the parity-of-record
+and runs on every backend before the wire hop; Valkey's Lua path
+additionally validates (more permissively, prefix-only) on the
+storage tier.
+
+**Before (v0.12, cairn's pattern):**
+
+```rust,ignore
+// Raw Valkey HSET bypassing FlowFabric's namespace rules.
+let mut client = ferriskey::Client::connect(valkey_url).await?;
+client
+    .hset(
+        format!("ff:exec:{{p:{}}}:{}:tags", partition, exec_id),
+        "cairn.session_id",
+        session_id.as_str(),
+    )
+    .await?;
+```
+
+**After (v0.13, trait-routed on any backend):**
+
+```rust,ignore
+let backend: Arc<dyn EngineBackend> = pg_backend.clone();
+backend
+    .set_execution_tag(&exec_id, "cairn.session_id", session_id.as_str())
+    .await?;
+
+// Read-side:
+let v = backend
+    .get_execution_tag(&exec_id, "cairn.session_id")
+    .await?;
+
+// Flow-scoped tags land on a separate store (see engine_backend rustdoc
+// for the per-backend shape — Valkey uses a dedicated :tags sub-hash;
+// PG/SQLite write the top-level raw_fields on ff_flow_core):
+backend
+    .set_flow_tag(&flow_id, "cairn.tenant", tenant.as_str())
+    .await?;
+```
+
+**Error mapping.**
+
+- Invalid key → `EngineError::Validation { kind: InvalidInput, detail }`
+  (short-circuits before the wire hop).
+- Missing execution → `EngineError::NotFound { entity: "execution" }`
+  (matches the Valkey FCALL `execution_not_found` mapping).
+- Missing flow → `EngineError::NotFound { entity: "flow" }`.
+- On read, missing tag **and** missing row both collapse to
+  `Ok(None)` — callers that need to distinguish must call
+  `describe_execution` / `describe_flow` first.
+
+**Describe-flow parity caveat.** `FlowSnapshot::tags` from
+Valkey's `describe_flow` snapshots `flow_core` fields only and does
+NOT today merge the `:tags` sub-hash; Postgres `describe_flow` surfaces
+flow tags via `extract_tags` on `raw_fields`. Consumers on Valkey that
+need the full flow-tag set should complement the snapshot with per-key
+`get_flow_tag` reads until the Valkey merge lands (additive
+post-v0.13).
+
+## Waitpoint-token read — `read_waitpoint_token` (#438 / cairn #434)
+
+**Motivation.** The signal-bridge (cairn's resume-on-signal harness)
+needs to read the stored waitpoint token at poll-on-resume to
+reconstruct the HMAC fingerprint. Pre-v0.13 the only path was
+Valkey-only `fetch_waitpoint_token_v07` (retired at v0.8.0) or raw
+`HGET` against an internal partition layout. v0.13 adds a
+backend-agnostic trait method — all three backends implement it.
+
+**Before (v0.12, Valkey-only):**
+
+```rust,ignore
+// Direct Valkey HGET bypassing the trait.
+let mut client = ferriskey::Client::connect(valkey_url).await?;
+let token: Option<String> = client
+    .hget(
+        format!("ff:wp:{{p:{}}}:{}", partition, waitpoint_id),
+        "token",
+    )
+    .await?;
+```
+
+**After (v0.13):**
+
+```rust,ignore
+let token = backend
+    .read_waitpoint_token(partition, &waitpoint_id)
+    .await?;
+```
+
+`partition` is the opaque `PartitionKey` the waitpoint was minted
+against — typically extracted from the `Handle` / `ResumeToken` the
+signal-bridge holds. Missing waitpoint surfaces as `Ok(None)` on all
+three backends.
+
+## Service-layer FCALL surface (#442 / cairn #389)
+
+**Motivation.** Control-plane callers (cairn's
+`valkey_control_plane_impl.rs` and future non-Handle consumers) were
+reaching into `ferriskey::Value::Array` matching + a manual
+`check_fcall_success` + `parse_*` for the full `complete` / `fail` /
+`renew` / `resume` / admission / eligibility surface. v0.13 adds six
+trait methods that mirror the existing Handle-taking peers but accept
+`(execution_id, fence)` tuples and return typed outcomes from
+`ff_core::contracts`.
+
+**Parity status at v0.13.** Valkey ships bodies at landing. PG +
+SQLite inherit the `EngineError::Unavailable { op: "<name>" }` default
+and receive real bodies in a follow-up (same staging as RFC-024
+reclaim + `claim_execution`). See
+[`POSTGRES_PARITY_MATRIX.md`](POSTGRES_PARITY_MATRIX.md) §cairn #389
+for the per-method row.
+
+**Before (v0.12):**
+
+```rust,ignore
+// Raw ferriskey Value matching against the FCALL response.
+let resp = client
+    .fcall(
+        "ff_complete_execution",
+        &keys_for_exec(&partition, &exec_id),
+        &args_for_complete(&fence, &result_payload),
+    )
+    .await?;
+let arr = match resp {
+    ferriskey::Value::Array(a) => a,
+    other => anyhow::bail!("unexpected FCALL shape: {other:?}"),
+};
+check_fcall_success(&arr)?;
+let outcome = parse_complete_execution_response(&arr)?;
+```
+
+**After (v0.13):**
+
+```rust,ignore
+let outcome = backend
+    .complete_execution(&exec_id, &fence, &result_payload)
+    .await?;
+
+// Sibling peers, same pattern:
+backend.fail_execution(&exec_id, &fence, &failure).await?;
+backend.renew_lease(&exec_id, &fence).await?;
+backend.resume_execution(&exec_id, &fence, &resume_args).await?;
+
+// Admission / eligibility — read-shaped:
+let admission = backend
+    .check_admission(&quota_policy_id, "default", &args)
+    .await?;
+let status = backend.evaluate_flow_eligibility(&flow_id).await?;
+```
+
+`check_admission` takes `quota_policy_id` + `dimension` outside the
+`CheckAdmissionArgs` struct because quota keys live on the
+`{q:<policy>}` partition (not derivable from `execution_id`); empty
+`dimension` is normalised to `"default"`.
+
+## PR-7b scanner trait routing (#436 / cluster PRs)
+
+**Motivation.** The scanner supervisor (`ff-engine`) previously held
+Valkey-specific FCALL dispatch logic for every scanner tick —
+foundation (`mark_lease_expired_if_due`, `promote_delayed`,
+`close_waitpoint`, `expire_execution`, `expire_suspension`),
+reconciler (`unblock_execution`), cancel-family
+(`drain_sibling_cancel_group`, `reconcile_sibling_cancel_group`),
+tally-recompute (`reconcile_{execution_index,budget_counters,quota_counters}`),
+projection (`project_flow_summary`), and retention (`trim_retention`).
+Consumers embedding `Engine` on Postgres or SQLite saw `Unsupported`
+from every tick. v0.13 routes every scanner tick through
+`EngineBackend::*` with backend-appropriate semantics.
+
+**Cluster index.**
+
+| Cluster | PR | Trait methods |
+|---|---|---|
+| 1 — Foundation | #441 + #443 | `mark_lease_expired_if_due`, `promote_delayed`, `close_waitpoint`, `expire_execution`, `expire_suspension`, `get_execution_namespace` |
+| 2 — Reconciler | #445 | `unblock_execution` |
+| 3 — Cancel family | #444 | `drain_sibling_cancel_group`, `reconcile_sibling_cancel_group` |
+| 2b-A — Tally-recompute | #447 | `reconcile_execution_index`, `reconcile_budget_counters`, `reconcile_quota_counters` |
+| 2b-B — Projection + retention | #449 (pending merge) | `project_flow_summary`, `trim_retention` |
+| 4 — Completion listener | #446 | `cascade_completion` (covered in the Cluster 4 section above) |
+
+**Consumer-visible shape.** Consumers embedding `Engine` get
+backend-agnostic scanner routing post-PR-7b final scaffolding:
+
+```rust,ignore
+// Post-PR-7b: Engine::start_with_completions is backend-agnostic.
+let pg_backend: Arc<PostgresBackend> = PostgresBackend::connect_with(...).await?;
+let engine = Engine::start_with_completions(
+    config,
+    pg_backend.clone().into_arc_dyn(),  // backend as Arc<dyn EngineBackend>
+    completion_stream,
+    shutdown,
+)
+.await?;
+```
+
+On Postgres + SQLite, the reconcile/cancel/tally scanner ticks that
+map to Valkey-only FCALL semantics surface `Unsupported` and the
+scanner supervisor skips them — **intentional**, because the PG
+scheduler and SQLite's `BEGIN IMMEDIATE` reconcilers re-evaluate the
+same state live via SQL. See
+[`POSTGRES_PARITY_MATRIX.md`](POSTGRES_PARITY_MATRIX.md) §PR-7b
+scanner additions for the per-method rationale.
+
+## cairn closed-issues index
+
+v0.13 closes the following cairn-originated ask items. Each row
+points to the tracking FlowFabric issue/PR pair.
+
+| cairn issue | FlowFabric resolution | Ship vehicle |
+|---|---|---|
+| #433 Tag methods on trait | #439 | v0.13 (this release) |
+| #434 Waitpoint-token read on trait | #438 | v0.13 |
+| #435 `pg.create_waitpoint` | #437 | v0.13 |
+| #387 `ferriskey` ReadOnly auto-refresh | #426 + #427 + #429 chain | v0.12 (realised) |
+| #389 Typed FCALL outcomes (service-layer) | #442 | v0.13 (Valkey); PG + SQLite bodies follow-up |
+| #436 PR-7b — `Engine` non-Valkey backend routing | #441 + #443 + #444 + #445 + #446 + #447 + #449 + final scaffolding | v0.13 |
+
+**Per-issue summary.**
+
+- **#433 (→ #439).** Caller-namespaced tag writes + reads now route
+  through `EngineBackend::{set,get}_{execution,flow}_tag` on all
+  three backends. Regex-validated at the trait edge. See §Tag
+  methods above.
+- **#434 (→ #438).** `read_waitpoint_token` implemented on all three
+  backends; replaces the retired `fetch_waitpoint_token_v07`. See
+  §Waitpoint-token read above.
+- **#435 (→ #437).** Postgres `create_waitpoint` landed as a trait
+  impl, closing the ingress-parity gap flagged during cairn's
+  signal-bridge port.
+- **#387 (→ #426 + #427 + #429 chain).** `ferriskey` ReadOnly clients
+  now auto-refresh on topology changes without caller intervention.
+  Realised in v0.12; kept in this index for completeness.
+- **#389 (→ #442).** Six service-layer trait methods added
+  (`complete_execution`, `fail_execution`, `renew_lease`,
+  `resume_execution`, `check_admission`,
+  `evaluate_flow_eligibility`). See §Service-layer FCALL surface
+  above. PG + SQLite parity is v0.13-follow-up scope.
+- **#436 (→ 7+ PRs).** PR-7b trait-routed scanner push lands every
+  cluster 1/2/3/2b-A/2b-B/4 scanner tick behind the `EngineBackend`
+  trait. Cluster 2b-B (projection + retention) depends on #449
+  merging.
+
+## Known limitations
+
+The following Postgres / SQLite `Unavailable` surfaces persist in
+v0.13 and are **not** closed by this release. All are tracked;
+consumers on PG or SQLite should compile-check against the matrix
+before relying on these methods.
+
+- **`claim_from_grant` / `claim_execution` / `claim_via_server`
+  still PG/SQLite `Unavailable`** per
+  `project_claim_from_grant_pg_sqlite_gap.md`. v0.13 does NOT
+  address this. PG's grant-consumer flow routes through
+  `PostgresScheduler::claim_for_worker`; SQLite has no
+  grant-consumer path today.
+- **`resolve_dependency` PG `Unavailable`** — PG uses an
+  outbox-per-event cascade (`ff_completion_event` +
+  `dispatch_completion`), not the Valkey per-edge shape. Not a bug;
+  an architectural divergence — the PG reconciler already drives
+  the equivalent work.
+- **`unblock_execution` PG `Unavailable`** — PG re-evaluates
+  eligibility live via SQL on every `claim_for_worker` tick; no
+  persisted blocked-index to reconcile. SQLite inherits the design.
+- **Scanner-bypass primitives Valkey-only** —
+  `scan_eligible_executions`, `issue_claim_grant`, `block_route`
+  remain Valkey-`impl` / PG + SQLite `Unavailable` (default). **Not
+  a regression** — design intent; gated behind the
+  `direct-valkey-claim` bench-only feature. PG/SQLite consumers use
+  the scheduler-routed `claim_for_worker` path.
+- **Retention overrides Valkey-only post-#449** —
+  `policy.stream_policy.retention_ttl_ms` per-policy overrides are
+  honoured only on Valkey's `trim_retention` FCALL. Postgres uses
+  the global default. Not a regression; documented when #449 lands.
+- **Scanner `Unavailable` on PG/SQLite by design** — the six
+  reconcile/cancel/tally scanner methods
+  (`drain_sibling_cancel_group`, `reconcile_sibling_cancel_group`,
+  `unblock_execution`, `reconcile_execution_index`,
+  `reconcile_budget_counters`, `reconcile_quota_counters`) return
+  `Unavailable` on PG/SQLite — **not a parity gap**, because these
+  backends' SERIALIZABLE transactions + live SQL eligibility
+  re-evaluation leave no counter drift to reconcile. See the matrix
+  for per-method rationale.
+
+## Deferred to v0.14
+
+The following items were scoped out of v0.13 and are on the v0.14
+track. Trackers listed inline.
+
+- **Broader `Duration` overflow harmonisation** — scattered
+  `u64::MAX` ms-to-`Duration` conversions need a project-wide
+  policy pass. Tracked on GitHub issues.
+- **Option B streaming trait split** — the streaming-feature-gated
+  subtrait split was considered but deferred; current
+  `#[cfg(feature = "streaming")]` gates on individual trait methods
+  ship v0.13 unchanged.
+- **PG / SQLite `claim_execution` parity** — grant-consumer flow
+  for the SDK `claim_from_grant` path. See
+  `project_claim_from_grant_pg_sqlite_gap.md`.
+- **SQLite `public_state = 'running'` on claim path** — see
+  `project_sqlite_claim_public_state_gap.md`. Normaliser handles
+  the read side; claim-write parity is a v0.14 fix.
+- **Remaining PG `Unavailable` surfaces on the service-layer family**
+  — bodies for `complete_execution`, `fail_execution`,
+  `renew_lease`, `resume_execution`, `check_admission`,
+  `evaluate_flow_eligibility` on PG + SQLite. Covered by #442
+  follow-up.
+- **Cluster 2b-B rows in the parity matrix** —
+  `project_flow_summary` and `trim_retention` rows merge
+  concurrently with PR #449; if #449 slips past the v0.13 tag,
+  the rows land in a point-release doc amendment.
