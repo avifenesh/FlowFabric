@@ -400,8 +400,14 @@ impl CancelReconciler {
     ///
     /// "Ack-worthy" semantics preserved:
     /// - success: true
-    /// - already-terminal / not-found: true (no point retrying)
-    /// - transient transport: false (retry next cycle)
+    /// - already-terminal (`Contention(ExecutionNotActive)`) /
+    ///   `NotFound`: true (the member is gone; retrying is pointless)
+    /// - `Validation` / `Bug`: true — these are non-convergent under
+    ///   retry. Acking prevents a poison cancel-group member from
+    ///   triggering retry storms on every reconcile tick. Emitted at
+    ///   `warn` level so operators notice the malformed entry.
+    /// - transient transport / other `Contention` / `ResourceExhausted` /
+    ///   `State` / `Unavailable`: false (retry next cycle)
     async fn cancel_member(
         &self,
         client: &ferriskey::Client,
