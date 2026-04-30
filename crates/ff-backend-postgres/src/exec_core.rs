@@ -1230,6 +1230,7 @@ pub(super) async fn trim_retention_impl(
     retention_ms: u64,
     now_ms: i64,
     batch_size: u32,
+    filter: &ff_core::backend::ScannerFilter,
 ) -> Result<u32, EngineError> {
     let retention_i64 = i64::try_from(retention_ms).unwrap_or(i64::MAX);
     let cutoff = now_ms.saturating_sub(retention_i64);
@@ -1242,6 +1243,17 @@ pub(super) async fn trim_retention_impl(
     // `terminal_at_ms` parallels Valkey's `completed_at` score. Rows with
     // terminal_at_ms IS NULL (tombstoned-but-not-yet-timestamped edge
     // case) are excluded — retention will pick them up on the next pass.
+    //
+    // Issue #122: `ScannerFilter` narrows the batch. `namespace` /
+    // `instance_tag` live in `ff_exec_core.raw_fields` (JSONB); we
+    // push both dimensions into the SELECT WHERE-clause so a filter-
+    // scoped scanner cycle never reads rows outside its scope.
+    let namespace_opt = filter.namespace.as_ref().map(|n| n.as_str().to_owned());
+    let instance_tag_opt = filter
+        .instance_tag
+        .as_ref()
+        .map(|(k, v)| (k.clone(), v.clone()));
+
     let rows: Vec<(Uuid,)> = sqlx::query_as(
         r#"
         SELECT execution_id
@@ -1251,6 +1263,8 @@ pub(super) async fn trim_retention_impl(
           AND lifecycle_phase = 'terminal'
           AND terminal_at_ms IS NOT NULL
           AND terminal_at_ms <= $3
+          AND ($5::text IS NULL OR raw_fields->>'namespace' = $5)
+          AND ($6::text IS NULL OR raw_fields->'tags'->>$6 = $7)
         ORDER BY terminal_at_ms
         LIMIT $4
         "#,
@@ -1259,6 +1273,9 @@ pub(super) async fn trim_retention_impl(
     .bind(lane_id)
     .bind(cutoff)
     .bind(limit_i64)
+    .bind(namespace_opt.as_deref())
+    .bind(instance_tag_opt.as_ref().map(|(k, _)| k.as_str()))
+    .bind(instance_tag_opt.as_ref().map(|(_, v)| v.as_str()))
     .fetch_all(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
@@ -1269,6 +1286,14 @@ pub(super) async fn trim_retention_impl(
     }
 
     let eids: Vec<Uuid> = rows.into_iter().map(|(e,)| e).collect();
+    // Sibling tables split `execution_id` between `uuid` (e.g.
+    // `ff_exec_core`, `ff_attempt`, `ff_claim_grant`,
+    // `ff_completion_event`, `ff_stream_*`, `ff_suspension_current`,
+    // `ff_waitpoint_pending`) and `text` (e.g. `ff_lease_event`,
+    // `ff_signal_event`, `ff_operator_event`, `ff_quota_*`,
+    // `ff_cancel_backlog_member`). Compare on `execution_id::text` so
+    // a single bind of `text[]` works uniformly.
+    let eid_texts: Vec<String> = eids.iter().map(Uuid::to_string).collect();
 
     // Cascade siblings first; exec_core last. Mirrors the Valkey
     // ordering rationale: if a sibling delete fails mid-batch the
@@ -1277,12 +1302,12 @@ pub(super) async fn trim_retention_impl(
     // allowlist above — no caller influence on table identity.
     for table in RETENTION_SIBLING_TABLES {
         let sql = format!(
-            "DELETE FROM {} WHERE partition_key = $1 AND execution_id = ANY($2::uuid[])",
+            "DELETE FROM {} WHERE partition_key = $1 AND execution_id::text = ANY($2::text[])",
             table
         );
         sqlx::query(&sql)
             .bind(partition_key)
-            .bind(&eids)
+            .bind(&eid_texts)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx_error)?;

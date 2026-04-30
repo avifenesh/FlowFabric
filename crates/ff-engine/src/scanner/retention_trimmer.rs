@@ -25,7 +25,7 @@ use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::{LaneId, TimestampMs};
 
-use super::{ScanResult, Scanner};
+use super::{should_skip_candidate, ScanResult, Scanner};
 
 const BATCH_SIZE: u32 = 20;
 
@@ -114,15 +114,28 @@ impl Scanner for RetentionTrimmer {
         for lane in &self.lanes {
             let res = if let Some(backend) = self.backend.as_ref() {
                 backend
-                    .trim_retention(p, lane, self.default_retention_ms, now_ts, BATCH_SIZE)
+                    .trim_retention(
+                        p,
+                        lane,
+                        self.default_retention_ms,
+                        now_ts,
+                        BATCH_SIZE,
+                        &self.filter,
+                    )
                     .await
                     .map_err(|e: EngineError| e.to_string())
             } else {
                 // Test-only fallback when the scanner is instantiated
                 // without a backend. Mirrors the pre-PR-7b ZRANGEBYSCORE
                 // + per-exec cascade loop behaviour for test fixtures.
+                // Filter is honoured via `should_skip_candidate` in the
+                // per-eid loop; with no backend plumbed a non-noop filter
+                // skips everything (conservative), matching the trait-
+                // routed semantic.
                 trim_retention_direct_fallback(
                     client,
+                    self.backend.as_ref(),
+                    &self.filter,
                     &p,
                     lane,
                     self.default_retention_ms,
@@ -154,8 +167,11 @@ impl Scanner for RetentionTrimmer {
 /// Test-only direct-client retention loop for scanner instantiations
 /// without an `EngineBackend`. Returns the number of executions purged
 /// in this call.
+#[allow(clippy::too_many_arguments)]
 async fn trim_retention_direct_fallback(
     client: &ferriskey::Client,
+    backend: Option<&Arc<dyn EngineBackend>>,
+    filter: &ScannerFilter,
     partition: &Partition,
     lane: &LaneId,
     default_retention_ms: u64,
@@ -183,6 +199,9 @@ async fn trim_retention_direct_fallback(
 
     let mut processed = 0u32;
     for eid_str in &expired {
+        if should_skip_candidate(backend, filter, partition.index, eid_str).await {
+            continue;
+        }
         if purge_execution_fallback(
             client,
             partition,

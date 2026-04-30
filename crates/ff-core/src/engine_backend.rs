@@ -2460,6 +2460,7 @@ pub trait EngineBackend: Send + Sync + 'static {
         _retention_ms: u64,
         _now_ms: TimestampMs,
         _batch_size: u32,
+        _filter: &crate::backend::ScannerFilter,
     ) -> Result<u32, EngineError> {
         Err(EngineError::Unavailable {
             op: "trim_retention",
@@ -3132,7 +3133,14 @@ mod tests {
         };
         let lane = LaneId::new("default");
         match b
-            .trim_retention(partition, &lane, 60_000, TimestampMs::from_millis(0), 20)
+            .trim_retention(
+                partition,
+                &lane,
+                60_000,
+                TimestampMs::from_millis(0),
+                20,
+                &crate::backend::ScannerFilter::NOOP,
+            )
             .await
         {
             Err(EngineError::Unavailable { op }) => {

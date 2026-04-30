@@ -8569,14 +8569,16 @@ impl EngineBackend for ValkeyBackend {
         retention_ms: u64,
         now_ms: TimestampMs,
         batch_size: u32,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<u32, EngineError> {
         trim_retention_impl(
-            &self.client,
+            self,
             partition,
             lane_id,
             retention_ms,
             now_ms,
             batch_size,
+            filter,
         )
         .await
     }
@@ -10062,13 +10064,15 @@ async fn project_flow_summary_impl(
 /// number of executions actually purged (skipped ones — custom
 /// retention not yet due — do not count).
 async fn trim_retention_impl(
-    client: &ferriskey::Client,
+    backend: &ValkeyBackend,
     partition: Partition,
     lane_id: &LaneId,
     retention_ms: u64,
     now_ms: TimestampMs,
     batch_size: u32,
+    filter: &ff_core::backend::ScannerFilter,
 ) -> Result<u32, EngineError> {
+    let client = &backend.client;
     let idx = IndexKeys::new(&partition);
     let terminal_key = idx.lane_terminal(lane_id);
     let now_ms_u64 = now_ms.0.max(0) as u64;
@@ -10092,6 +10096,12 @@ async fn trim_retention_impl(
 
     let mut processed: u32 = 0;
     for eid_str in &expired {
+        // Issue #122: honour per-candidate ScannerFilter (namespace /
+        // instance tag). Filtered-out candidates are left in place so a
+        // differently-scoped scanner cycle can reach them.
+        if backend.scanner_skip_candidate(filter, eid_str).await {
+            continue;
+        }
         // false = custom retention not yet expired; do not count.
         if purge_retention_execution(
             client,

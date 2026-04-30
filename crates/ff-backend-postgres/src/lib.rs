@@ -1572,6 +1572,7 @@ impl EngineBackend for PostgresBackend {
         retention_ms: u64,
         now_ms: TimestampMs,
         batch_size: u32,
+        filter: &ff_core::backend::ScannerFilter,
     ) -> Result<u32, EngineError> {
         let partition_key = partition_index_to_i16(partition)?;
         exec_core::trim_retention_impl(
@@ -1581,6 +1582,7 @@ impl EngineBackend for PostgresBackend {
             retention_ms,
             now_ms.0,
             batch_size,
+            filter,
         )
         .await
     }
