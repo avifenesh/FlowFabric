@@ -1615,6 +1615,14 @@ impl EngineBackend for PostgresBackend {
         crate::typed_ops::fail_execution(self.pool(), args).await
     }
 
+    #[cfg(feature = "core")]
+    async fn resume_execution(
+        &self,
+        args: ff_core::contracts::ResumeExecutionArgs,
+    ) -> Result<ff_core::contracts::ResumeExecutionResult, EngineError> {
+        crate::typed_ops::resume_execution(self.pool(), args).await
+    }
+
     // ── PR-7b Wave 0a: exec_core field read ──
 
     async fn read_exec_core_fields(

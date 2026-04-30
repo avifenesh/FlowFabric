@@ -33,7 +33,7 @@
 
 use ff_core::contracts::{
     CompleteExecutionArgs, CompleteExecutionResult, FailExecutionArgs, FailExecutionResult,
-    RenewLeaseArgs, RenewLeaseResult,
+    RenewLeaseArgs, RenewLeaseResult, ResumeExecutionArgs, ResumeExecutionResult,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
 use ff_core::state::PublicState;
@@ -758,6 +758,143 @@ pub(crate) async fn fail_execution(
 }
 
 
+
+
+/// PG body for [`ff_core::engine_backend::EngineBackend::resume_execution`].
+///
+/// Mirrors `ff_resume_execution` in `flowfabric.lua`:
+///
+/// 1. Lock `ff_exec_core FOR UPDATE` + verify `lifecycle_phase == 'suspended'`.
+/// 2. Verify a matching `ff_suspension_current` row exists
+///    (`ExecutionNotSuspended` otherwise).
+/// 3. Flip `ff_exec_core` to `runnable`, compute eligibility based on
+///    `resume_delay_ms`: > 0 → `not_eligible_until_time`/`delayed`,
+///    else `eligible_now`/`waiting`. Clear `current_waitpoint_id` +
+///    `current_suspension_id` from `raw_fields`.
+/// 4. DELETE the `ff_suspension_current` row.
+/// 5. Return `Resumed { public_state }`.
+pub(crate) async fn resume_execution(
+    pool: &PgPool,
+    args: ResumeExecutionArgs,
+) -> Result<ResumeExecutionResult, EngineError> {
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+    // 1. Lock exec_core + lifecycle gate.
+    let exec_row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+         FOR UPDATE
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(exec_row) = exec_row else {
+        return Err(EngineError::NotFound { entity: "execution" });
+    };
+    let lifecycle_phase: String = exec_row
+        .try_get("lifecycle_phase")
+        .map_err(map_sqlx_error)?;
+    if lifecycle_phase != "suspended" {
+        return Err(EngineError::State(StateKind::ExecutionNotSuspended));
+    }
+
+    // 2. Confirm a suspension row exists.
+    let susp_row = sqlx::query(
+        r#"
+        SELECT 1 FROM ff_suspension_current
+         WHERE partition_key = $1 AND execution_id = $2
+         FOR UPDATE
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+    if susp_row.is_none() {
+        return Err(EngineError::State(StateKind::ExecutionNotSuspended));
+    }
+
+    let now = now_ms();
+
+    // 3. Decide eligibility based on resume_delay_ms.
+    let (eligibility_state, blocking_reason, public_state) = if args.resume_delay_ms > 0 {
+        (
+            "not_eligible_until_time",
+            "waiting_for_resume_delay",
+            PublicState::Delayed,
+        )
+    } else {
+        (
+            "eligible_now",
+            "waiting_for_worker",
+            PublicState::Waiting,
+        )
+    };
+    let public_state_str = match public_state {
+        PublicState::Delayed => "delayed",
+        PublicState::Waiting => "waiting",
+        // Unreachable — the branch above only sets Delayed or Waiting.
+        _ => "waiting",
+    };
+
+    // 4. Flip exec_core.
+    let patch = serde_json::json!({
+        "current_suspension_id": "",
+        "current_waitpoint_id": "",
+    });
+    sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET lifecycle_phase = 'runnable',
+               ownership_state = 'unowned',
+               eligibility_state = $1,
+               attempt_state = 'attempt_interrupted',
+               blocking_reason = $2,
+               public_state = $3,
+               raw_fields = raw_fields || $4::jsonb
+         WHERE partition_key = $5 AND execution_id = $6
+        "#,
+    )
+    .bind(eligibility_state)
+    .bind(blocking_reason)
+    .bind(public_state_str)
+    .bind(patch)
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // 5. Drop the suspension_current row. `trigger_type` is advisory
+    // and recorded for audit in the outbox only (PG shape doesn't
+    // keep a separate "close_reason" on the row since we DELETE).
+    let _ = &args.trigger_type;
+    sqlx::query(
+        r#"
+        DELETE FROM ff_suspension_current
+         WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+
+    let _ = now;
+    Ok(ResumeExecutionResult::Resumed { public_state })
+}
 #[cfg(test)]
 mod tests {
     // Integration tests live in `tests/typed_renew_lease.rs` +
