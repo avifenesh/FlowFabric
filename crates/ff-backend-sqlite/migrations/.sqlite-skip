@@ -14,3 +14,9 @@
 # The parity-drift lint (`scripts/lint-migrations.sh`) parses this
 # format directly.
 
+# PR-7b Cluster 2b-B — `ff_flow_summary` projection table. SQLite
+# rides `EngineBackend::project_flow_summary`'s `Unavailable` default
+# per RFC-023 Phase 3.5 (flow summary projection is a shared-
+# deployment dashboard feature; local single-tenant SQLite
+# deployments don't need it). No SQLite sibling migration required.
+0019_flow_summary.sql

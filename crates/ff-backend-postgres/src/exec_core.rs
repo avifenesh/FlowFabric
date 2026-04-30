@@ -1179,3 +1179,127 @@ pub(super) async fn get_execution_namespace_impl(
 
     Ok(row.and_then(|(ns,)| ns))
 }
+
+// ── PR-7b Cluster 2b-B — retention trimmer (cascading purge) ──────────
+//
+// Retention trimming is inherently a scan-and-delete loop over time.
+// The trait surface exists to remove engine-side Valkey coupling, not
+// to atomise the operation into one round-trip. This impl runs one
+// transaction per batch, selecting a `batch_size`-bounded set of
+// terminal+old executions and cascading DELETEs across every sibling
+// table (the schema has no FK CASCADE). Returns the count of rows
+// deleted from `ff_exec_core` so the engine scanner can loop when it
+// saturates the batch.
+//
+// Semantics match the Valkey scanner: "terminal executions whose
+// terminal_at_ms is older than now - retention_ms". Per-execution
+// policy overrides are deferred — Valkey's scanner applies them
+// because it reads one exec at a time anyway; SQL retention's per-
+// batch shape makes overrides a follow-up. For now the SQL path uses
+// the caller-supplied global retention only.
+
+/// Sibling tables (execution-scoped) that retention must clean up
+/// alongside `ff_exec_core`. Kept here so a new table with an
+/// `execution_id` column triggers an explicit edit — silent schema
+/// drift (new table, stale retention) would orphan rows.
+const RETENTION_SIBLING_TABLES: &[&str] = &[
+    "ff_attempt",
+    "ff_cancel_backlog_member",
+    "ff_claim_grant",
+    "ff_completion_event",
+    "ff_lease_event",
+    "ff_operator_event",
+    "ff_quota_admitted",
+    "ff_quota_window",
+    "ff_signal_event",
+    "ff_stream_frame",
+    "ff_stream_meta",
+    "ff_stream_summary",
+    "ff_suspension_current",
+    "ff_waitpoint_pending",
+];
+
+/// Delete a batch of terminal executions past the retention cutoff
+/// across `ff_exec_core` + every execution-scoped sibling table.
+/// Returns the number of `ff_exec_core` rows deleted so the engine
+/// scanner can re-loop on saturation.
+pub(super) async fn trim_retention_impl(
+    pool: &PgPool,
+    partition_key: i16,
+    lane_id: &str,
+    retention_ms: u64,
+    now_ms: i64,
+    batch_size: u32,
+) -> Result<u32, EngineError> {
+    let retention_i64 = i64::try_from(retention_ms).unwrap_or(i64::MAX);
+    let cutoff = now_ms.saturating_sub(retention_i64);
+    let limit_i64 = i64::from(batch_size);
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+    // Pick a batch of eligible execution_ids. `lifecycle_phase = 'terminal'`
+    // matches the Valkey semantic (scanner consumes the terminal ZSET);
+    // `terminal_at_ms` parallels Valkey's `completed_at` score. Rows with
+    // terminal_at_ms IS NULL (tombstoned-but-not-yet-timestamped edge
+    // case) are excluded — retention will pick them up on the next pass.
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT execution_id
+        FROM ff_exec_core
+        WHERE partition_key = $1
+          AND lane_id = $2
+          AND lifecycle_phase = 'terminal'
+          AND terminal_at_ms IS NOT NULL
+          AND terminal_at_ms <= $3
+        ORDER BY terminal_at_ms
+        LIMIT $4
+        "#,
+    )
+    .bind(partition_key)
+    .bind(lane_id)
+    .bind(cutoff)
+    .bind(limit_i64)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if rows.is_empty() {
+        tx.commit().await.map_err(map_sqlx_error)?;
+        return Ok(0);
+    }
+
+    let eids: Vec<Uuid> = rows.into_iter().map(|(e,)| e).collect();
+
+    // Cascade siblings first; exec_core last. Mirrors the Valkey
+    // ordering rationale: if a sibling delete fails mid-batch the
+    // whole tx rolls back and the next pass rebuilds the full delete
+    // set by re-reading exec_core. Table names are injected from the
+    // allowlist above — no caller influence on table identity.
+    for table in RETENTION_SIBLING_TABLES {
+        let sql = format!(
+            "DELETE FROM {} WHERE partition_key = $1 AND execution_id = ANY($2::uuid[])",
+            table
+        );
+        sqlx::query(&sql)
+            .bind(partition_key)
+            .bind(&eids)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+    }
+
+    let deleted = sqlx::query(
+        "DELETE FROM ff_exec_core \
+         WHERE partition_key = $1 AND execution_id = ANY($2::uuid[])",
+    )
+    .bind(partition_key)
+    .bind(&eids)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?
+    .rows_affected();
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+
+    Ok(u32::try_from(deleted).unwrap_or(u32::MAX))
+}
