@@ -1599,6 +1599,14 @@ impl EngineBackend for PostgresBackend {
         crate::typed_ops::renew_lease(self.pool(), args).await
     }
 
+    #[cfg(feature = "core")]
+    async fn complete_execution(
+        &self,
+        args: ff_core::contracts::CompleteExecutionArgs,
+    ) -> Result<ff_core::contracts::CompleteExecutionResult, EngineError> {
+        crate::typed_ops::complete_execution(self.pool(), args).await
+    }
+
     // ── PR-7b Wave 0a: exec_core field read ──
 
     async fn read_exec_core_fields(

@@ -31,8 +31,12 @@
 //! | `lease_revoked`      | `State(LeaseRevoked)`                                             |
 //! | `fence_required`     | `Validation { InvalidInput, detail: "fence_required" }`           |
 
-use ff_core::contracts::{RenewLeaseArgs, RenewLeaseResult};
+use ff_core::contracts::{
+    CompleteExecutionArgs, CompleteExecutionResult, RenewLeaseArgs, RenewLeaseResult,
+};
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
+use ff_core::state::PublicState;
+use ff_core::types::CancelSource;
 use sqlx::{PgPool, Row};
 
 use crate::attempt::split_exec_id;
@@ -214,6 +218,240 @@ pub(crate) async fn renew_lease(
 
     Ok(RenewLeaseResult::Renewed {
         expires_at: ff_core::types::TimestampMs::from_millis(new_expires),
+    })
+}
+
+/// PG body for [`ff_core::engine_backend::EngineBackend::complete_execution`].
+///
+/// Mirrors `ff_complete_execution` in `flowfabric.lua`:
+///
+/// 1. Fence-or-operator-override gate. `args.fence.is_none()` with
+///    `source != OperatorOverride` → `Validation{fence_required}`.
+/// 2. Lock `ff_attempt FOR UPDATE` + epoch fence (when present).
+/// 3. Check `ff_exec_core.lifecycle_phase == 'active'`; otherwise
+///    `ExecutionNotActive` (typed carries phase/epoch detail).
+/// 4. Mark attempt terminal: `outcome='success'`, `terminal_at_ms=now`,
+///    `lease_expires_at_ms=NULL`.
+/// 5. Flip `ff_exec_core` to `lifecycle_phase='terminal'`,
+///    `ownership_state='unowned'`, `eligibility_state='not_applicable'`,
+///    `attempt_state='attempt_terminal'`, `public_state='completed'`,
+///    `terminal_at_ms=now`, store `result` payload.
+/// 6. Emit completion to `ff_completion_event` outbox (fires `pg_notify`
+///    to subscribed listeners).
+/// 7. Emit `lease_event::EVENT_REVOKED` to the lease outbox.
+/// 8. Return `Completed { execution_id, public_state: Completed }`.
+///
+/// Operator-override path bypasses the epoch fence but still enforces
+/// the lifecycle gate at step 3 — an operator cannot complete an
+/// execution that's already terminal.
+pub(crate) async fn complete_execution(
+    pool: &PgPool,
+    args: CompleteExecutionArgs,
+) -> Result<CompleteExecutionResult, EngineError> {
+    // 1. Fence-or-override gate.
+    let is_operator_override = matches!(args.source, CancelSource::OperatorOverride);
+    if args.fence.is_none() && !is_operator_override {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "fence_required".into(),
+        });
+    }
+
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let attempt_index =
+        i32::try_from(args.attempt_index.0).map_err(|_| EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "attempt_index {} exceeds PG i32 column bound",
+                args.attempt_index.0
+            ),
+        })?;
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+    // 2. Lock exec_core FIRST (parity with Lua: lifecycle/ownership
+    // gates are the authoritative pre-conditions, checked before the
+    // attempt-row fence).
+    let exec_row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase, ownership_state, flow_id,
+               COALESCE(raw_fields->>'current_attempt_id', '') AS current_attempt_id
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+         FOR UPDATE
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+    let Some(exec_row) = exec_row else {
+        return Err(EngineError::NotFound { entity: "execution" });
+    };
+    let lifecycle_phase: String = exec_row
+        .try_get("lifecycle_phase")
+        .map_err(map_sqlx_error)?;
+    let ownership_state: String = exec_row
+        .try_get("ownership_state")
+        .map_err(map_sqlx_error)?;
+    // Valkey's `validate_lease_and_mark_expired` rejects revoked
+    // leases ahead of the lifecycle/attempt checks. PG signals
+    // revocation via `ownership_state = 'lease_revoked'`.
+    if ownership_state == "lease_revoked" {
+        return Err(EngineError::State(StateKind::LeaseRevoked));
+    }
+    if lifecycle_phase != "active" {
+        let current_attempt_id: String = exec_row
+            .try_get("current_attempt_id")
+            .map_err(map_sqlx_error)?;
+        // Terminal outcome for PG is derived from `ff_attempt.outcome`
+        // (schema of record — `raw_fields.terminal_outcome` is a
+        // denormalisation legacy row that not every migration has).
+        // Leave the wire-level detail blank when unknown rather than
+        // fabricating a stale string from raw_fields.
+        return Err(EngineError::Contention(ContentionKind::ExecutionNotActive {
+            terminal_outcome: String::new(),
+            lease_epoch: String::new(),
+            lifecycle_phase,
+            attempt_id: current_attempt_id,
+        }));
+    }
+
+    // 3. Lock attempt row + epoch fence (when caller supplied one) +
+    // lease-live check. Lua's `validate_lease_and_mark_expired` rejects
+    // expired leases with `lease_expired`; PG mirrors that by checking
+    // `lease_expires_at_ms <= now` under the same lock.
+    let attempt_row = sqlx::query(
+        r#"
+        SELECT lease_epoch, lease_expires_at_ms
+          FROM ff_attempt
+         WHERE partition_key = $1 AND execution_id = $2 AND attempt_index = $3
+         FOR UPDATE
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(attempt_index)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(attempt_row) = attempt_row else {
+        return Err(EngineError::NotFound { entity: "attempt" });
+    };
+
+    let observed_epoch_i: i64 = attempt_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+    let observed_epoch = u64::try_from(observed_epoch_i).unwrap_or(0);
+    let observed_expires_at: Option<i64> = attempt_row
+        .try_get("lease_expires_at_ms")
+        .map_err(map_sqlx_error)?;
+
+    if let Some(fence) = &args.fence
+        && observed_epoch != fence.lease_epoch.0
+    {
+        return Err(EngineError::State(StateKind::StaleLease));
+    }
+
+    // Prefer the caller-supplied `args.now` for scanner/cluster time
+    // skew — PG-local `SystemTime::now()` is fine only if the caller
+    // hasn't passed a timestamp. All typed-contract call sites DO
+    // populate `args.now`, so this path is the norm.
+    let now = args.now.0;
+    if let Some(exp) = observed_expires_at
+        && exp <= now
+    {
+        return Err(EngineError::State(StateKind::LeaseExpired));
+    }
+
+    // 4. Mark attempt terminal.
+    sqlx::query(
+        r#"
+        UPDATE ff_attempt
+           SET terminal_at_ms = $1,
+               outcome = 'success',
+               lease_expires_at_ms = NULL
+         WHERE partition_key = $2 AND execution_id = $3 AND attempt_index = $4
+        "#,
+    )
+    .bind(now)
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(attempt_index)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // 5. Flip exec_core to terminal + store result payload + stamp
+    // `terminal_outcome=success` into `raw_fields` for backfills /
+    // legacy readers that still look at the denormalised copy.
+    let raw_patch = serde_json::json!({
+        "terminal_outcome": "success",
+    });
+    sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET lifecycle_phase = 'terminal',
+               ownership_state = 'unowned',
+               eligibility_state = 'not_applicable',
+               attempt_state = 'attempt_terminal',
+               public_state = 'completed',
+               terminal_at_ms = $1,
+               result = $2,
+               raw_fields = raw_fields || $3::jsonb
+         WHERE partition_key = $4 AND execution_id = $5
+        "#,
+    )
+    .bind(now)
+    .bind(args.result_payload.as_deref())
+    .bind(raw_patch)
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // 6. Completion outbox → pg_notify cascade for DAG dispatch.
+    // Carry `namespace` + `instance_tag` forward from `ff_exec_core`
+    // so downstream subscribers (RFC-019 filtered subscriptions)
+    // receive the events instead of silently dropping on NULL.
+    sqlx::query(
+        r#"
+        INSERT INTO ff_completion_event (
+            partition_key, execution_id, flow_id, outcome,
+            namespace, instance_tag, occurred_at_ms
+        )
+        SELECT partition_key, execution_id, flow_id, 'success',
+               raw_fields->>'namespace',
+               raw_fields->>'instance_tag',
+               $3
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // 7. RFC-019 Stage B lease outbox: revoked (terminal success).
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_REVOKED,
+        now,
+    )
+    .await?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+
+    Ok(CompleteExecutionResult::Completed {
+        execution_id: args.execution_id,
+        public_state: PublicState::Completed,
     })
 }
 
