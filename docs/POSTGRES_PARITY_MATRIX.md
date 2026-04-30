@@ -583,6 +583,12 @@ as part of #449's own doc updates. Expected shape:
   [`CONSUMER_MIGRATION_0.13.md`](CONSUMER_MIGRATION_0.13.md) §Known
   limitations.
 
+**#453 / PR-7b — typed-FCALL bodies (cairn blocker):**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `renew_lease` | `impl` | `impl` | `Unavailable` (default, follow-up) | PG: `READ COMMITTED` tx + `FOR UPDATE` on `ff_attempt`. Fence validation is **epoch-only** (PG doesn't persist `lease_id`/`attempt_id` to disk; `lease_epoch` monotonic bump is sufficient to catch the same violations Valkey's full-triple check covers). Error map: `fence_required`→`Validation{InvalidInput}`, `stale_lease`→`State(StaleLease)`, `lease_expired`→`State(LeaseExpired)`, `execution_not_active`→`Contention(ExecutionNotActive{...})`. Integration test: `crates/ff-backend-postgres/tests/typed_renew_lease.rs`. |
+
 **PR-7b Wave 0a — backend-agnostic primitives + `start_*` no-panic (cairn #436):**
 
 | Method | Valkey | Postgres | SQLite | Notes |
