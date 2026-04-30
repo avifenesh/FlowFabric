@@ -538,3 +538,63 @@ Until the bodies land, consumers compiling against those backends
 receive `EngineError::Unavailable { op: "<name>" }` on dispatch — a
 terminal, non-retryable classification the `ErrorClass` mapping
 already handles.
+
+### PR-7b scanner + cairn #434 additions (v0.13)
+
+Seven new trait methods landed during the PR-7b trait-routed scanner
+push (cairn #436) plus cairn #434 (waitpoint-token read). Row values
+reflect bodies on `main` at v0.13 tag-prep time.
+
+**Cluster 2 — reconciler scanners (#445):**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `unblock_execution` | `impl` | `Unavailable` (default, intentional) | `Unavailable` (default) | Valkey: `FCALL ff_unblock_execution` — scanner-driven move from `blocked_route` ZSET back to lane-eligible after a capability change. Postgres is architecturally `Unavailable`: the PG scheduler re-evaluates eligibility live via SQL on every `claim_for_worker` tick (`ff_exec_core` eligibility columns + `ff_lane` routing join), so there is no persisted blocked-index to reconcile. SQLite inherits PG's live-SQL approach; same rationale. |
+
+**Cluster 3 — cancel-family scanners (#444):**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `drain_sibling_cancel_group` | `impl` | `Unavailable` (default, intentional) | `Unavailable` (default) | Valkey: `FCALL ff_drain_sibling_cancel_group` — scanner drains the per-group sibling-cancel backlog into per-member cancel writes. Postgres `cancel_flow_header` + `ack_cancel_member` already use `ff_cancel_backlog` (migration 0014) and the PG cancel-backlog reconciler drives per-member writes directly from the table; no separate drain step exists. SQLite mirrors the PG cancel-backlog design (RFC-023 Phase 3.3). |
+| `reconcile_sibling_cancel_group` | `impl` | `Unavailable` (default, intentional) | `Unavailable` (default) | Valkey: `FCALL ff_reconcile_sibling_cancel_group` — scanner recounts `group_pending` vs `group_active` and flips group-terminal transitions. Postgres + SQLite derive group state from SQL aggregates over `ff_cancel_backlog` + `ff_exec_core` at read time; no persisted group counter to reconcile. |
+
+**Cluster 2b-A — tally-recompute scanners (#447):**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `reconcile_execution_index` | `impl` | `Unavailable` (default, intentional) | `Unavailable` (default) | Valkey: `FCALL ff_reconcile_execution_index` — recomputes per-lane eligible ZSET counters to repair drift from crash-in-middle-of-FCALL sequences. Postgres runs SERIALIZABLE-tx counters under `ff_exec_core` + live SQL eligibility evaluation on every claim; no persisted counter to drift, nothing to reconcile. SQLite inherits the PG design under `BEGIN IMMEDIATE`. |
+| `reconcile_budget_counters` | `impl` | `Unavailable` (default, intentional) | `Unavailable` (default) | Valkey: `FCALL ff_reconcile_budget_counters` — recomputes `ff:budget:*` hash counters from `ff_budget_usage` entries. Postgres maintains breach counters + `next_reset_at_ms` in-tx on `ff_budget_policy` + `ff_budget_usage` (migration 0013) under READ-COMMITTED INSERT-or-UPDATE; drift-free by construction. SQLite mirrors PG (RFC-023 Phase 3.4). |
+| `reconcile_quota_counters` | `impl` | `Unavailable` (default, intentional) | `Unavailable` (default) | Valkey: `FCALL ff_reconcile_quota_counters` — recomputes per-window quota counters after partial-apply crashes. Postgres maintains `ff_quota_window` + `ff_quota_admitted` in-tx (migration 0012, 256-way HASH-partitioned); drift-free by construction. SQLite mirrors PG. |
+
+**Cluster 2b-B — projection + retention scanners (#449, pending merge):**
+
+Rows for `project_flow_summary` and `trim_retention` depend on PR #449
+merging. They will be added in a follow-up commit once #449 lands, OR
+as part of #449's own doc updates. Expected shape:
+
+- `project_flow_summary` — Valkey `impl`, Postgres `impl` (migration
+  `0019_flow_summary.sql`), SQLite default `Unavailable`.
+- `trim_retention` — Valkey `impl`, Postgres `impl`, SQLite default
+  `Unavailable`. Retention overrides
+  (`policy.stream_policy.retention_ttl_ms`) are Valkey-only; PG uses
+  the global default. Not a regression — design intent documented in
+  [`CONSUMER_MIGRATION_0.13.md`](CONSUMER_MIGRATION_0.13.md) §Known
+  limitations.
+
+**cairn #434 — waitpoint-token read (#438):**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `read_waitpoint_token` | `impl` | `impl` | `impl` | Non-mutating point read of the stored waitpoint token. Replaces the Valkey-only `fetch_waitpoint_token_v07` retired at v0.8.0 with a backend-agnostic surface. Valkey: HGET on the partition-local waitpoint hash. Postgres: `SELECT token FROM ff_waitpoint_pending WHERE partition = $1 AND waitpoint_id = $2` (`suspend_ops::read_waitpoint_token_impl`). SQLite: same shape via `crates/ff-backend-sqlite/src/reads.rs::read_waitpoint_token_impl`. Missing row surfaces as `Ok(None)` on all three backends (signal-bridge poll-on-resume pattern relies on this). |
+
+**Summary of Valkey-scanner asymmetry (PG/SQLite `Unavailable`).** The
+6 scanner methods above are all Valkey-`impl` / PG+SQLite `Unavailable`
+by design. This is **not a parity gap** — the reconcile-drift pattern
+these scanners implement only exists on the Valkey backend's CRDT-ish
+counter topology. Postgres uses SERIALIZABLE transactions + live SQL
+eligibility re-evaluation; SQLite uses `BEGIN IMMEDIATE` + the same
+PG reconciler shapes. Neither backend can drift, so neither needs a
+reconcile hook. Consumers embedding `Engine` get backend-agnostic
+scanner routing: PR-7b final scaffolding asserts `Unsupported` on
+PG/SQLite for scanner-shaped calls, and the engine's scanner
+supervisor skips the tick entirely on those backends.
