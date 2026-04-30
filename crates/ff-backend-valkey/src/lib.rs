@@ -41,9 +41,9 @@ use ff_core::contracts::{
     AdditionalWaitpointBinding, BlockRouteArgs, BlockRouteOutcome, CancelFlowArgs,
     CancelFlowResult, ClaimExecutionArgs, ClaimExecutionResult, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult, CompositeBody,
-    CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
-    ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary,
-    IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueReclaimGrantArgs,
+    ClaimGrantOutcome, CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection,
+    EdgeSnapshot, ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary,
+    IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs, IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
     ListSuspendedPage, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
     RecordSpendArgs, ReleaseBudgetArgs, ScanEligibleArgs,
@@ -62,7 +62,7 @@ use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
 use ff_core::types::{
     AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseFence,
-    LeaseId, SignalId, TimestampMs, WaitpointId, WorkerInstanceId,
+    LeaseId, SignalId, TimestampMs, WaitpointId, WorkerId, WorkerInstanceId,
 };
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
@@ -79,7 +79,7 @@ use ff_script::functions::lease::{ff_renew_lease, ff_revoke_lease};
 use ff_script::functions::suspension::{ResumeOpKeys, ff_resume_execution};
 use ff_script::functions::quota::ff_check_admission_and_record;
 use ff_script::functions::scheduling::{
-    ChangePriorityResultPartial, SchedOpKeys, ff_change_priority,
+    ChangePriorityResultPartial, SchedOpKeys, ff_change_priority, ff_issue_grant_and_claim,
 };
 use ff_script::functions::budget::{BudgetOpKeys, ff_create_budget, ff_record_spend, ff_release_budget, ff_report_usage_and_check, ff_reset_budget};
 use ff_script::functions::quota::{QuotaOpKeys, ff_create_quota_policy};
@@ -5036,6 +5036,104 @@ async fn claim_execution_impl(
     Ok(result)
 }
 
+/// cairn #454 Phase 3d — backend-atomic `issue_claim_grant` +
+/// `claim_execution` composition. One `ff_issue_grant_and_claim` FCALL
+/// writes the grant, DEL's it, and mints the lease in a single Lua
+/// execution so a mid-op crash cannot leak a dangling grant.
+///
+/// The trait-level [`IssueGrantAndClaimArgs`] is intentionally minimal
+/// (`execution_id`, `lane_id`, `lease_duration_ms`) because this is an
+/// operator/control-plane path: cairn names an execution and demands a
+/// lease, the backend mints synthetic worker/lease/attempt identities
+/// to stamp onto the attempt + lease records. The minted
+/// `WorkerId`/`WorkerInstanceId` use stable `"operator"` labels so
+/// dashboards can distinguish control-plane leases from worker-dialed
+/// ones.
+///
+/// Dispatch between fresh-claim and resume-claim happens inside the
+/// Lua based on `exec_core.attempt_state`; the Rust side doesn't
+/// pre-read the dispatch bit because TOCTOU risk + re-reading
+/// `current_attempt_index` would require a second round trip (defeating
+/// the whole point of the fused FCALL). `expected_attempt_index` is
+/// read once here for KEYS[6..=8] placeholder construction — the Lua
+/// recomputes the real index internally, so the placeholder is only
+/// read-by-index-0 on the fresh path and unused on the resume path.
+#[tracing::instrument(
+    name = "ff.issue_grant_and_claim",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        lane_id = %args.lane_id,
+        lease_duration_ms = args.lease_duration_ms,
+    )
+)]
+async fn issue_grant_and_claim_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: IssueGrantAndClaimArgs,
+) -> Result<ClaimGrantOutcome, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let idx = IndexKeys::new(&partition);
+
+    // Synthetic operator identity. Keeps `current_worker_id` /
+    // `current_worker_instance_id` populated on the exec_core for
+    // dashboards + lease-history audit without pretending the lease
+    // is owned by a real worker-dialed SDK instance.
+    let worker_id = WorkerId::new("operator");
+    let worker_instance_id = WorkerInstanceId::new("operator");
+    let lease_id = LeaseId::new();
+    let attempt_id = AttemptId::new();
+
+    // Pre-read `total_attempt_count` so the KEYS[6..=8] placeholder
+    // attempt-key construction matches what the Lua computes on the
+    // fresh-claim branch. Resume branch reads `current_attempt_index`
+    // inside the Lua and builds the attempt key dynamically — the
+    // placeholder we send is unused on that path (same slot-same-hash
+    // property means no cluster-routing problem).
+    let att_idx_str: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("total_attempt_count")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    let expected_attempt_index = AttemptIndex::new(
+        att_idx_str
+            .as_deref()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0),
+    );
+
+    let ce_args = ClaimExecutionArgs::new(
+        args.execution_id.clone(),
+        worker_id,
+        worker_instance_id.clone(),
+        args.lane_id.clone(),
+        lease_id,
+        args.lease_duration_ms,
+        attempt_id,
+        expected_attempt_index,
+        "{}".to_owned(),
+        None,
+        None,
+        TimestampMs::now(),
+    );
+
+    let keys = ExecOpKeys {
+        ctx: &ctx,
+        idx: &idx,
+        lane_id: &args.lane_id,
+        worker_instance_id: &worker_instance_id,
+    };
+
+    let partial = ff_issue_grant_and_claim(client, &keys, &ce_args)
+        .await
+        .map_err(EngineError::from)?;
+    Ok(partial.complete())
+}
+
 /// RFC-017 Stage B: acquire a stream-op permit off
 /// `ValkeyBackend::stream_semaphore`. Non-blocking — saturation
 /// surfaces as [`EngineError::ResourceExhausted { pool: "stream_ops",
@@ -5771,6 +5869,21 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "issue_claim_grant: FCALL ff_issue_claim_grant",
+                )
+            })
+    }
+
+    /// cairn #454 Phase 3d — backend-atomic grant-then-claim.
+    async fn issue_grant_and_claim(
+        &self,
+        args: IssueGrantAndClaimArgs,
+    ) -> Result<ClaimGrantOutcome, EngineError> {
+        issue_grant_and_claim_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "issue_grant_and_claim: FCALL ff_issue_grant_and_claim",
                 )
             })
     }

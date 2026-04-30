@@ -503,3 +503,351 @@ redis.register_function('ff_issue_reclaim_grant', function(keys, args)
   -- RFC-024 §3.1 grant-carried fields come from server.
   return ok(A.execution_id, tostring(grant_expires_at))
 end)
+
+---------------------------------------------------------------------------
+-- #40  ff_issue_grant_and_claim   (cairn #454 Phase 3d)
+--
+-- Backend-atomic composition of `ff_issue_claim_grant` + claim (fresh or
+-- resumed). Operator-driven: the caller (cairn control plane) takes
+-- ownership of a specific execution in one FCALL so a crash between
+-- grant-issue and claim cannot leak a grant. Per cairn #454 comment
+-- 4355865937 this method is deliberately NOT default-impl chained —
+-- atomicity is the whole point.
+--
+-- Capability matching is SKIPPED here. This is an operator-override
+-- path: the caller asserts authority to claim, not worker-capability
+-- eligibility. This diverges from `ff_issue_claim_grant` where a
+-- capability miss is the primary guard.
+--
+-- Dispatch: if `core.attempt_state == "attempt_interrupted"` we route
+-- through the resume-claim body (same attempt continues); otherwise
+-- the fresh-claim body creates a new attempt. The caller sees the
+-- unified tuple `{lease_id, lease_epoch, attempt_index}` regardless.
+--
+-- KEYS (14): exec_core, claim_grant, eligible_zset, lease_expiry_zset,
+--            worker_leases, attempt_hash (placeholder, index 0),
+--            attempt_usage (placeholder), attempt_policy (placeholder),
+--            attempts_zset, lease_current, lease_history, active_index,
+--            attempt_timeout_zset, execution_deadline_zset
+--            Superset-union of ff_claim_execution + ff_claim_resumed_execution.
+--            Dynamic attempt-key construction for resume-path mirrors
+--            the pattern in both source functions (see tag match below).
+-- ARGV (11): execution_id, worker_id, worker_instance_id, lane,
+--            capability_snapshot_hash, lease_id, lease_ttl_ms,
+--            attempt_id, attempt_policy_json, attempt_timeout_ms,
+--            execution_deadline_at
+--            `renew_before_ms` is derived as `lease_ttl_ms * 2 / 3`
+--            (same formula `claim_impl` applies on the Rust side).
+---------------------------------------------------------------------------
+redis.register_function('ff_issue_grant_and_claim', function(keys, args)
+  local K = {
+    core_key               = keys[1],
+    claim_grant            = keys[2],
+    eligible_zset          = keys[3],
+    lease_expiry_key       = keys[4],
+    worker_leases_key      = keys[5],
+    attempt_hash_ph        = keys[6],
+    attempt_usage_ph       = keys[7],
+    attempt_policy_ph      = keys[8],
+    attempts_zset          = keys[9],
+    lease_current_key      = keys[10],
+    lease_history_key      = keys[11],
+    active_index_key       = keys[12],
+    attempt_timeout_key    = keys[13],
+    execution_deadline_key = keys[14],
+  }
+
+  local lease_ttl_n = require_number(args[7], "lease_ttl_ms")
+  if type(lease_ttl_n) == "table" then return lease_ttl_n end
+
+  local A = {
+    execution_id          = args[1],
+    worker_id             = args[2],
+    worker_instance_id    = args[3],
+    lane                  = args[4],
+    capability_hash       = args[5] or "",
+    lease_id              = args[6],
+    lease_ttl_ms          = lease_ttl_n,
+    attempt_id            = args[8],
+    attempt_policy_json   = args[9] or "",
+    attempt_timeout_ms    = args[10] or "",
+    execution_deadline_at = args[11] or "",
+  }
+
+  local t = redis.call("TIME")
+  local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+  -- 1. Validate execution exists + is runnable.
+  local raw = redis.call("HGETALL", K.core_key)
+  if #raw == 0 then return err("execution_not_found") end
+  local core = hgetall_to_table(raw)
+
+  if core.lifecycle_phase ~= "runnable" then
+    return err("execution_not_eligible")
+  end
+  if core.ownership_state ~= "unowned" then
+    return err("lease_conflict")
+  end
+  if core.terminal_outcome ~= "none" then
+    return err("execution_not_eligible")
+  end
+
+  -- Defense-in-depth: invariant A3 (no running attempt while claiming).
+  if core.attempt_state == "running_attempt" then
+    return err("active_attempt_exists")
+  end
+
+  -- 2. Block double-grant. The composed flow always DEL's the grant
+  -- at the end; a pre-existing grant means someone else raced.
+  if redis.call("EXISTS", K.claim_grant) == 1 then
+    return err("grant_already_exists")
+  end
+
+  -- 3. Write grant hash with TTL. Grant TTL == lease TTL (ARGV[7]) —
+  -- the grant is consumed in the same FCALL so TTL reuse is safe and
+  -- keeps the trait method's single-knob surface (`lease_duration_ms`).
+  local grant_expires_at = now_ms + A.lease_ttl_ms
+  redis.call("HSET", K.claim_grant,
+    "worker_id", A.worker_id,
+    "worker_instance_id", A.worker_instance_id,
+    "lane_id", A.lane,
+    "capability_hash", A.capability_hash,
+    "route_snapshot_json", "",
+    "admission_summary", "",
+    "created_at", tostring(now_ms),
+    "grant_expires_at", tostring(grant_expires_at))
+  -- No PEXPIREAT needed — consumed in the same call below. A hard
+  -- DEL follows either branch.
+
+  -- 4. Dispatch — resume-claim vs fresh-claim. Mirrors the dispatch
+  --    on `ff_claim_execution` (`use_claim_resumed_execution` signal).
+  local tag = string.match(K.core_key, "(%b{})")
+  local next_epoch = tonumber(core.current_lease_epoch or "0") + 1
+  local expires_at = now_ms + A.lease_ttl_ms
+  local renewal_deadline = now_ms + math.floor(A.lease_ttl_ms * 2 / 3)
+
+  if core.attempt_state == "attempt_interrupted" then
+    -- ── Resume-claim path (mirrors ff_claim_resumed_execution body) ──
+    local att_idx = core.current_attempt_index
+    local att_id = core.current_attempt_id
+    local att_key = "ff:attempt:" .. tag .. ":" .. A.execution_id .. ":" .. tostring(att_idx)
+
+    -- Consume grant
+    redis.call("DEL", K.claim_grant)
+
+    -- Resume attempt: interrupted -> started.
+    redis.call("HSET", att_key,
+      "attempt_state", "started",
+      "resumed_at", tostring(now_ms),
+      "lease_id", A.lease_id,
+      "lease_epoch", tostring(next_epoch),
+      "worker_id", A.worker_id,
+      "worker_instance_id", A.worker_instance_id,
+      "suspended_at", "",
+      "suspension_id", "")
+
+    -- New lease record bound to same attempt.
+    redis.call("DEL", K.lease_current_key)
+    redis.call("HSET", K.lease_current_key,
+      "lease_id", A.lease_id,
+      "lease_epoch", tostring(next_epoch),
+      "execution_id", A.execution_id,
+      "attempt_id", att_id,
+      "worker_id", A.worker_id,
+      "worker_instance_id", A.worker_instance_id,
+      "acquired_at", tostring(now_ms),
+      "expires_at", tostring(expires_at),
+      "last_renewed_at", tostring(now_ms),
+      "renewal_deadline", tostring(renewal_deadline))
+
+    -- Update exec_core — ALL 7 state vector dims.
+    redis.call("HSET", K.core_key,
+      "lifecycle_phase", "active",
+      "ownership_state", "leased",
+      "eligibility_state", "not_applicable",
+      "blocking_reason", "none",
+      "blocking_detail", "",
+      "terminal_outcome", "none",
+      "attempt_state", "running_attempt",
+      "public_state", "active",
+      "current_lease_id", A.lease_id,
+      "current_lease_epoch", tostring(next_epoch),
+      "current_worker_id", A.worker_id,
+      "current_worker_instance_id", A.worker_instance_id,
+      "current_lane", A.lane,
+      "lease_acquired_at", tostring(now_ms),
+      "lease_expires_at", tostring(expires_at),
+      "lease_last_renewed_at", tostring(now_ms),
+      "lease_renewal_deadline", tostring(renewal_deadline),
+      "lease_expired_at", "",
+      "lease_revoked_at", "",
+      "lease_revoke_reason", "",
+      "last_transition_at", tostring(now_ms),
+      "last_mutation_at", tostring(now_ms))
+
+    -- Indexes.
+    redis.call("ZREM", K.eligible_zset, A.execution_id)
+    redis.call("ZADD", K.lease_expiry_key, expires_at, A.execution_id)
+    redis.call("SADD", K.worker_leases_key, A.execution_id)
+    redis.call("ZADD", K.active_index_key, expires_at, A.execution_id)
+
+    -- Lease history event.
+    redis.call("XADD", K.lease_history_key, "MAXLEN", "~", 1000, "*",
+      "event", "acquired",
+      "lease_id", A.lease_id,
+      "lease_epoch", tostring(next_epoch),
+      "attempt_index", att_idx,
+      "attempt_id", att_id,
+      "worker_id", A.worker_id,
+      "reason", "issue_grant_and_claim_resumed",
+      "ts", tostring(now_ms))
+
+    return ok(A.lease_id, tostring(next_epoch), tostring(att_idx))
+  end
+
+  -- ── Fresh-claim path (mirrors ff_claim_execution body) ──
+  -- Verify execution is in eligible set (TOCTOU parity with ff_issue_claim_grant).
+  local score = redis.call("ZSCORE", K.eligible_zset, A.execution_id)
+  if not score then
+    -- Roll back grant (not strictly needed: eligible-set miss on a
+    -- runnable+unowned+non-terminal exec means index drift; surface
+    -- the same err class as ff_issue_claim_grant rather than silently
+    -- leaving a grant).
+    redis.call("DEL", K.claim_grant)
+    return err("execution_not_in_eligible_set")
+  end
+
+  if core.eligibility_state ~= "eligible_now" then
+    redis.call("DEL", K.claim_grant)
+    return err("execution_not_eligible")
+  end
+
+  local next_att_idx = tonumber(core.total_attempt_count or "0")
+  local att_key = "ff:attempt:" .. tag .. ":" .. A.execution_id .. ":" .. tostring(next_att_idx)
+  local att_usage_key = att_key .. ":usage"
+  local att_policy_key = att_key .. ":policy"
+
+  -- Attempt type from attempt_state (retry / replay / initial).
+  local attempt_type = "initial"
+  local lineage_fields = {}
+  if core.attempt_state == "pending_retry_attempt" then
+    attempt_type = "retry"
+    lineage_fields = {
+      "retry_reason", core.pending_retry_reason or "",
+      "previous_attempt_index", core.pending_previous_attempt_index or ""
+    }
+  elseif core.attempt_state == "pending_replay_attempt" then
+    attempt_type = "replay"
+    lineage_fields = {
+      "replay_reason", core.pending_replay_reason or "",
+      "replay_requested_by", core.pending_replay_requested_by or "",
+      "replayed_from_attempt_index", core.pending_previous_attempt_index or ""
+    }
+  end
+
+  -- Consume grant (DEL).
+  redis.call("DEL", K.claim_grant)
+
+  -- Create attempt record.
+  local attempt_fields = {
+    "attempt_id", A.attempt_id,
+    "execution_id", A.execution_id,
+    "attempt_index", tostring(next_att_idx),
+    "attempt_type", attempt_type,
+    "attempt_state", "started",
+    "created_at", tostring(now_ms),
+    "started_at", tostring(now_ms),
+    "lease_id", A.lease_id,
+    "lease_epoch", tostring(next_epoch),
+    "worker_id", A.worker_id,
+    "worker_instance_id", A.worker_instance_id
+  }
+  for _, v in ipairs(lineage_fields) do
+    attempt_fields[#attempt_fields + 1] = v
+  end
+  redis.call("HSET", att_key, unpack(attempt_fields))
+  redis.call("ZADD", K.attempts_zset, now_ms, tostring(next_att_idx))
+
+  -- Initialize usage counters.
+  redis.call("HSET", att_usage_key, "last_usage_report_seq", "0")
+
+  -- Attempt policy snapshot (if present).
+  if is_set(A.attempt_policy_json) then
+    local policy_flat = unpack_policy(A.attempt_policy_json)
+    if #policy_flat > 0 then
+      redis.call("HSET", att_policy_key, unpack(policy_flat))
+    end
+  end
+
+  -- Lease record.
+  redis.call("DEL", K.lease_current_key)
+  redis.call("HSET", K.lease_current_key,
+    "lease_id", A.lease_id,
+    "lease_epoch", tostring(next_epoch),
+    "execution_id", A.execution_id,
+    "attempt_id", A.attempt_id,
+    "worker_id", A.worker_id,
+    "worker_instance_id", A.worker_instance_id,
+    "acquired_at", tostring(now_ms),
+    "expires_at", tostring(expires_at),
+    "last_renewed_at", tostring(now_ms),
+    "renewal_deadline", tostring(renewal_deadline))
+
+  -- Exec core — ALL 7 state vector dims.
+  redis.call("HSET", K.core_key,
+    "lifecycle_phase", "active",
+    "ownership_state", "leased",
+    "eligibility_state", "not_applicable",
+    "blocking_reason", "none",
+    "blocking_detail", "",
+    "terminal_outcome", "none",
+    "attempt_state", "running_attempt",
+    "public_state", "active",
+    "current_attempt_index", tostring(next_att_idx),
+    "total_attempt_count", tostring(next_att_idx + 1),
+    "current_attempt_id", A.attempt_id,
+    "current_lease_id", A.lease_id,
+    "current_lease_epoch", tostring(next_epoch),
+    "current_worker_id", A.worker_id,
+    "current_worker_instance_id", A.worker_instance_id,
+    "current_lane", A.lane,
+    "lease_acquired_at", tostring(now_ms),
+    "lease_expires_at", tostring(expires_at),
+    "lease_last_renewed_at", tostring(now_ms),
+    "lease_renewal_deadline", tostring(renewal_deadline),
+    "started_at",
+      (core.started_at ~= nil and core.started_at ~= "") and core.started_at or tostring(now_ms),
+    "pending_retry_reason", "",
+    "pending_replay_reason", "",
+    "pending_replay_requested_by", "",
+    "pending_previous_attempt_index", "",
+    "last_transition_at", tostring(now_ms),
+    "last_mutation_at", tostring(now_ms))
+
+  -- Indexes.
+  redis.call("ZREM", K.eligible_zset, A.execution_id)
+  redis.call("ZADD", K.lease_expiry_key, expires_at, A.execution_id)
+  redis.call("SADD", K.worker_leases_key, A.execution_id)
+  redis.call("ZADD", K.active_index_key, expires_at, A.execution_id)
+
+  if is_set(A.attempt_timeout_ms) and A.attempt_timeout_ms ~= "0" then
+    redis.call("ZADD", K.attempt_timeout_key,
+      now_ms + tonumber(A.attempt_timeout_ms), A.execution_id)
+  end
+  if is_set(A.execution_deadline_at) and A.execution_deadline_at ~= "0" then
+    redis.call("ZADD", K.execution_deadline_key,
+      tonumber(A.execution_deadline_at), A.execution_id)
+  end
+
+  redis.call("XADD", K.lease_history_key, "MAXLEN", "~", 1000, "*",
+    "event", "acquired",
+    "lease_id", A.lease_id,
+    "lease_epoch", tostring(next_epoch),
+    "attempt_id", A.attempt_id,
+    "attempt_index", tostring(next_att_idx),
+    "worker_id", A.worker_id,
+    "reason", "issue_grant_and_claim",
+    "ts", tostring(now_ms))
+
+  return ok(A.lease_id, tostring(next_epoch), tostring(next_att_idx))
+end)
