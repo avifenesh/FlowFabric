@@ -32,11 +32,12 @@
 //! | `fence_required`     | `Validation { InvalidInput, detail: "fence_required" }`           |
 
 use ff_core::contracts::{
-    CompleteExecutionArgs, CompleteExecutionResult, RenewLeaseArgs, RenewLeaseResult,
+    CompleteExecutionArgs, CompleteExecutionResult, FailExecutionArgs, FailExecutionResult,
+    RenewLeaseArgs, RenewLeaseResult,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
 use ff_core::state::PublicState;
-use ff_core::types::CancelSource;
+use ff_core::types::{AttemptIndex, CancelSource, TimestampMs};
 use sqlx::{PgPool, Row};
 
 use crate::attempt::split_exec_id;
@@ -454,6 +455,308 @@ pub(crate) async fn complete_execution(
         public_state: PublicState::Completed,
     })
 }
+
+
+/// Parse the retry policy envelope:
+/// `{ "max_retries": N, "backoff": { "type": "exponential"|"fixed", ... } }`.
+/// Uses `serde_json::Value` (ff-backend-postgres doesn't depend on
+/// `serde` directly; adding a dep for one struct isn't worth it).
+/// Returns `(max_retries, compute_delay_fn)`.
+struct ParsedRetryPolicy {
+    max_retries: u32,
+    backoff: serde_json::Value,
+}
+
+fn parse_retry_policy(s: &str) -> ParsedRetryPolicy {
+    if s.is_empty() {
+        return ParsedRetryPolicy {
+            max_retries: 0,
+            backoff: serde_json::Value::Null,
+        };
+    }
+    let v: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+    let max_retries = v
+        .get("max_retries")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0) as u32;
+    let backoff = v.get("backoff").cloned().unwrap_or(serde_json::Value::Null);
+    ParsedRetryPolicy {
+        max_retries,
+        backoff,
+    }
+}
+
+/// Compute the next retry delay given a policy backoff JSON block +
+/// the current retry counter. Mirrors the Lua branches in
+/// `ff_fail_execution`. Default 1 s fixed when the backoff block
+/// doesn't specify a recognised type.
+fn compute_retry_delay_ms(backoff: &serde_json::Value, retry_count: u32) -> u64 {
+    let kind = backoff.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match kind {
+        "exponential" => {
+            let initial = backoff
+                .get("initial_delay_ms")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1_000);
+            let max_d = backoff
+                .get("max_delay_ms")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(60_000);
+            let mult = backoff
+                .get("multiplier")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(2.0);
+            let exp = mult.powi(retry_count as i32);
+            let delay = (initial as f64) * exp;
+            (delay.min(max_d as f64)) as u64
+        }
+        "fixed" => backoff
+            .get("delay_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(1_000),
+        _ => 1_000,
+    }
+}
+
+/// PG body for [`ff_core::engine_backend::EngineBackend::fail_execution`].
+///
+/// Mirrors `ff_fail_execution` in `flowfabric.lua`. Two exit branches:
+///
+/// - **Retry path** (`retry_count < policy.max_retries`): flips
+///   `ff_exec_core` to `runnable`/`delayed`, releases the lease
+///   (`lease_expires_at_ms=NULL`), records pending retry lineage in
+///   `raw_fields` (`pending_retry_reason`,
+///   `pending_previous_attempt_index`, `retry_count` bump,
+///   `delay_until`), increments `retry_count`. Returns
+///   `RetryScheduled { delay_until, next_attempt_index }`.
+/// - **Terminal path** (retries exhausted): flips `ff_exec_core` to
+///   `terminal`/`failed`, stamps `terminal_at_ms`, emits completion
+///   event (`outcome='failed'`) + lease-revoked outbox event.
+///   Returns `TerminalFailed`.
+pub(crate) async fn fail_execution(
+    pool: &PgPool,
+    args: FailExecutionArgs,
+) -> Result<FailExecutionResult, EngineError> {
+    // 1. Fence-or-operator-override gate.
+    let is_operator_override = matches!(args.source, CancelSource::OperatorOverride);
+    if args.fence.is_none() && !is_operator_override {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "fence_required".into(),
+        });
+    }
+
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let attempt_index = i32::try_from(args.attempt_index.0).unwrap_or(i32::MAX);
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+    // 2. Lock attempt row + fence.
+    let attempt_row = sqlx::query(
+        r#"
+        SELECT lease_epoch
+          FROM ff_attempt
+         WHERE partition_key = $1 AND execution_id = $2 AND attempt_index = $3
+         FOR UPDATE
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(attempt_index)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(attempt_row) = attempt_row else {
+        return Err(EngineError::NotFound { entity: "attempt" });
+    };
+    let observed_epoch_i: i64 = attempt_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+    let observed_epoch = u64::try_from(observed_epoch_i).unwrap_or(0);
+
+    if let Some(fence) = &args.fence
+        && observed_epoch != fence.lease_epoch.0
+    {
+        return Err(EngineError::State(StateKind::StaleLease));
+    }
+
+    // 3. Lock exec_core + lifecycle gate + read retry_count.
+    let exec_row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase, flow_id,
+               COALESCE((raw_fields->>'retry_count')::int, 0) AS retry_count,
+               COALESCE(raw_fields->>'current_attempt_id', '') AS current_attempt_id,
+               COALESCE(raw_fields->>'terminal_outcome', 'none') AS terminal_outcome
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+         FOR UPDATE
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(exec_row) = exec_row else {
+        return Err(EngineError::NotFound { entity: "execution" });
+    };
+    let lifecycle_phase: String = exec_row
+        .try_get("lifecycle_phase")
+        .map_err(map_sqlx_error)?;
+    if lifecycle_phase != "active" {
+        let terminal_outcome: String =
+            exec_row.try_get("terminal_outcome").map_err(map_sqlx_error)?;
+        let current_attempt_id: String = exec_row
+            .try_get("current_attempt_id")
+            .map_err(map_sqlx_error)?;
+        return Err(EngineError::Contention(ContentionKind::ExecutionNotActive {
+            terminal_outcome,
+            lease_epoch: observed_epoch.to_string(),
+            lifecycle_phase,
+            attempt_id: current_attempt_id,
+        }));
+    }
+    let retry_count_i: i32 = exec_row.try_get("retry_count").map_err(map_sqlx_error)?;
+    let retry_count = u32::try_from(retry_count_i.max(0)).unwrap_or(0);
+
+    // 4. Parse retry policy + decide branch.
+    let policy = parse_retry_policy(&args.retry_policy_json);
+    let can_retry = retry_count < policy.max_retries;
+
+    let now = now_ms();
+
+    // 5. Mark attempt terminal (both branches).
+    sqlx::query(
+        r#"
+        UPDATE ff_attempt
+           SET terminal_at_ms = $1,
+               outcome = 'failure',
+               lease_expires_at_ms = NULL
+         WHERE partition_key = $2 AND execution_id = $3 AND attempt_index = $4
+        "#,
+    )
+    .bind(now)
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(attempt_index)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if can_retry {
+        // 6a. RETRY PATH
+        let backoff_ms = compute_retry_delay_ms(&policy.backoff, retry_count);
+        let delay_until = now.saturating_add(backoff_ms as i64);
+        let next_attempt_index = attempt_index.saturating_add(1);
+
+        let patch = serde_json::json!({
+            "pending_retry_reason": args.failure_reason.clone(),
+            "pending_previous_attempt_index": attempt_index.to_string(),
+            "retry_count": (retry_count + 1).to_string(),
+            "delay_until": delay_until.to_string(),
+            "failure_reason": args.failure_reason.clone(),
+        });
+
+        sqlx::query(
+            r#"
+            UPDATE ff_exec_core
+               SET lifecycle_phase = 'runnable',
+                   ownership_state = 'unowned',
+                   eligibility_state = 'not_eligible_until_time',
+                   attempt_state = 'pending_retry_attempt',
+                   blocking_reason = 'waiting_for_retry_backoff',
+                   public_state = 'delayed',
+                   raw_fields = raw_fields || $1::jsonb
+             WHERE partition_key = $2 AND execution_id = $3
+            "#,
+        )
+        .bind(patch)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Lease outbox: released.
+        lease_event::emit(
+            &mut tx,
+            part,
+            exec_uuid,
+            None,
+            lease_event::EVENT_REVOKED,
+            now,
+        )
+        .await?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+
+        return Ok(FailExecutionResult::RetryScheduled {
+            delay_until: TimestampMs::from_millis(delay_until),
+            next_attempt_index: AttemptIndex::new(next_attempt_index as u32),
+        });
+    }
+
+    // 6b. TERMINAL FAILED PATH
+    let patch = serde_json::json!({
+        "failure_reason": args.failure_reason.clone(),
+        "terminal_outcome": "failed",
+    });
+    sqlx::query(
+        r#"
+        UPDATE ff_exec_core
+           SET lifecycle_phase = 'terminal',
+               ownership_state = 'unowned',
+               eligibility_state = 'not_applicable',
+               attempt_state = 'attempt_terminal',
+               public_state = 'failed',
+               terminal_at_ms = $1,
+               raw_fields = raw_fields || $2::jsonb
+         WHERE partition_key = $3 AND execution_id = $4
+        "#,
+    )
+    .bind(now)
+    .bind(patch)
+    .bind(part)
+    .bind(exec_uuid)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // Completion outbox with outcome='failed' so downstream DAG can
+    // cascade skip/fail.
+    sqlx::query(
+        r#"
+        INSERT INTO ff_completion_event (
+            partition_key, execution_id, flow_id, outcome,
+            namespace, instance_tag, occurred_at_ms
+        )
+        SELECT partition_key, execution_id, flow_id, 'failed',
+               NULL, NULL, $3
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    lease_event::emit(
+        &mut tx,
+        part,
+        exec_uuid,
+        None,
+        lease_event::EVENT_REVOKED,
+        now,
+    )
+    .await?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(FailExecutionResult::TerminalFailed)
+}
+
 
 #[cfg(test)]
 mod tests {
