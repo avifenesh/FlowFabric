@@ -30,7 +30,7 @@ use ff_core::contracts::{
     SuspendArgs, SuspendOutcome, SuspensionReasonCode, WaitpointBinding,
 };
 use ff_core::engine_backend::EngineBackend;
-use ff_core::engine_error::EngineError;
+use ff_core::engine_error::{EngineError, ValidationKind};
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, execution_partition};
 use ff_core::types::{
@@ -66,9 +66,14 @@ async fn raw_client() -> ferriskey::Client {
 }
 
 async fn connect_backend() -> Arc<dyn EngineBackend> {
-    ValkeyBackend::connect(BackendConfig::valkey(HOST, PORT))
+    let backend = ValkeyBackend::connect(BackendConfig::valkey(HOST, PORT))
         .await
-        .expect("connect ValkeyBackend")
+        .expect("connect ValkeyBackend");
+    // Load the `flowfabric` Lua function library. `prepare` is idempotent
+    // (ensure_library version-checks and reloads only on mismatch) so it
+    // is safe to call from every test.
+    backend.prepare().await.expect("prepare/ensure_library");
+    backend
 }
 
 /// Pin `ff:config:partitions` to `PartitionConfig::default()` so the
@@ -384,6 +389,47 @@ async fn deliver_approval_signal_missing_waitpoint_is_not_found() {
     match err {
         EngineError::NotFound { entity } => assert_eq!(entity, "waitpoint"),
         other => panic!("expected NotFound {{ waitpoint }}, got {other:?}"),
+    }
+
+    cleanup_execution(&raw, &eid).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Valkey at 127.0.0.1:6379"]
+async fn deliver_approval_signal_lane_mismatch_is_validation_error() {
+    // PR #465 Copilot review: `ff_deliver_signal` mutates lane-specific
+    // index ZSETs purely from the KEYS we pass. A caller-supplied
+    // `args.lane_id` that disagrees with the execution's authoritative
+    // `exec_core.lane_id` would leak state into the wrong lane. The
+    // backend pre-reads the authoritative lane and rejects with a
+    // typed Validation { InvalidInput } before dispatching.
+    let raw = raw_client().await;
+    let backend = connect_backend().await;
+    let (eid, _handle, wp_id) = setup_suspended(&backend, &raw).await;
+
+    let bogus = DeliverApprovalSignalArgs::new(
+        eid.clone(),
+        LaneId::new("bogus-lane"),
+        wp_id.clone(),
+        "approved".to_owned(),
+        "lane-mismatch-1".to_owned(),
+        60_000,
+        None,
+        None,
+    );
+    let err = backend
+        .deliver_approval_signal(bogus)
+        .await
+        .expect_err("lane mismatch must reject");
+    match err {
+        EngineError::Validation { kind, detail } => {
+            assert!(matches!(kind, ValidationKind::InvalidInput));
+            assert!(
+                detail.contains("lane_mismatch"),
+                "expected lane_mismatch detail, got {detail:?}"
+            );
+        }
+        other => panic!("expected Validation {{ InvalidInput }}, got {other:?}"),
     }
 
     cleanup_execution(&raw, &eid).await;

@@ -4188,6 +4188,37 @@ async fn deliver_approval_signal_impl(
     //     absent (approval signals carry no body; cairn stores side data).
     let idempotency_key =
         format!("approval:{}:{}", args.signal_name, args.idempotency_suffix);
+
+    // Pre-read the authoritative `lane_id` from `exec_core` — the same
+    // guard `deliver_signal_impl` uses. `ff_deliver_signal` mutates
+    // lane-specific index ZSETs purely from the KEYS we pass, so trusting
+    // the caller-supplied `args.lane_id` would let a stale or wrong value
+    // leak state into the wrong lane's suspended/eligible/delayed index
+    // (PR #465 Copilot review).
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let lane_str: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("lane_id")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    let authoritative_lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
+    if authoritative_lane.as_str() != args.lane_id.as_str() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "lane_mismatch: args.lane_id={} exec_core.lane_id={}",
+                args.lane_id.as_str(),
+                authoritative_lane.as_str()
+            ),
+        });
+    }
+
+    // Capture one wall-clock sample and reuse it for both `created_at`
+    // and `now` so the args represent a single dispatch moment
+    // (PR #465 gemini review).
+    let now = TimestampMs::now();
     let ds = DeliverSignalArgs {
         execution_id: args.execution_id.clone(),
         waitpoint_id: args.waitpoint_id.clone(),
@@ -4201,24 +4232,23 @@ async fn deliver_approval_signal_impl(
         correlation_id: None,
         idempotency_key: Some(idempotency_key),
         target_scope: "execution".to_owned(),
-        created_at: Some(TimestampMs::now()),
+        created_at: Some(now),
         dedup_ttl_ms: Some(args.signal_dedup_ttl_ms),
         resume_delay_ms: None,
         max_signals_per_execution: args.max_signals_per_execution,
         signal_maxlen: args.maxlen,
         waitpoint_token: WaitpointToken::new(token_str),
-        now: TimestampMs::now(),
+        now,
     };
 
     // Dispatch through the shared deliver_signal body — same ExecKey /
     // Index / lane-key wiring, and the same Lua FCALL re-verifies the
     // token we just looked up.
-    let ctx = ExecKeyContext::new(&partition, &ds.execution_id);
     let idx = IndexKeys::new(&partition);
     let keys = SignalOpKeys {
         ctx: &ctx,
         idx: &idx,
-        lane_id: &args.lane_id,
+        lane_id: &authoritative_lane,
     };
     ff_deliver_signal(client, &keys, &ds)
         .await
