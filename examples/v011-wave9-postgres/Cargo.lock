@@ -300,14 +300,13 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-postgres"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "ff-core",
  "ff-observability",
  "futures-core",
  "hex",
- "hmac",
  "serde_json",
  "sha2",
  "sqlx",
@@ -319,14 +318,17 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
  "crc16",
  "futures-core",
+ "hex",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -335,11 +337,11 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "ff-script"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ff-core",
  "serde_json",
@@ -350,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ff-core",
  "ff-script",
@@ -370,7 +372,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flowfabric"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ff-backend-postgres",
  "ff-core",

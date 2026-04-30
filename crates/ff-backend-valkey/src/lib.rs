@@ -88,6 +88,7 @@ use ff_script::result::{FcallResult, FromFcallResult};
 
 pub mod backend_error;
 pub mod boot;
+mod cascade;
 mod completion;
 mod handle_codec;
 
@@ -6268,6 +6269,17 @@ impl EngineBackend for ValkeyBackend {
                 "resolve_dependency: FCALL ff_resolve_dependency",
             ))?;
         Ok(result.into())
+    }
+
+    // PR-7b Cluster 4. Trait-routed cascade for the completion listener.
+    // Synchronous semantics: by the time this returns, the full
+    // recursive cascade (up to MAX_CASCADE_DEPTH) has executed — see
+    // trait rustdoc "Timing semantics" for the PG divergence.
+    async fn cascade_completion(
+        &self,
+        payload: &ff_core::backend::CompletionPayload,
+    ) -> Result<ff_core::contracts::CascadeOutcome, EngineError> {
+        cascade::run_cascade(&self.client, &self.partition_config, payload).await
     }
 
     // core-gated at trait level; ff-backend-valkey propagates ff-core/core

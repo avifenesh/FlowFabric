@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use ff_backend_postgres::{apply_migrations, dispatch, PostgresBackend};
 use ff_core::completion_backend::CompletionBackend;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::partition::PartitionConfig;
 use ff_engine::completion_listener::run_completion_listener_postgres;
 use sqlx::postgres::PgPoolOptions;
@@ -131,12 +132,13 @@ async fn listener_dispatches_single_completion() {
     let Some(pool) = setup_or_skip().await else { return };
     let (flow, downstream, upstream) = seed_simple_flow(&pool).await;
 
-    let backend: Arc<dyn CompletionBackend> =
-        PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
+    let concrete = PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
+    let engine_backend: Arc<dyn EngineBackend> = concrete.clone();
+    let backend: Arc<dyn CompletionBackend> = concrete;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let pool_clone = pool.clone();
     let handle = tokio::spawn(async move {
-        run_completion_listener_postgres(backend, pool_clone, shutdown_rx).await
+        run_completion_listener_postgres(engine_backend, backend, pool_clone, shutdown_rx).await
     });
 
     // Give the subscriber task time to LISTEN before we emit.
@@ -170,12 +172,13 @@ async fn listener_dispatches_single_completion() {
 #[ignore = "requires a live Postgres; set FF_PG_TEST_URL"]
 async fn listener_shuts_down_on_watch_signal() {
     let Some(pool) = setup_or_skip().await else { return };
-    let backend: Arc<dyn CompletionBackend> =
-        PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
+    let concrete = PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
+    let engine_backend: Arc<dyn EngineBackend> = concrete.clone();
+    let backend: Arc<dyn CompletionBackend> = concrete;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let pool_clone = pool.clone();
     let handle = tokio::spawn(async move {
-        run_completion_listener_postgres(backend, pool_clone, shutdown_rx).await
+        run_completion_listener_postgres(engine_backend, backend, pool_clone, shutdown_rx).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -203,12 +206,13 @@ async fn listener_dispatches_burst_exactly_once() {
         execs.push(Uuid::new_v4());
     }
 
-    let backend: Arc<dyn CompletionBackend> =
-        PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
+    let concrete = PostgresBackend::from_pool(pool.clone(), PartitionConfig::default());
+    let engine_backend: Arc<dyn EngineBackend> = concrete.clone();
+    let backend: Arc<dyn CompletionBackend> = concrete;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let pool_clone = pool.clone();
     let handle = tokio::spawn(async move {
-        run_completion_listener_postgres(backend, pool_clone, shutdown_rx).await
+        run_completion_listener_postgres(engine_backend, backend, pool_clone, shutdown_rx).await
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;

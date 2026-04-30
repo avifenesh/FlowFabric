@@ -976,6 +976,37 @@ impl EngineBackend for PostgresBackend {
         flow_staging::apply_dependency_to_child(&self.pool, &self.partition_config, &args).await
     }
 
+    // PR-7b Cluster 4. Async-via-outbox cascade — see trait rustdoc
+    // "Timing semantics" for the Valkey-sync vs PG-outbox divergence.
+    // This resolves the payload to its `ff_completion_event.event_id`
+    // and invokes the existing Wave-5a `dispatch_completion`; further
+    // hops ride their own outbox events emitted by the per-hop tx.
+    #[cfg(feature = "core")]
+    async fn cascade_completion(
+        &self,
+        payload: &ff_core::backend::CompletionPayload,
+    ) -> Result<ff_core::contracts::CascadeOutcome, EngineError> {
+        let event_id = match resolve_event_id(&self.pool, payload).await {
+            Some(id) => id,
+            None => {
+                // Event not materialised (outbox race or pre-subscribe
+                // payload) — reconciler is the backstop.
+                tracing::warn!(
+                    execution_id = %payload.execution_id,
+                    produced_at_ms = payload.produced_at_ms.0,
+                    "pg.cascade_completion: could not resolve event_id; reconciler will claim"
+                );
+                return Ok(ff_core::contracts::CascadeOutcome::async_dispatched(0));
+            }
+        };
+        let outcome = crate::dispatch::dispatch_completion(&self.pool, event_id).await?;
+        let advanced = match outcome {
+            crate::dispatch::DispatchOutcome::NoOp => 0,
+            crate::dispatch::DispatchOutcome::Advanced(n) => n,
+        };
+        Ok(ff_core::contracts::CascadeOutcome::async_dispatched(advanced))
+    }
+
     fn backend_label(&self) -> &'static str {
         "postgres"
     }
@@ -1505,6 +1536,65 @@ impl EngineBackend for PostgresBackend {
             exec_uuid,
         )
         .await
+    }
+}
+
+/// Resolve a `CompletionPayload` to the matching
+/// `ff_completion_event.event_id` for PR-7b cascade dispatch.
+///
+/// Mirrors the cursor-walk previously inlined in
+/// `ff-engine::completion_listener::run_completion_listener_postgres` —
+/// keyed on `(partition_key, execution_id_uuid, occurred_at_ms)`. The
+/// `partition_key` scoping is what makes this hit the
+/// `ff_completion_event_lookup_idx` composite instead of devolving into
+/// a cross-partition seq-scan; it's recoverable from the textual
+/// `ExecutionId` (`"<partition>:<uuid>"`).
+///
+/// Returns `None` if the outbox row isn't visible yet (race with the
+/// producing tx), the payload's execution id can't be parsed, or the
+/// partition prefix isn't an `i16` — all recoverable via the
+/// dependency_reconciler backstop. Transient sqlx errors are logged at
+/// `warn` with the query inputs and also fall back to `None`; the
+/// listener retries on the next payload and the reconciler covers the
+/// worst case.
+async fn resolve_event_id(
+    pool: &PgPool,
+    payload: &ff_core::backend::CompletionPayload,
+) -> Option<i64> {
+    let eid_str = payload.execution_id.as_str();
+    // ExecutionId is `{fp:N}:<uuid>`; split on the rightmost `:` so the
+    // `{fp:N}` hash-tag prefix stays intact.
+    let uuid_str = eid_str.rsplit_once(':').map(|(_, u)| u)?;
+    let uuid = uuid::Uuid::parse_str(uuid_str).ok()?;
+    // The payload's ExecutionId is already validated (construction
+    // enforces the `{fp:N}:<uuid>` shape), so `.partition()` is
+    // infallible. Narrow to `i16` for the partition_key column.
+    let partition_key = i16::try_from(payload.execution_id.partition()).ok()?;
+    let occurred_at_ms = payload.produced_at_ms.0;
+
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT event_id FROM ff_completion_event \
+         WHERE partition_key = $1 AND execution_id = $2 AND occurred_at_ms = $3 \
+         ORDER BY event_id ASC LIMIT 1",
+    )
+    .bind(partition_key)
+    .bind(uuid)
+    .bind(occurred_at_ms)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::warn!(
+                partition_key,
+                execution_id = %uuid,
+                occurred_at_ms,
+                error = %err,
+                "resolve_event_id: ff_completion_event lookup failed; falling back to \
+                 dependency_reconciler backstop"
+            );
+            None
+        }
     }
 }
 

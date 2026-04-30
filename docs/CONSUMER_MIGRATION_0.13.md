@@ -159,6 +159,63 @@ per-deployment values:
   `ff-server` responsibilities; embedded consumers wanting them bring
   their own gate.
 
+## PR-7b Cluster 4 — completion listener is now trait-routed
+
+**What changed.** The post-completion cascade path
+(`ff-engine::completion_listener::spawn_dispatch_loop`) previously
+held backend-specific logic — a `ferriskey::Client`-driven FCALL walk
+for Valkey and a separate `run_completion_listener_postgres` draining
+the PG `ff_completion_event` outbox. v0.13 unifies both behind
+`EngineBackend::cascade_completion(&CompletionPayload)`:
+
+- `spawn_dispatch_loop(backend, stream, shutdown)` — now takes
+  `Arc<dyn EngineBackend>` instead of `(router, client)`.
+- New trait method `EngineBackend::cascade_completion` with a default
+  impl returning `EngineError::Unavailable` for out-of-tree backends
+  that have not migrated.
+
+**Timing semantics — documented divergence, NOT a parity gap.** The
+two in-tree backends cascade with different timing guarantees. This
+is architectural and intentional:
+
+- **Valkey — synchronous.** By the time `cascade_completion` returns,
+  the full recursive cascade (up to `MAX_CASCADE_DEPTH = 50`) has run
+  inline. `CascadeOutcome.synchronous = true`;
+  `resolved + cascaded_children` reflect the whole subtree walked.
+- **Postgres — async via outbox.** The call resolves the payload to
+  its `ff_completion_event.event_id` and invokes Wave-5a
+  `dispatch_completion` (per-hop serializable transactions; see
+  `ff_backend_postgres::dispatch`). Further-descendant cascades ride
+  their own outbox events emitted by those per-hop transactions —
+  NOT this call. `CascadeOutcome.synchronous = false`.
+
+Papering over the divergence would be wrong: making PG synchronously
+wait for outbox drain would kill PG throughput; making Valkey publish
+to an outbox first would double-work on Valkey and change its
+semantics. Both backends achieve cascade — just with different timing.
+
+**Consumer action.** If your code depends on synchronous cascade
+observable from the completion call, one of:
+
+1. Target Valkey explicitly and assert
+   `CascadeOutcome.synchronous == true`.
+2. On Postgres, observe outbox drain via the
+   `dependency_reconciler` partial index
+   (`ff_completion_event.dispatched_at_ms IS NOT NULL`) before
+   asserting graph state.
+
+If you only call the engine's `start_with_completions` and never
+invoke `cascade_completion` directly, **no action required** — the
+engine wiring now passes the backend through; the behaviour you saw
+in v0.12 (Valkey: sync-through-FCALL; PG: drain-through-outbox) is
+preserved exactly.
+
+**Back-compat shims retained.** `run_completion_listener_postgres`
+still exists for in-tree test callers, now taking
+`(Arc<dyn EngineBackend>, Arc<dyn CompletionBackend>, PgPool, ShutdownRx)`.
+The extra `engine_backend` argument is mechanical (pass the same
+`Arc<PostgresBackend>` as both).
+
 ## Not in scope
 
 - HTTP admin semantics (`ff-server` unchanged).

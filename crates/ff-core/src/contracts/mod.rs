@@ -2381,6 +2381,69 @@ impl From<ResolveDependencyResult> for ResolveDependencyOutcome {
     }
 }
 
+// ─── cascade_completion (PR-7b Cluster 4) ─────────────────────────────
+
+/// Typed outcome of
+/// [`crate::engine_backend::EngineBackend::cascade_completion`].
+///
+/// Observable result of cascading a terminal-execution completion into
+/// its downstream edges. Counters are best-effort — they describe what
+/// the backend actually did on this call, not an authoritative graph
+/// state (the `dependency_reconciler` remains the correctness safety
+/// net for both backends).
+///
+/// # Timing semantics
+///
+/// The two in-tree backends differ in *when* cascade work is observable
+/// to the caller. This is an accepted architectural divergence; consumer
+/// code that needs synchronous cascade either targets Valkey explicitly
+/// or inspects Postgres's observability surface (outbox drain) to
+/// verify.
+///
+/// - **Valkey (`synchronous = true`):** the FCALL cascade runs
+///   inline — when `cascade_completion` returns, every directly
+///   resolvable edge has been advanced and every `child_skipped`
+///   transitive descendant has been recursively cascaded up to the
+///   `MAX_CASCADE_DEPTH` cap. `resolved` + `cascaded_children`
+///   reflect the full subtree walked on this invocation.
+/// - **Postgres (`synchronous = false`):** the call enqueues a
+///   dispatch against the `ff_completion_event` outbox row; actual
+///   downstream `ff_edge_group` advancement is performed by
+///   `ff_backend_postgres::dispatch::dispatch_completion` in per-hop
+///   transactions. `resolved` is the number of edge groups advanced
+///   during this invocation's outbox drain; `cascaded_children` is
+///   always `0` (PG does not self-recurse — further hops go through
+///   their own outbox events emitted by the completing transaction).
+///
+/// `#[non_exhaustive]` so additional counters (e.g. an explicit
+/// `dispatched_event_id` for PG, or a `depth_reached` for Valkey) can
+/// be added without breaking consumers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CascadeOutcome {
+    /// Edges whose resolution observably advanced on this call.
+    pub resolved: usize,
+    /// Transitive descendants cascaded synchronously (Valkey only;
+    /// always `0` on Postgres — see Timing semantics).
+    pub cascaded_children: usize,
+    /// `true` when the caller observed the cascade inline (Valkey);
+    /// `false` when the call only enqueued dispatch (Postgres outbox).
+    pub synchronous: bool,
+}
+
+impl CascadeOutcome {
+    /// Construct an outcome describing a synchronous (Valkey) cascade.
+    pub fn synchronous(resolved: usize, cascaded_children: usize) -> Self {
+        Self { resolved, cascaded_children, synchronous: true }
+    }
+
+    /// Construct an outcome describing an async (Postgres outbox)
+    /// dispatch. `advanced` is the per-call outbox-drain count.
+    pub fn async_dispatched(advanced: usize) -> Self {
+        Self { resolved: advanced, cascaded_children: 0, synchronous: false }
+    }
+}
+
 // ─── promote_blocked_to_eligible ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
