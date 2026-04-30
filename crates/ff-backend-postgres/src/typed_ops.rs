@@ -9,9 +9,13 @@
 //! # Isolation
 //!
 //! Each op runs under the default `READ COMMITTED` isolation level
-//! with explicit `FOR UPDATE` row locks on `ff_exec_core` and/or
-//! `ff_attempt`. The fence triple (lease_id, lease_epoch, attempt_id)
-//! is the authoritative conflict token and is validated under lock.
+//! (some ops like `check_admission` upgrade to `SERIALIZABLE` per
+//! their rustdoc) with explicit `FOR UPDATE` row locks on
+//! `ff_exec_core` and/or `ff_attempt`. PG persists `lease_epoch` only;
+//! it's monotonically bumped on each claim/reclaim and is sufficient
+//! to detect the violations Valkey's full `(lease_id, lease_epoch,
+//! attempt_id)` triple catches. See each op's rustdoc for the
+//! specific fence shape.
 //!
 //! # Error mapping
 //!
@@ -21,7 +25,7 @@
 //! | Lua                  | EngineError                                                       |
 //! |----------------------|-------------------------------------------------------------------|
 //! | `execution_not_found`| `NotFound { entity: "execution" }`                                |
-//! | `execution_not_active`| `State(ExecutionNotActive { … })` (carries Lua-side detail)     |
+//! | `execution_not_active`| `Contention(ExecutionNotActive { … })` (carries Lua-side detail) |
 //! | `stale_lease`        | `State(StaleLease)`                                               |
 //! | `lease_expired`      | `State(LeaseExpired)`                                             |
 //! | `lease_revoked`      | `State(LeaseRevoked)`                                             |
@@ -87,7 +91,16 @@ pub(crate) async fn renew_lease(
     })?;
 
     let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
-    let attempt_index = i32::try_from(args.attempt_index.0).unwrap_or(i32::MAX);
+    // `attempt_index` is `u32`; PG column is `integer` (i32). A caller
+    // supplying an index beyond i32::MAX is a typed input error —
+    // surface it rather than silently querying a truncated row.
+    let attempt_index = i32::try_from(args.attempt_index.0).map_err(|_| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!(
+            "attempt_index {} exceeds PG i32 column bound",
+            args.attempt_index.0
+        ),
+    })?;
     let expected_epoch = fence.lease_epoch.0;
 
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -167,8 +180,10 @@ pub(crate) async fn renew_lease(
         _ => return Err(EngineError::State(StateKind::LeaseExpired)),
     }
 
-    // 6. Extend the lease.
-    let new_expires = now.saturating_add(i64::try_from(args.lease_ttl_ms).unwrap_or(0));
+    // 6. Extend the lease. Clamp `lease_ttl_ms` overflow to `i64::MAX`
+    // so a huge TTL extends the lease by as much as PG can represent
+    // rather than silently collapsing to now (unwrap_or(0) bug).
+    let new_expires = now.saturating_add(i64::try_from(args.lease_ttl_ms).unwrap_or(i64::MAX));
     sqlx::query(
         r#"
         UPDATE ff_attempt
@@ -204,40 +219,21 @@ pub(crate) async fn renew_lease(
 
 #[cfg(test)]
 mod tests {
-    // Integration tests live in `tests/typed_ops_renew_lease.rs` —
-    // they require a live Postgres (`FF_PG_TEST_URL`). This module
-    // holds unit tests that don't touch the DB.
+    // Integration tests live in `tests/typed_renew_lease.rs` +
+    // sibling files per-method; they require a live Postgres
+    // (`FF_PG_TEST_URL`). This module holds unit tests that don't
+    // touch the DB.
 
     use super::*;
     use ff_core::types::{AttemptId, AttemptIndex, ExecutionId, LeaseEpoch, LeaseFence, LeaseId};
 
-    #[tokio::test]
-    async fn renew_lease_rejects_missing_fence() {
-        // Use a dummy pool — the fence-required check short-circuits
-        // before any DB I/O. `begin()` is never called because the
-        // `ok_or_else` returns first.
-        //
-        // We can't easily construct a `PgPool` without connecting,
-        // so instead we hand-build the args + call the fence gate
-        // mirror as a standalone assertion.
-        let args = RenewLeaseArgs {
-            execution_id: ExecutionId::parse(
-                "{fp:0}:00000000-0000-0000-0000-000000000001",
-            )
-            .unwrap(),
-            attempt_index: AttemptIndex::new(0),
-            fence: None,
-            lease_ttl_ms: 60_000,
-            lease_history_grace_ms: 60_000,
-        };
-        // Fence gate is the first guard in `renew_lease`; with
-        // `fence = None` the function must return
-        // `Validation{InvalidInput, fence_required}` without
-        // touching the pool. We can't call the function without a
-        // pool, so we instead assert the fence-argument shape — any
-        // `Some(fence)` later is an invariant on the caller.
-        assert!(args.fence.is_none());
-    }
+    // NOTE: the `renew_lease` fence-missing short-circuit is behavior-
+    // covered by the ignore-gated integration test
+    // `renew_lease_rejects_missing_fence` in
+    // `tests/typed_renew_lease.rs`, which executes `renew_lease` end-to-
+    // end with a live PG pool. A pool-free unit test of that gate can't
+    // exercise the function body (we can't construct a `PgPool`), so
+    // we don't inline a placeholder here.
 
     #[test]
     fn lease_fence_shape() {
