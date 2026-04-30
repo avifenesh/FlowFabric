@@ -8623,16 +8623,16 @@ impl EngineBackend for ValkeyBackend {
             .map_err(transport_fk)?;
         if result.len() < 2 {
             return Err(EngineError::Transport {
-                backend: "valkey".into(),
+                backend: "valkey",
                 source: "TIME returned fewer than 2 elements".into(),
             });
         }
         let secs: u64 = result[0].parse().map_err(|_| EngineError::Transport {
-            backend: "valkey".into(),
+            backend: "valkey",
             source: "TIME: invalid seconds".into(),
         })?;
         let micros: u64 = result[1].parse().map_err(|_| EngineError::Transport {
-            backend: "valkey".into(),
+            backend: "valkey",
             source: "TIME: invalid microseconds".into(),
         })?;
         Ok(secs.saturating_mul(1000).saturating_add(micros / 1000))

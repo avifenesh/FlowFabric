@@ -1661,7 +1661,7 @@ impl EngineBackend for PostgresBackend {
             .fetch_optional(self.pool())
             .await
             .map_err(|e| EngineError::Transport {
-                backend: "postgres".into(),
+                backend: "postgres",
                 source: format!("read_exec_core_fields: {e}").into(),
             })?;
 
@@ -1671,7 +1671,7 @@ impl EngineBackend for PostgresBackend {
             for (idx, field) in fields.iter().enumerate() {
                 let val: Option<String> =
                     row.try_get(idx).map_err(|e| EngineError::Transport {
-                        backend: "postgres".into(),
+                        backend: "postgres",
                         source: format!("read_exec_core_fields[{field}]: {e}").into(),
                     })?;
                 out.insert((*field).to_string(), val);
@@ -1691,12 +1691,12 @@ impl EngineBackend for PostgresBackend {
             .fetch_one(self.pool())
             .await
             .map_err(|e| EngineError::Transport {
-                backend: "postgres".into(),
+                backend: "postgres",
                 source: format!("server_time_ms: {e}").into(),
             })?;
         if ms < 0 {
             return Err(EngineError::Transport {
-                backend: "postgres".into(),
+                backend: "postgres",
                 source: "server_time_ms: negative epoch".into(),
             });
         }
