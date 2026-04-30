@@ -598,8 +598,7 @@ impl Engine {
         let listener_enabled = completions.is_some();
         if let Some(stream) = completions {
             handles.push(completion_listener::spawn_dispatch_loop(
-                router.clone(),
-                client,
+                backend.clone(),
                 stream,
                 shutdown_rx,
             ));

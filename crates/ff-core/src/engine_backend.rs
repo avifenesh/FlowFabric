@@ -1457,12 +1457,14 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// otherwise. Idempotent (`AlreadyResolved` on replay).
     ///
     /// PR-7b Step 0 overlap-resolver: lifted here so cluster 2
-    /// (`scanner/dependency_reconciler`) and cluster 4
-    /// (`completion_listener::spawn_dispatch_loop`) can both trait-
-    /// route through `Arc<dyn EngineBackend>` without a merge
-    /// conflict. Both Valkey call sites today build identical
-    /// KEYS[14]+ARGV[5] and invoke the `ff_resolve_dependency`
-    /// FCALL — this method is that FCALL behind the trait.
+    /// (`scanner/dependency_reconciler`) could trait-route through
+    /// `Arc<dyn EngineBackend>` without a merge conflict with cluster
+    /// 4. Cluster 4 (`completion_listener::spawn_dispatch_loop`)
+    /// ultimately routed through the coarser
+    /// [`Self::cascade_completion`] (per-payload) instead of looping
+    /// over this per-edge method, because the Postgres cascade is
+    /// outbox-driven rather than per-edge — see `cascade_completion`
+    /// rustdoc "Timing semantics" for details.
     ///
     /// # Backend status
     ///
@@ -1489,6 +1491,52 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<crate::contracts::ResolveDependencyOutcome, EngineError> {
         Err(EngineError::Unavailable {
             op: "resolve_dependency",
+        })
+    }
+
+    /// Cascade a terminal-execution completion into its downstream
+    /// edges. Consumed by
+    /// `ff-engine::completion_listener::spawn_dispatch_loop` (PR-7b
+    /// Cluster 4) to trait-route the post-completion DAG-promotion
+    /// path through `Arc<dyn EngineBackend>`.
+    ///
+    /// Distinct from [`Self::resolve_dependency`]: that method is
+    /// per-edge (one `ff_resolve_dependency` FCALL); this method is
+    /// per-completion and orchestrates the full outgoing-edge walk
+    /// plus `child_skipped` recursion (Valkey) or outbox-event
+    /// dispatch (Postgres).
+    ///
+    /// # Timing semantics
+    ///
+    /// Backends diverge on *when* the caller observes cascade work.
+    /// See [`CascadeOutcome`] for the full contract; the short form:
+    ///
+    /// - **Valkey:** synchronous. FCALL-driven walk completes inline;
+    ///   `child_skipped` descendants are recursively cascaded up to the
+    ///   internal `MAX_CASCADE_DEPTH` cap before return.
+    /// - **Postgres:** asynchronous via the `ff_completion_event`
+    ///   outbox. The call resolves `payload` to its `event_id`, runs
+    ///   `ff_backend_postgres::dispatch::dispatch_completion`, and
+    ///   returns when the outbox row has been claimed + its direct
+    ///   hops advanced. Further-descendant cascades ride their own
+    ///   outbox events (emitted by the per-hop tx) — NOT this call.
+    ///
+    /// Consumers that depend on synchronous cascade must either target
+    /// Valkey explicitly or observe PG's `dispatched_at_ms` clearance
+    /// via the `dependency_reconciler` partial index to verify drain.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so
+    /// backends that have not been migrated surface a typed error
+    /// rather than a panic.
+    ///
+    /// [`CascadeOutcome`]: crate::contracts::CascadeOutcome
+    #[cfg(feature = "core")]
+    async fn cascade_completion(
+        &self,
+        _payload: &crate::backend::CompletionPayload,
+    ) -> Result<crate::contracts::CascadeOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "cascade_completion",
         })
     }
 
