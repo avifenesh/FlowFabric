@@ -33,8 +33,9 @@
 
 use ff_core::contracts::{
     CheckAdmissionArgs, CheckAdmissionResult, CompleteExecutionArgs, CompleteExecutionResult,
-    FailExecutionArgs, FailExecutionResult, RenewLeaseArgs, RenewLeaseResult,
-    ResumeExecutionArgs, ResumeExecutionResult,
+    EvaluateFlowEligibilityArgs, EvaluateFlowEligibilityResult, FailExecutionArgs,
+    FailExecutionResult, RenewLeaseArgs, RenewLeaseResult, ResumeExecutionArgs,
+    ResumeExecutionResult,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
 use ff_core::partition::{quota_partition, PartitionConfig};
@@ -1089,6 +1090,140 @@ pub(crate) async fn check_admission(
 
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(CheckAdmissionResult::Admitted)
+}
+
+/// PG body for [`ff_core::engine_backend::EngineBackend::evaluate_flow_eligibility`].
+///
+/// Mirrors `ff_evaluate_flow_eligibility` in `flowfabric.lua`. Read-only,
+/// returns a textual status code:
+///
+/// - `not_found` — execution row absent
+/// - `not_runnable` — `lifecycle_phase != 'runnable'`
+/// - `owned` — `ownership_state != 'unowned'`
+/// - `terminal` — `raw_fields.terminal_outcome != 'none'`
+/// - `impossible` — at least one incoming edge's upstream is terminal
+///   with `outcome='failed'` under an AllOf/required policy
+/// - `blocked_by_dependencies` — at least one incoming edge's upstream
+///   is not yet terminal under a required policy
+/// - `eligible` — none of the above; execution can proceed
+///
+/// The dependency analysis walks `ff_edge` + joins upstream
+/// `ff_exec_core` to derive `unsatisfied_required_count` /
+/// `impossible_required_count` live instead of reading a persisted
+/// counter (Valkey maintains `ff:deps:<eid>` counters; PG replicates
+/// the logic via SQL). Matches cairn's pre-migration control-plane
+/// path which already queries `ff_edge` for adjacency.
+pub(crate) async fn evaluate_flow_eligibility(
+    pool: &PgPool,
+    args: EvaluateFlowEligibilityArgs,
+) -> Result<EvaluateFlowEligibilityResult, EngineError> {
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+
+    // Step 1 — read exec_core state.
+    let exec_row = sqlx::query(
+        r#"
+        SELECT lifecycle_phase, ownership_state, flow_id,
+               COALESCE(raw_fields->>'terminal_outcome', 'none') AS terminal_outcome
+          FROM ff_exec_core
+         WHERE partition_key = $1 AND execution_id = $2
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(exec_row) = exec_row else {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "not_found".into(),
+        });
+    };
+    let lifecycle_phase: String = exec_row
+        .try_get("lifecycle_phase")
+        .map_err(map_sqlx_error)?;
+    if lifecycle_phase != "runnable" {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "not_runnable".into(),
+        });
+    }
+    let ownership_state: String = exec_row
+        .try_get("ownership_state")
+        .map_err(map_sqlx_error)?;
+    if ownership_state != "unowned" {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "owned".into(),
+        });
+    }
+    let terminal_outcome: String = exec_row
+        .try_get("terminal_outcome")
+        .map_err(map_sqlx_error)?;
+    if terminal_outcome != "none" {
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "terminal".into(),
+        });
+    }
+    let flow_id_opt: Option<uuid::Uuid> = exec_row.try_get("flow_id").map_err(map_sqlx_error)?;
+    let Some(flow_id) = flow_id_opt else {
+        // Standalone execution — no dep graph to evaluate.
+        return Ok(EvaluateFlowEligibilityResult::Status {
+            status: "eligible".into(),
+        });
+    };
+
+    // Step 2 — walk incoming edges + classify upstreams.
+    //
+    // Required edges' upstream `ff_exec_core.raw_fields.terminal_outcome`:
+    // - `failed` → impossible_required_count
+    // - `success` → satisfied (doesn't count)
+    // - anything else / missing → unsatisfied_required_count
+    //
+    // Policy is `jsonb`: we consider a policy "required" if
+    // `policy->>'kind' IN ('required', 'AllOf', 'all_of')`. Optional
+    // edges (Any-Of / Count policies) are not counted as required.
+    let counts = sqlx::query(
+        r#"
+        SELECT
+          SUM(CASE
+                WHEN is_required
+                  AND COALESCE(up.raw_fields->>'terminal_outcome', 'none') = 'failed'
+                THEN 1 ELSE 0 END)::bigint AS impossible_count,
+          SUM(CASE
+                WHEN is_required
+                  AND COALESCE(up.raw_fields->>'terminal_outcome', 'none') NOT IN ('failed', 'success')
+                THEN 1 ELSE 0 END)::bigint AS unsatisfied_count
+        FROM (
+          SELECT e.upstream_eid,
+                 (e.policy->>'kind') IN ('required', 'AllOf', 'all_of') AS is_required
+            FROM ff_edge e
+           WHERE e.partition_key = $1
+             AND e.flow_id = $2
+             AND e.downstream_eid = $3
+        ) edges
+        LEFT JOIN ff_exec_core up
+          ON up.partition_key = $1 AND up.execution_id = edges.upstream_eid
+        "#,
+    )
+    .bind(part)
+    .bind(flow_id)
+    .bind(exec_uuid)
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let impossible: Option<i64> = counts.try_get("impossible_count").map_err(map_sqlx_error)?;
+    let unsatisfied: Option<i64> =
+        counts.try_get("unsatisfied_count").map_err(map_sqlx_error)?;
+    let status = if impossible.unwrap_or(0) > 0 {
+        "impossible"
+    } else if unsatisfied.unwrap_or(0) > 0 {
+        "blocked_by_dependencies"
+    } else {
+        "eligible"
+    };
+    Ok(EvaluateFlowEligibilityResult::Status {
+        status: status.into(),
+    })
 }
 #[cfg(test)]
 mod tests {
