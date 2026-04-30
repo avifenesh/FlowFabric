@@ -177,6 +177,166 @@ redis.register_function('ff_report_usage_and_check', function(keys, args)
 end)
 
 ---------------------------------------------------------------------------
+-- #30b ff_record_spend  (on {b:M})  (cairn #454 Phase 3a)
+--
+-- Open-set spend recording for cairn's per-tenant budgets. Same
+-- check-then-increment semantics as `ff_report_usage_and_check`, but
+-- ARGV carries (dim, delta) pairs instead of parallel arrays — the
+-- upstream `RecordSpendArgs.deltas` is a `BTreeMap<String, u64>` with
+-- deterministic iteration order, and the pair encoding keeps the
+-- serialisation site trivial. Returns the same 4-variant status shape
+-- so `parse_report_usage` on the backend side is reused verbatim.
+--
+-- KEYS (5): budget_usage, budget_limits, budget_def,
+--           by_exec_hash ({b:M}:<bid>:by_exec:<execution_id>),
+--           by_exec_index ({b:M}:<bid>:by_exec:index)
+-- ARGV (variable): pair_count, dim_1, delta_1, ..., dim_N, delta_N,
+--                  now_ms, dedup_key, execution_id
+--
+-- cairn #454 option A — per-execution ledger. In addition to aggregate
+-- HINCRBY on usage_key, each successful increment is mirrored into a
+-- per-execution HASH keyed by dim so `ff_release_budget` can reverse
+-- the exact attribution later. The index set tracks known executions
+-- for admin-enumeration flows.
+---------------------------------------------------------------------------
+redis.register_function('ff_record_spend', function(keys, args)
+  local K = {
+    usage_key        = keys[1],
+    limits_key       = keys[2],
+    def_key          = keys[3],
+    by_exec_key      = keys[4],
+    by_exec_index    = keys[5],
+  }
+
+  local pair_count = require_number(args[1], "pair_count")
+  if type(pair_count) == "table" then return pair_count end
+  local now_ms = args[2 + 2 * pair_count]
+  local dedup_key = args[3 + 2 * pair_count] or ""
+  local execution_id = args[4 + 2 * pair_count] or ""
+
+  -- Idempotency: if dedup_key provided, check for prior application.
+  if dedup_key ~= "" then
+    local existing = redis.call("GET", dedup_key)
+    if existing then
+      return {1, "ALREADY_APPLIED"}
+    end
+  end
+
+  -- Phase 1: CHECK all dimensions BEFORE any increment. If any hard
+  -- limit would be breached, reject the entire spend.
+  for i = 1, pair_count do
+    local dim = args[2 * i]
+    local delta = tonumber(args[2 * i + 1])
+    local current = tonumber(redis.call("HGET", K.usage_key, dim) or "0")
+    local new_total = current + delta
+
+    local hard_limit = redis.call("HGET", K.limits_key, "hard:" .. dim)
+    if hard_limit and hard_limit ~= "" and hard_limit ~= false then
+      local limit_val = tonumber(hard_limit)
+      if limit_val > 0 and new_total > limit_val then
+        redis.call("HINCRBY", K.def_key, "breach_count", 1)
+        redis.call("HSET", K.def_key,
+          "last_breach_at", now_ms,
+          "last_breach_dim", dim,
+          "last_updated_at", now_ms)
+        return {1, "HARD_BREACH", dim, tostring(current), tostring(hard_limit)}
+      end
+    end
+  end
+
+  -- Phase 2: no hard breach — safe to increment all dimensions.
+  -- Mirror each delta onto the per-execution ledger so release_budget
+  -- can reverse the exact attribution (cairn #454 option A).
+  local breached_soft = nil
+  for i = 1, pair_count do
+    local dim = args[2 * i]
+    local delta = tonumber(args[2 * i + 1])
+    local new_val = redis.call("HINCRBY", K.usage_key, dim, delta)
+    if execution_id ~= "" then
+      redis.call("HINCRBY", K.by_exec_key, dim, delta)
+    end
+
+    local soft_limit = redis.call("HGET", K.limits_key, "soft:" .. dim)
+    if soft_limit and soft_limit ~= "" and soft_limit ~= false then
+      local limit_val = tonumber(soft_limit)
+      if limit_val > 0 and new_val > limit_val then
+        if not breached_soft then
+          breached_soft = dim
+        end
+      end
+    end
+  end
+
+  -- Record this execution in the index so admin flows can enumerate.
+  if execution_id ~= "" then
+    redis.call("SADD", K.by_exec_index, execution_id)
+  end
+
+  redis.call("HSET", K.def_key, "last_updated_at", now_ms)
+
+  -- Stamp dedup key after successful increment (24h TTL).
+  if dedup_key ~= "" then
+    redis.call("SET", dedup_key, "1", "PX", 86400000)
+  end
+
+  if breached_soft then
+    redis.call("HINCRBY", K.def_key, "soft_breach_count", 1)
+    local soft_val = tonumber(redis.call("HGET", K.limits_key, "soft:" .. breached_soft) or "0")
+    local cur_val = tonumber(redis.call("HGET", K.usage_key, breached_soft) or "0")
+    return {1, "SOFT_BREACH", breached_soft, tostring(cur_val), tostring(soft_val)}
+  end
+
+  return {1, "OK"}
+end)
+
+---------------------------------------------------------------------------
+-- ff_release_budget  (on {b:M})  (cairn #454 Phase 3b, option A)
+--
+-- Per-execution attribution reversal. Reads the per-exec ledger hash,
+-- negates each dim on the aggregate (clamped at 0 — negative usage is
+-- nonsense even though the ledger represents the exact delta applied;
+-- a prior reset/zero could have shrunk the aggregate below what this
+-- execution contributed, so clamp instead of letting it go negative),
+-- DELs the ledger hash, SREMs the index. Idempotent: if the ledger is
+-- empty the call is a no-op and still returns OK.
+--
+-- KEYS (3): budget_usage, by_exec_hash, by_exec_index
+-- ARGV (2): budget_id, execution_id
+---------------------------------------------------------------------------
+redis.register_function('ff_release_budget', function(keys, args)
+  local K = {
+    usage_key     = keys[1],
+    by_exec_key   = keys[2],
+    by_exec_index = keys[3],
+  }
+
+  local execution_id = assert(args[2], "missing execution_id")
+
+  local raw = redis.call("HGETALL", K.by_exec_key)
+  if #raw == 0 then
+    -- No prior attribution for this execution — idempotent no-op.
+    return {1, "OK", "noop"}
+  end
+
+  -- raw is a flat list [dim1, delta1, dim2, delta2, ...].
+  for i = 1, #raw, 2 do
+    local dim = raw[i]
+    local delta = tonumber(raw[i + 1]) or 0
+    if delta > 0 then
+      local cur = tonumber(redis.call("HGET", K.usage_key, dim) or "0")
+      local new_val = cur - delta
+      if new_val < 0 then new_val = 0 end
+      redis.call("HSET", K.usage_key, dim, tostring(new_val))
+    end
+  end
+
+  redis.call("DEL", K.by_exec_key)
+  redis.call("SREM", K.by_exec_index, execution_id)
+
+  return {1, "OK", "released"}
+end)
+
+---------------------------------------------------------------------------
 -- #31  ff_reset_budget  (on {b:M})
 --
 -- Scanner-called periodic reset. Zero all usage fields, record reset,
