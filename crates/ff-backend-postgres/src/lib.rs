@@ -981,6 +981,7 @@ impl EngineBackend for PostgresBackend {
     // This resolves the payload to its `ff_completion_event.event_id`
     // and invokes the existing Wave-5a `dispatch_completion`; further
     // hops ride their own outbox events emitted by the per-hop tx.
+    #[cfg(feature = "core")]
     async fn cascade_completion(
         &self,
         payload: &ff_core::backend::CompletionPayload,
