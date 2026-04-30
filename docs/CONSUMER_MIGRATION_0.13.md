@@ -464,6 +464,97 @@ let status = backend.evaluate_flow_eligibility(&flow_id).await?;
 `{q:<policy>}` partition (not derivable from `execution_id`); empty
 `dimension` is normalised to `"default"`.
 
+## cairn #454 trait additions — 4 new control-plane methods
+
+**Motivation.** cairn #454 asks for four additional control-plane
+methods that the current trait does not expose: per-execution
+**budget spend** with tenant-open dimensions, per-execution
+**budget-attribution release**, **operator approval-signal** delivery
+(token never leaves the server), and **backend-atomic
+`issue_claim_grant + claim_execution`** composition. v0.13 lands the
+trait surface + arg/result types + `Unavailable` defaults; per-backend
+bodies land in the subsequent phases of the same release window
+(Valkey → PG → SQLite).
+
+**New trait methods.** All four live on `EngineBackend` under
+`#[cfg(feature = "core")]` and return `EngineError::Unavailable`
+from the default impl so out-of-tree backends compile unchanged.
+
+| Method | Args | Return |
+|---|---|---|
+| `record_spend` | `RecordSpendArgs` | `ReportUsageResult` |
+| `release_budget` | `ReleaseBudgetArgs` | `()` |
+| `deliver_approval_signal` | `DeliverApprovalSignalArgs` | `DeliverSignalResult` |
+| `issue_grant_and_claim` | `IssueGrantAndClaimArgs` | `ClaimGrantOutcome` |
+
+**Shape notes (why these types, not the existing peers).**
+
+- `RecordSpendArgs.deltas` is `BTreeMap<String, u64>` — **open-set**
+  tenant-defined dimension keys with stable iteration order, distinct
+  from the fixed-shape `UsageDimensions` used by `report_usage` /
+  `report_usage_admin`. Stable ordering matches `UsageDimensions::custom`
+  and lets the PG body update multiple dimension rows in a fixed order
+  (avoids deadlocks under concurrent spend).
+  Cairn budgets are per-tenant open-schema (tenant A tracks
+  `"tokens"` + `"cost_cents"`; tenant B tracks `"egress_bytes"`).
+  Return reuses `ReportUsageResult` — same four variants cairn's UI
+  already branches on. No new result enum.
+- `ReleaseBudgetArgs` is **per-execution**, not whole-budget flush.
+  Called on execution termination to reverse this execution's
+  attribution; the budget counter persists across executions.
+- `DeliverApprovalSignalArgs` is a pre-shaped variant of
+  `deliver_signal` where the caller **does not carry the waitpoint
+  token**. The backend reads the token from `ff_waitpoint_pending`
+  (via `read_waitpoint_token`, v0.12-shipped), HMAC-verifies
+  server-side, and dispatches. Operator API never touches the bytes.
+  `signal_name` is a flat string (`"approved"` / `"rejected"` by
+  convention); audit metadata (`decided_by`, `note`, `reason`) lives
+  in cairn's audit log, not on the FF surface.
+- `IssueGrantAndClaimArgs` + `ClaimGrantOutcome` compose
+  `issue_claim_grant` + `claim_execution` into a **backend-atomic**
+  op. Caller-chained composition risks leaking a grant when
+  `claim_execution` fails after `issue_claim_grant` succeeded; the
+  trait method's contract is that Valkey fuses them in one FCALL and
+  PG/SQLite fuse them inside one tx. The default impl is **not** a
+  fallback chained call — it returns `Unavailable` so consumers
+  cannot silently pick up a non-atomic path.
+
+**Parity status at v0.13.** Trait + types + Unavailable defaults
+land in this release. Valkey bodies land next (ship vehicle: #454
+Phase 3). PG + SQLite bodies follow (#454 Phases 4 + 5). Consumers
+compile-check against `Unavailable` on PG / SQLite until the
+per-backend phases merge.
+
+**Before (v0.12, cairn's pattern for record_spend):**
+
+```rust,ignore
+// cairn had no trait seat; budget spend went through ad-hoc ff-server
+// HTTP endpoints + cairn-local bookkeeping.
+```
+
+**After (v0.13):**
+
+```rust,ignore
+let deltas = std::collections::BTreeMap::from([
+    ("tokens".to_string(), 1_500),
+    ("cost_cents".to_string(), 12),
+]);
+let outcome = backend
+    .record_spend(RecordSpendArgs::new(
+        budget_id,
+        exec_id,
+        deltas,
+        idempotency_key,
+    ))
+    .await?;
+match outcome {
+    ReportUsageResult::Ok { .. } => { /* proceed */ }
+    ReportUsageResult::SoftBreach { .. } => { /* warn + proceed */ }
+    ReportUsageResult::HardBreach { .. } => { /* stop */ }
+    ReportUsageResult::AlreadyApplied { .. } => { /* dedup no-op */ }
+}
+```
+
 ## PR-7b scanner trait routing (#436 / cluster PRs)
 
 **Motivation.** The scanner supervisor (`ff-engine`) previously held
