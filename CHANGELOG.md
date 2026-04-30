@@ -31,6 +31,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`examples/external-callback` — SC-09 headline demo for the v0.13
+  waitpoint consumer surface.** A workflow suspends against an
+  HMAC-signed pending waitpoint, an asynchronous external actor POSTs
+  the token back, a signal-bridge shim authenticates the token via
+  [`EngineBackend::read_waitpoint_token`] (#434), and
+  [`FlowFabricWorker::deliver_signal`] resumes the flow. Exercises
+  the four v0.13 surfaces end-to-end on a zero-infra SQLite backend
+  (`FF_DEV_MODE=1 cargo run -p external-callback -- --backend sqlite`):
+  `create_waitpoint` (#435), the backend-agnostic
+  `FlowFabricAdminClient::connect_with` facade (#432),
+  `WorkerConfig.backend: Option<BackendConfig>` (#448), and the HMAC
+  verify path on `read_waitpoint_token`. Includes a tamper-rejection
+  branch (flip one hex char, keep the `kid:` prefix) to demonstrate
+  constant-time token compare. Production migration reference:
+  [`docs/CONSUMER_MIGRATION_0.13.md`](docs/CONSUMER_MIGRATION_0.13.md).
+  Distinct from the synchronous `deploy-approval` operator-gate and
+  the `incident-remediation` (SC-10) reclaim-handoff scenarios —
+  SC-09 is the asynchronous-external-actor contract cairn's
+  signal-bridge architecture targets. ~410 LoC Rust + README.
 - **PR-7b Cluster 3: cancel-family scanners trait-routed (cairn #436).**
   Two new `EngineBackend` trait methods plus the
   `SiblingCancelReconcileAction` enum on

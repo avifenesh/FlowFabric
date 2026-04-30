@@ -1,0 +1,49 @@
+[workspace]
+
+[package]
+name = "external-callback"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "SC-09 scenario — external-callback workflow demonstrating the v0.13 waitpoint surface (create_waitpoint, read_waitpoint_token, FlowFabricAdminClient facade, WorkerConfig.backend=None)."
+
+[[bin]]
+name = "external-callback"
+path = "src/main.rs"
+
+[dependencies]
+# SC-09 (pre-RFC use-case catalog) consumer-surface posture. The
+# end-to-end flow (request_approval → wait_for_external → finalize)
+# is driven through the v0.13 public consumer surface:
+#
+#   * `EngineBackend::create_waitpoint`       (cairn #435)
+#   * `EngineBackend::read_waitpoint_token`   (cairn #434, signal-bridge)
+#   * `FlowFabricAdminClient::connect_with`   (cairn #432, admin facade)
+#   * `FlowFabricWorker::connect_with`        (cairn #448, backend=None)
+#   * `FlowFabricWorker::deliver_signal`      (HMAC-authenticated resume)
+#
+# `ff-sdk` with `features = ["sqlite"]` so `connect_with` compiles
+# under a non-Valkey backend; `valkey-default` stays on transitively
+# so the `--backend valkey` dispatch path has the ferriskey client
+# available.
+ff-sdk = { path = "../../crates/ff-sdk", features = ["sqlite"] }
+ff-core = { path = "../../crates/ff-core", default-features = false, features = ["core", "streaming", "suspension", "budget"] }
+ff-backend-sqlite = { path = "../../crates/ff-backend-sqlite" }
+ff-backend-postgres = { path = "../../crates/ff-backend-postgres" }
+ff-backend-valkey = { path = "../../crates/ff-backend-valkey" }
+
+# Side-pool against the shared-cache SQLite URI. Used by the
+# `promote_to_runnable` helper — dev-only analogue of what the
+# Valkey/PG scheduler drives in production. Mirrors `examples/ff-dev`
+# and `examples/incident-remediation`.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "uuid"] }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
