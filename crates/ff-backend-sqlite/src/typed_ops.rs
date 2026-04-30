@@ -42,12 +42,14 @@
 //! catches the same violations Valkey's full-triple check catches.
 
 use ff_core::contracts::{
-    CompleteExecutionArgs, CompleteExecutionResult, FailExecutionArgs, FailExecutionResult,
-    RenewLeaseArgs, RenewLeaseResult, ResumeExecutionArgs, ResumeExecutionResult,
+    CheckAdmissionArgs, CheckAdmissionResult, CompleteExecutionArgs, CompleteExecutionResult,
+    FailExecutionArgs, FailExecutionResult, RenewLeaseArgs, RenewLeaseResult,
+    ResumeExecutionArgs, ResumeExecutionResult,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
+use ff_core::partition::{quota_partition, PartitionConfig};
 use ff_core::state::PublicState;
-use ff_core::types::{AttemptIndex, CancelSource, TimestampMs};
+use ff_core::types::{AttemptIndex, CancelSource, QuotaPolicyId, TimestampMs};
 use sqlx::Row;
 use sqlx::SqlitePool;
 
@@ -815,4 +817,169 @@ pub(crate) async fn resume_execution(
             Err(e)
         }
     }
+}
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::check_admission`].
+///
+/// Mirrors PG at `ff-backend-postgres/src/typed_ops.rs::check_admission`.
+/// The PG `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` is omitted —
+/// `BEGIN IMMEDIATE` + SQLite's single-writer invariant is implicitly
+/// serialisable for writers; the writer lock held across this tx gives
+/// the same atomicity guarantee the PG path needs to prevent concurrent
+/// admits from racing.
+///
+/// Four-exit decision tree: `AlreadyAdmitted`, `RateExceeded {
+/// retry_after_ms }`, `ConcurrencyExceeded`, `Admitted`.
+pub(crate) async fn check_admission(
+    pool: &SqlitePool,
+    partition_config: &PartitionConfig,
+    quota_policy_id: &QuotaPolicyId,
+    args: CheckAdmissionArgs,
+) -> Result<CheckAdmissionResult, EngineError> {
+    let part = quota_partition(quota_policy_id, partition_config).index as i64;
+    let policy_id_text = quota_policy_id.to_string();
+    let now = args.now.0;
+    let window_ms: i64 =
+        i64::try_from(args.window_seconds.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    let exec_id_text = args.execution_id.to_string();
+
+    let mut conn = begin_immediate(pool).await?;
+
+    // 1. Idempotency guard.
+    let guard_row = sqlx::query(
+        "SELECT expires_at_ms FROM ff_quota_admitted \
+         WHERE partition_key = ?1 AND quota_policy_id = ?2 AND execution_id = ?3",
+    )
+    .bind(part)
+    .bind(&policy_id_text)
+    .bind(&exec_id_text)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?;
+    if let Some(row) = guard_row {
+        let expires_at_ms: i64 = row.try_get("expires_at_ms").map_err(map_sqlx_error)?;
+        if expires_at_ms > now {
+            commit_or_rollback(&mut conn).await?;
+            return Ok(CheckAdmissionResult::AlreadyAdmitted);
+        }
+    }
+
+    // 2. Sliding window sweep for THIS policy.
+    sqlx::query(
+        "DELETE FROM ff_quota_window \
+         WHERE partition_key = ?1 AND quota_policy_id = ?2 AND admitted_at_ms < ?3",
+    )
+    .bind(part)
+    .bind(&policy_id_text)
+    .bind(now.saturating_sub(window_ms))
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    // 3. Rate check.
+    if args.rate_limit > 0 {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM ff_quota_window \
+             WHERE partition_key = ?1 AND quota_policy_id = ?2",
+        )
+        .bind(part)
+        .bind(&policy_id_text)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+        if count as u64 >= args.rate_limit {
+            let oldest: Option<(i64,)> = sqlx::query_as(
+                "SELECT admitted_at_ms FROM ff_quota_window \
+                 WHERE partition_key = ?1 AND quota_policy_id = ?2 \
+                 ORDER BY admitted_at_ms ASC LIMIT 1",
+            )
+            .bind(part)
+            .bind(&policy_id_text)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+            let retry = oldest
+                .map(|(oldest_ms,)| {
+                    let delta = oldest_ms.saturating_add(window_ms).saturating_sub(now);
+                    u64::try_from(delta.max(0)).unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let jitter = args.jitter_ms.unwrap_or(0);
+            let retry_after_ms = retry.saturating_add(jitter);
+            commit_or_rollback(&mut conn).await?;
+            return Ok(CheckAdmissionResult::RateExceeded { retry_after_ms });
+        }
+    }
+
+    // 4. Concurrency check.
+    let policy_row = sqlx::query(
+        "SELECT active_concurrency FROM ff_quota_policy \
+         WHERE partition_key = ?1 AND quota_policy_id = ?2",
+    )
+    .bind(part)
+    .bind(&policy_id_text)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?;
+    let active: i64 = policy_row
+        .map(|r| r.try_get("active_concurrency").unwrap_or(0i64))
+        .unwrap_or(0);
+    if args.concurrency_cap > 0 && active as u64 >= args.concurrency_cap {
+        commit_or_rollback(&mut conn).await?;
+        return Ok(CheckAdmissionResult::ConcurrencyExceeded);
+    }
+
+    // 5. Admit.
+    sqlx::query(
+        "INSERT INTO ff_quota_window \
+            (partition_key, quota_policy_id, dimension, admitted_at_ms, execution_id) \
+         VALUES (?1, ?2, '', ?3, ?4)",
+    )
+    .bind(part)
+    .bind(&policy_id_text)
+    .bind(now)
+    .bind(&exec_id_text)
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    sqlx::query(
+        "INSERT INTO ff_quota_admitted \
+            (partition_key, quota_policy_id, execution_id, admitted_at_ms, expires_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (partition_key, quota_policy_id, execution_id) DO UPDATE \
+            SET admitted_at_ms = excluded.admitted_at_ms, \
+                expires_at_ms = excluded.expires_at_ms",
+    )
+    .bind(part)
+    .bind(&policy_id_text)
+    .bind(&exec_id_text)
+    .bind(now)
+    .bind(now.saturating_add(window_ms))
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if args.concurrency_cap > 0 {
+        sqlx::query(
+            "INSERT INTO ff_quota_policy \
+                (partition_key, quota_policy_id, \
+                 requests_per_window_seconds, max_requests_per_window, \
+                 active_concurrency_cap, active_concurrency, \
+                 created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, 0, 0, 0, 1, ?3, ?3) \
+             ON CONFLICT (partition_key, quota_policy_id) DO UPDATE \
+                SET active_concurrency = active_concurrency + 1, \
+                    updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(part)
+        .bind(&policy_id_text)
+        .bind(now)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    }
+
+    commit_or_rollback(&mut conn).await?;
+    Ok(CheckAdmissionResult::Admitted)
 }

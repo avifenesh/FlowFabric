@@ -2633,6 +2633,28 @@ impl EngineBackend for SqliteBackend {
         retry_serializable(|| crate::typed_ops::resume_execution(pool, pubsub, args.clone())).await
     }
 
+    async fn check_admission(
+        &self,
+        quota_policy_id: &ff_core::types::QuotaPolicyId,
+        _dimension: &str,
+        args: ff_core::contracts::CheckAdmissionArgs,
+    ) -> Result<ff_core::contracts::CheckAdmissionResult, EngineError> {
+        let pool = &self.inner.pool;
+        // SQLite is single-writer; quota bucketing under
+        // `num_quota_partitions` still hashes the quota_policy_id to a
+        // partition_key but all rows land in the same DB. Use the
+        // default PartitionConfig (same hash fn + `num_quota_partitions`
+        // as Valkey/PG) so the partition_key column value stays
+        // consistent across backends — `ff_quota_*` tables in SQLite
+        // don't HASH-partition the storage, but the column carries the
+        // same derived index for cross-backend read parity.
+        let pc = ff_core::partition::PartitionConfig::default();
+        retry_serializable(|| {
+            crate::typed_ops::check_admission(pool, &pc, quota_policy_id, args.clone())
+        })
+        .await
+    }
+
     async fn progress(
         &self,
         handle: &Handle,
