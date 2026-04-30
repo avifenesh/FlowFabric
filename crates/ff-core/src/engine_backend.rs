@@ -72,13 +72,15 @@ use crate::contracts::{
     ClaimExecutionResult, ClaimForWorkerArgs, ClaimForWorkerOutcome, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult,
     BlockRouteArgs, BlockRouteOutcome, CheckAdmissionArgs, CheckAdmissionResult,
+    ClaimGrantOutcome,
     CompleteExecutionArgs, CompleteExecutionResult, CreateBudgetArgs, CreateBudgetResult,
     CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
     CreateQuotaPolicyArgs, CreateQuotaPolicyResult,
-    DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
+    DeliverApprovalSignalArgs, DeliverSignalArgs, DeliverSignalResult, EdgeDirection, EdgeSnapshot,
     EvaluateFlowEligibilityArgs, EvaluateFlowEligibilityResult, ExecutionInfo,
     FailExecutionArgs, FailExecutionResult,
-    IssueClaimGrantArgs, IssueClaimGrantOutcome, ScanEligibleArgs,
+    IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs,
+    RecordSpendArgs, ReleaseBudgetArgs, ScanEligibleArgs,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
     ListPendingWaitpointsResult, ListSuspendedPage, RenewLeaseArgs, RenewLeaseResult,
     ReplayExecutionArgs, ReplayExecutionResult,
@@ -1691,6 +1693,91 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<EvaluateFlowEligibilityResult, EngineError> {
         Err(EngineError::Unavailable {
             op: "evaluate_flow_eligibility",
+        })
+    }
+
+    // ── #454 — cairn typed-FCALL additions (4) ─────────────────
+
+    /// Per-execution budget spend with tenant-open dimensions.
+    ///
+    /// Cairn #454 Q1/Q2: takes an open-set `HashMap<String, u64>` of
+    /// deltas (distinct from the fixed-shape
+    /// [`Self::report_usage`]/[`Self::report_usage_admin`] which use
+    /// [`UsageDimensions`]). Return shape reuses [`ReportUsageResult`]
+    /// — same `Ok` / `SoftBreach` / `HardBreach` / `AlreadyApplied`
+    /// variants cairn's UI already branches on.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`] so the
+    /// trait remains additive for backends that have not landed the
+    /// #454 body yet.
+    #[cfg(feature = "core")]
+    async fn record_spend(
+        &self,
+        _args: RecordSpendArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "record_spend",
+        })
+    }
+
+    /// Per-execution budget attribution release.
+    ///
+    /// Called on execution termination to reverse this execution's
+    /// contribution to a budget counter. Per cairn #454 clarification
+    /// this is **per-execution**, not a whole-budget flush — the
+    /// budget persists across executions.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    #[cfg(feature = "core")]
+    async fn release_budget(
+        &self,
+        _args: ReleaseBudgetArgs,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "release_budget",
+        })
+    }
+
+    /// Operator-driven approval-signal delivery.
+    ///
+    /// Pre-shaped variant of [`Self::deliver_signal`] where the caller
+    /// **does not carry the waitpoint token**. The backend reads the
+    /// token from `ff_waitpoint_pending`, HMAC-verifies server-side,
+    /// and dispatches. Operator API never sees the token bytes.
+    ///
+    /// Cairn #454 Q3 — `signal_name` is a flat string (conventional
+    /// values `"approved"` / `"rejected"`); audit metadata lives in
+    /// cairn's audit log, not on the FF surface.
+    ///
+    /// The default impl returns [`EngineError::Unavailable`].
+    #[cfg(feature = "core")]
+    async fn deliver_approval_signal(
+        &self,
+        _args: DeliverApprovalSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "deliver_approval_signal",
+        })
+    }
+
+    /// Backend-atomic `issue_claim_grant` + `claim_execution`.
+    ///
+    /// Cairn #454 Q4 — composing the two primitives caller-side risks
+    /// leaking a grant if `claim_execution` fails after
+    /// `issue_claim_grant` succeeded. This method's contract is that
+    /// the composition is backend-atomic: Valkey fuses them in one
+    /// FCALL; PG/SQLite fuse them in one tx.
+    ///
+    /// The default impl **must not** be a chained call — it returns
+    /// [`EngineError::Unavailable`] so consumers cannot accidentally
+    /// use a non-atomic fallback.
+    #[cfg(feature = "core")]
+    async fn issue_grant_and_claim(
+        &self,
+        _args: IssueGrantAndClaimArgs,
+    ) -> Result<ClaimGrantOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "issue_grant_and_claim",
         })
     }
 
@@ -3485,6 +3572,82 @@ mod tests {
             .unwrap_err()
         {
             EngineError::Unavailable { op } => assert_eq!(op, "reconcile_quota_counters"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    // ── #454 trait-additions default-impl tests (4) ────────────
+
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_record_spend_is_unavailable() {
+        use crate::contracts::RecordSpendArgs;
+        use crate::types::{BudgetId, ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = RecordSpendArgs::new(
+            BudgetId::new(),
+            eid,
+            std::collections::HashMap::new(),
+            "k".into(),
+        );
+        match b.record_spend(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "record_spend"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_release_budget_is_unavailable() {
+        use crate::contracts::ReleaseBudgetArgs;
+        use crate::types::{BudgetId, ExecutionId, FlowId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = ReleaseBudgetArgs::new(BudgetId::new(), eid);
+        match b.release_budget(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "release_budget"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_deliver_approval_signal_is_unavailable() {
+        use crate::contracts::DeliverApprovalSignalArgs;
+        use crate::types::{ExecutionId, FlowId, LaneId, WaitpointId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = DeliverApprovalSignalArgs::new(
+            eid,
+            LaneId::new("default"),
+            WaitpointId::new(),
+            "approved".into(),
+            "sfx".into(),
+            1_000,
+            100,
+            10,
+        );
+        match b.deliver_approval_signal(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "deliver_approval_signal"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_issue_grant_and_claim_is_unavailable() {
+        use crate::contracts::IssueGrantAndClaimArgs;
+        use crate::types::{ExecutionId, FlowId, LaneId};
+        let b = DefaultBackend;
+        let config = crate::partition::PartitionConfig::default();
+        let eid = ExecutionId::for_flow(&FlowId::new(), &config);
+        let args = IssueGrantAndClaimArgs::new(eid, LaneId::new("default"), 30_000);
+        match b.issue_grant_and_claim(args).await.unwrap_err() {
+            EngineError::Unavailable { op } => assert_eq!(op, "issue_grant_and_claim"),
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }

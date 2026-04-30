@@ -8,7 +8,7 @@ pub mod decode;
 use crate::policy::ExecutionPolicy;
 use crate::state::{AttemptType, PublicState, StateVector};
 use crate::types::{
-    AttemptId, AttemptIndex, CancelSource, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch,
+    AttemptId, AttemptIndex, BudgetId, CancelSource, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch,
     LeaseFence, LeaseId, Namespace, SignalId, SuspensionId, TimestampMs, WaitpointId,
     WaitpointToken, WorkerId, WorkerInstanceId,
 };
@@ -4814,6 +4814,211 @@ impl ReportUsageAdminArgs {
     pub fn with_dedup_key(mut self, key: String) -> Self {
         self.dedup_key = Some(key);
         self
+    }
+}
+
+// ─── #454 — cairn ControlPlaneBackend peer methods ──────────────────
+//
+// Four trait methods from cairn-rs #454 that previously routed through
+// raw `ferriskey::*` FCALLs outside the `EngineBackend` trait. Cairn's
+// ground-truth shapes at `cairn-fabric/src/engine/control_plane_types.rs`
+// (commit `a4fdb638`) are mirrored below verbatim so the v0.13 trait
+// matches cairn's existing Valkey impls 1:1.
+//
+// Default bodies on the trait return `EngineError::Unavailable { op }`
+// at landing; Valkey bodies ship in Phase 3; PG + SQLite in Phases 4+5.
+
+// ─── record_spend ───
+
+/// Args for [`crate::engine_backend::EngineBackend::record_spend`].
+///
+/// Carries an **open-set** `HashMap<String, u64>` of dimension deltas
+/// per cairn's ground-truth shape at
+/// `cairn-fabric/src/engine/control_plane_types.rs`. Cairn budgets are
+/// per-tenant open-schema (tenant A tracks `"tokens"` + `"cost_cents"`,
+/// tenant B tracks `"egress_bytes"`), distinct from FF's fixed-shape
+/// [`UsageDimensions`] which encodes the internal usage-report surface.
+///
+/// Return shape reuses [`ReportUsageResult`] — same four variants
+/// (`Ok` / `SoftBreach` / `HardBreach` / `AlreadyApplied`) cairn's UI
+/// branches on. Not a new enum.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RecordSpendArgs {
+    pub budget_id: BudgetId,
+    pub execution_id: ExecutionId,
+    /// Per-dimension positive deltas. Tenant-defined keys.
+    pub deltas: std::collections::HashMap<String, u64>,
+    /// Caller-computed idempotency key (cairn uses SHA-256 hex of
+    /// `budget_id || execution_id || sorted(deltas)`). FF does not
+    /// interpret the bytes — dedup is a simple equality check against
+    /// the prior stamped key.
+    pub idempotency_key: String,
+}
+
+impl RecordSpendArgs {
+    pub fn new(
+        budget_id: BudgetId,
+        execution_id: ExecutionId,
+        deltas: std::collections::HashMap<String, u64>,
+        idempotency_key: String,
+    ) -> Self {
+        Self {
+            budget_id,
+            execution_id,
+            deltas,
+            idempotency_key,
+        }
+    }
+}
+
+// ─── release_budget ───
+
+/// Args for [`crate::engine_backend::EngineBackend::release_budget`].
+///
+/// **Per-execution release-my-attribution**, not whole-budget flush.
+/// Called when an execution terminates so the budget persists across
+/// executions but this execution's attribution is reversed. Per cairn
+/// clarification on #454.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ReleaseBudgetArgs {
+    pub budget_id: BudgetId,
+    pub execution_id: ExecutionId,
+}
+
+impl ReleaseBudgetArgs {
+    pub fn new(budget_id: BudgetId, execution_id: ExecutionId) -> Self {
+        Self {
+            budget_id,
+            execution_id,
+        }
+    }
+}
+
+// ─── deliver_approval_signal ───
+
+/// Args for [`crate::engine_backend::EngineBackend::deliver_approval_signal`].
+///
+/// Pre-shaped variant of [`crate::engine_backend::EngineBackend::deliver_signal`]
+/// for the operator-driven approval flow. Distinct from `deliver_signal`
+/// because the caller **does not carry the waitpoint token** — the backend
+/// reads the token from `ff_waitpoint_pending` (via
+/// [`crate::engine_backend::EngineBackend::read_waitpoint_token`],
+/// #434-shipped in v0.12), HMAC-verifies server-side, and dispatches. The
+/// operator API never handles the token bytes.
+///
+/// `signal_name` is a flat string (`"approved"` / `"rejected"` by
+/// convention; not an enum at the trait level — audit metadata like
+/// `decided_by` / `note` / `reason` sits in cairn's audit log, not in
+/// the FF signal surface).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DeliverApprovalSignalArgs {
+    pub execution_id: ExecutionId,
+    pub lane_id: LaneId,
+    pub waitpoint_id: WaitpointId,
+    /// Conventional values: `"approved"` / `"rejected"`. Stored raw on
+    /// the delivered signal; FF does not interpret.
+    pub signal_name: String,
+    /// Cairn-side per-decision idempotency suffix. Combined with
+    /// `execution_id` + `signal_name` to form the dedup key.
+    pub idempotency_suffix: String,
+    /// Dedup TTL in milliseconds.
+    pub signal_dedup_ttl_ms: u64,
+    /// Signal stream MAXLEN for the suspension stream.
+    pub maxlen: u64,
+    /// Per-execution max signal cap (operator quota).
+    pub max_signals_per_execution: u64,
+}
+
+impl DeliverApprovalSignalArgs {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: ExecutionId,
+        lane_id: LaneId,
+        waitpoint_id: WaitpointId,
+        signal_name: String,
+        idempotency_suffix: String,
+        signal_dedup_ttl_ms: u64,
+        maxlen: u64,
+        max_signals_per_execution: u64,
+    ) -> Self {
+        Self {
+            execution_id,
+            lane_id,
+            waitpoint_id,
+            signal_name,
+            idempotency_suffix,
+            signal_dedup_ttl_ms,
+            maxlen,
+            max_signals_per_execution,
+        }
+    }
+}
+
+// ─── issue_grant_and_claim ───
+
+/// Args for [`crate::engine_backend::EngineBackend::issue_grant_and_claim`].
+///
+/// Composes `issue_claim_grant` + `claim_execution` into a single
+/// backend-atomic op per cairn #454 Q4. The composition **must** be
+/// backend-atomic (not caller-chained) to prevent leaking grants when
+/// `claim_execution` fails after `issue_claim_grant` succeeded.
+///
+/// Valkey: one `ff_issue_grant_and_claim` FCALL composing the two
+/// primitives in Lua.
+/// Postgres/SQLite: both primitives inside one tx.
+///
+/// Flattened shape (not `IssueClaimGrantArgs + ClaimExecutionArgs`
+/// composition) — the two arg types overlap on `execution_id` +
+/// `lane_id`; flattening drops the dup.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct IssueGrantAndClaimArgs {
+    pub execution_id: ExecutionId,
+    pub lane_id: LaneId,
+    /// Lease TTL in milliseconds. Threaded into both the grant TTL and
+    /// the claimed attempt's `lease_expires_at_ms`.
+    pub lease_duration_ms: u64,
+}
+
+impl IssueGrantAndClaimArgs {
+    pub fn new(execution_id: ExecutionId, lane_id: LaneId, lease_duration_ms: u64) -> Self {
+        Self {
+            execution_id,
+            lane_id,
+            lease_duration_ms,
+        }
+    }
+}
+
+/// Outcome of [`crate::engine_backend::EngineBackend::issue_grant_and_claim`].
+///
+/// Distinct from [`ClaimExecutionResult`] because the trait method
+/// intentionally hides the grant-issuance step — callers only see the
+/// resulting lease identity. If the backend's transparent dispatch
+/// routes through `ff_claim_resumed_execution` (when the execution was
+/// suspended), the return is identical.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ClaimGrantOutcome {
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
+    pub attempt_index: AttemptIndex,
+}
+
+impl ClaimGrantOutcome {
+    pub fn new(
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        attempt_index: AttemptIndex,
+    ) -> Self {
+        Self {
+            lease_id,
+            lease_epoch,
+            attempt_index,
+        }
     }
 }
 
