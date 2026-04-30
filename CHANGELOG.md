@@ -30,6 +30,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fallback for construction sites that do not supply a backend
   (test harnesses + `EdgeCancelDispatcher::new` /
   `EdgeCancelReconciler::new`).
+- **PR-7b Cluster 4: trait-routed completion listener (cairn #436).**
+  New `EngineBackend::cascade_completion(&CompletionPayload)` trait
+  method captures the full post-completion cascade behind
+  `Arc<dyn EngineBackend>`, with a typed
+  `ff_core::contracts::CascadeOutcome` return (`#[non_exhaustive]`;
+  counters `resolved` + `cascaded_children` + `synchronous`). Valkey
+  impl (`ff_backend_valkey::cascade::run_cascade`) moves the
+  pre-existing `ff-engine::partition_router::dispatch_dependency_resolution`
+  body behind the trait — same KEYS[14]+ARGV[5] FCALL, same recursive
+  `child_skipped` cascade up to `MAX_CASCADE_DEPTH=50`, preserved
+  exactly. Postgres impl resolves the payload to its
+  `ff_completion_event.event_id` and invokes Wave-5a
+  `dispatch_completion`. `spawn_dispatch_loop` signature changes from
+  `(router, client, stream, shutdown)` to
+  `(backend: Arc<dyn EngineBackend>, stream, shutdown)`;
+  `run_completion_listener_postgres` shim grows an `engine_backend`
+  argument. **Documented timing divergence** (Valkey-sync vs PG-outbox)
+  in `docs/POSTGRES_PARITY_MATRIX.md` row 5c +
+  `docs/CONSUMER_MIGRATION_0.13.md` — architectural, not a parity gap.
 - **PR-7b Cluster 1: foundation scanner operations on `EngineBackend`
   (cairn #436).** Five new trait methods + `ExpirePhase` enum on
   `ff_core::engine_backend::EngineBackend` for the six simple-expiry

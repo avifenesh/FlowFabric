@@ -18,9 +18,11 @@ observability = ["ff-observability/enabled"]
 # Wave 5a: enable the Postgres dispatch branch in `partition_router`.
 # Pulls `ff-backend-postgres` as a direct dep. OFF by default; the
 # Valkey-only build stays lean. Wave 6d extends this feature to gate
-# the Postgres completion_listener drain loop, which adds `sqlx` +
-# `uuid` for the outbox event_id resolution query.
-postgres = ["dep:ff-backend-postgres", "dep:sqlx", "dep:uuid"]
+# the Postgres completion_listener drain loop; PR-7b Cluster 4 moved
+# the event_id resolution (which needed `uuid` for the ExecutionId
+# suffix parse) into ff-backend-postgres::resolve_event_id, so only
+# `sqlx` remains here for the back-compat shim signature.
+postgres = ["dep:ff-backend-postgres", "dep:sqlx"]
 
 [dependencies]
 ff-core = { version = "0.12.0", path = "../ff-core", default-features = false, features = ["core"] }
@@ -46,10 +48,9 @@ tracing = { workspace = true }
 # feature only; stays out of the Valkey-only dep graph.
 ff-backend-postgres = { workspace = true, optional = true }
 # Wave 6d: Postgres completion_listener outbox drain. `sqlx` for the
-# event_id resolution query; `uuid` to decode the ExecutionId suffix.
-# Both flip on with the `postgres` feature only.
+# back-compat shim signature; flips on with the `postgres` feature
+# only.
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio-rustls"], optional = true }
-uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Unit-test mock `EngineBackend` impls need `#[async_trait]` to match
