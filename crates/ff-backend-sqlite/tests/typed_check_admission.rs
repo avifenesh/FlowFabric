@@ -119,11 +119,9 @@ async fn concurrency_cap_blocks_additional_admits() {
     let be: Arc<dyn EngineBackend> = backend.clone();
     let qid = QuotaPolicyId::from_uuid(Uuid::new_v4());
     // Pre-seed policy row with active_concurrency = 2, cap = 2.
-    let part = ff_core::partition::quota_partition(
-        &qid,
-        &ff_core::partition::PartitionConfig::default(),
-    )
-    .index as i64;
+    // SQLite `create_quota_policy_impl` writes partition_key = 0 under
+    // RFC-023 §4.1 A3 single-writer, so tests must match.
+    let part: i64 = 0;
     sqlx::query(
         "INSERT INTO ff_quota_policy \
             (partition_key, quota_policy_id, \
