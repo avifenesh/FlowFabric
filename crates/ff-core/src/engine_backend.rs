@@ -2466,6 +2466,71 @@ pub trait EngineBackend: Send + Sync + 'static {
             op: "trim_retention",
         })
     }
+
+    // ── PR-7b Wave 0a: exec_core field read primitive ──
+
+    /// Point-read N fields from the `exec_core` hash for a given
+    /// execution. Returns a map of field-name → Option<String>
+    /// (None for fields absent or stored as NULL). Scanner call
+    /// sites formerly issuing raw `HGET`/`HMGET` on `ExecKeyContext::core()`
+    /// route through this trait method (cairn #436 / PR-7b Wave 0a).
+    ///
+    /// Field values are coerced to String at the trait boundary for
+    /// wire compatibility with the Valkey HGET shape. Consumers parse
+    /// specific fields (`lane_id`, `current_attempt_index`, etc.) from
+    /// the returned strings as needed.
+    ///
+    /// - **Valkey:** `HMGET exec_core_key f1 f2 ...`, zipping names to values.
+    /// - **Postgres:** `SELECT` against `ff_exec_core` with dynamic column
+    ///   extraction; fields in `raw_fields` JSONB are extracted via `->>`.
+    /// - **SQLite:** equivalent with `json_extract(raw_fields, '$.field')`.
+    ///
+    /// Default body returns `Unavailable` so non-v0.13 backends remain
+    /// compile-compatible.
+    #[cfg(feature = "core")]
+    async fn read_exec_core_fields(
+        &self,
+        _partition: crate::partition::Partition,
+        _execution_id: &crate::types::ExecutionId,
+        _fields: &[&str],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_exec_core_fields",
+        })
+    }
+
+    // ── PR-7b Wave 0a: backend clock primitive ──
+
+    /// Returns the backend's current wall-clock epoch milliseconds.
+    ///
+    /// Used by 15 scanners to compute "due" thresholds before issuing
+    /// per-partition due-scans. Previously a Valkey-only helper in
+    /// `ff-engine`'s `scanner::lease_expiry` issuing `TIME`; this
+    /// trait method is the backend-agnostic replacement (cairn #436 /
+    /// PR-7b Wave 0a).
+    ///
+    /// Every in-tree backend overrides. The default falls back to
+    /// `SystemTime::now()` so out-of-tree `EngineBackend` impls (e.g.
+    /// cairn mocks, test doubles) stay source-compatible across v0.12
+    /// → v0.13.
+    ///
+    /// - **Valkey:** `TIME` command.
+    /// - **Postgres:** `SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint`
+    ///   (not `now()` — `now()` is the transaction start timestamp,
+    ///   which is stale under any long-running tx; scanners need the
+    ///   true wall-clock read).
+    /// - **SQLite:** `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`.
+    #[cfg(feature = "core")]
+    async fn server_time_ms(&self) -> Result<u64, EngineError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| EngineError::Transport {
+                backend: "system-clock",
+                source: format!("server_time_ms default: {e}").into(),
+            })?;
+        Ok(d.as_millis() as u64)
+    }
 }
 
 /// RFC-016 Stage D outcome of a single
@@ -3145,6 +3210,38 @@ mod tests {
         {
             Err(EngineError::Unavailable { op }) => {
                 assert_eq!(op, "trim_retention");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    // ── read_exec_core_fields (PR-7b Wave 0a) ──
+
+    /// Default impl returns `Unavailable { op: "read_exec_core_fields" }`
+    /// so out-of-tree backends that pre-date v0.13 keep compiling while
+    /// surfacing a typed error on call. Empty-field input short-circuits
+    /// to `Ok(empty map)` in all in-tree impls; the default is triggered
+    /// only when the trait method itself is un-overridden.
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_read_exec_core_fields_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+
+        let b = DefaultBackend;
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index: 0,
+        };
+        let eid = ExecutionId::parse(
+            "{fp:0}:66666666-6666-6666-6666-666666666666",
+        )
+        .unwrap();
+        match b
+            .read_exec_core_fields(partition, &eid, &["lane_id"])
+            .await
+        {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "read_exec_core_fields");
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }

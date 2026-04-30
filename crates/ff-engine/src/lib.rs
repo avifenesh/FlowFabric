@@ -193,15 +193,14 @@ impl Engine {
     ///
     /// Spawns background scanner tasks. Returns immediately.
     ///
-    /// `backend` must be a backend whose [`EngineBackend::as_any`]
-    /// downcasts to a supported concrete type. In v0.12 (PR-7a) that
-    /// is [`ff_backend_valkey::ValkeyBackend`] only; v0.13 (PR-7b)
-    /// will trait-ify the scanner surface and accept any
-    /// `EngineBackend` implementation. Passing a non-Valkey backend
-    /// today panics immediately inside this constructor (before any
-    /// scanner tasks are spawned) — by design; the cairn embedding
-    /// path that motivated this signature goes through Valkey until
-    /// the trait-ification lands.
+    /// `backend` is an `Arc<dyn EngineBackend>`. When the underlying
+    /// concrete type is [`ff_backend_valkey::ValkeyBackend`], the
+    /// engine spawns its in-tree Valkey scanner supervisors. For
+    /// non-Valkey backends (Postgres, SQLite, custom impls), the
+    /// reconciler supervisor lives inside the backend itself (spawned
+    /// during `connect_with_*`) and this constructor only wires the
+    /// completion dispatch loop + partition router. Cairn #436: the
+    /// runtime `downcast`-or-panic from v0.12 PR-7a is gone.
     pub fn start(config: EngineConfig, backend: Arc<dyn EngineBackend>) -> Self {
         // Construct a fresh metrics handle here so direct callers
         // (examples, tests) don't need to. Under the default build
@@ -241,27 +240,14 @@ impl Engine {
     /// `dependency_reconciler` scanner remains as a safety net for
     /// completions missed during subscriber reconnect windows.
     ///
-    /// # Backend parameter (v0.12 PR-7a)
+    /// # Backend parameter
     ///
-    /// `backend` is an `Arc<dyn EngineBackend>` so the public
-    /// constructor signature is backend-agnostic — cairn and other
-    /// consumers can sequence their engine construction around this
-    /// shape without waiting for the scanner trait-ification. Runtime
-    /// support in v0.12 is still Valkey-only: the scanner supervisors
-    /// today speak ferriskey, so this constructor downcasts
-    /// `backend.as_any()` to [`ff_backend_valkey::ValkeyBackend`] and
-    /// reaches for the embedded `ferriskey::Client`. v0.13 (PR-7b)
-    /// will trait-ify each scanner onto `EngineBackend` and retire
-    /// the downcast — the public signature stays stable through that
-    /// transition, so consumers wiring up the v0.12 shape today
-    /// don't change their call site.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `backend.as_any().downcast_ref::<ValkeyBackend>()`
-    /// is `None`. The only in-tree caller (`ff-server`) constructs a
-    /// `ValkeyBackend` before calling; external consumers that want
-    /// non-Valkey support must wait for PR-7b.
+    /// `backend` is an `Arc<dyn EngineBackend>`. Works uniformly
+    /// across Valkey / Postgres / SQLite (and any other impl): the
+    /// engine attempts a Valkey downcast and, when successful, spawns
+    /// the in-tree ferriskey-speaking scanner supervisors. Otherwise
+    /// it trusts the backend to own its reconciler supervisor (cairn
+    /// #436 / PR-7b). No runtime panic path.
     ///
     /// # Example
     ///
@@ -274,7 +260,7 @@ impl Engine {
     /// #     stream: ff_core::completion_backend::CompletionStream,
     /// #     backend: Arc<dyn EngineBackend>, // e.g. from ValkeyBackend::connect
     /// # ) {
-    /// // Valkey backend: works today (v0.12 PR-7a).
+    /// // Any `EngineBackend` impl works (cairn #436).
     /// let engine = ff_engine::Engine::start_with_completions(
     ///     cfg, backend, metrics, stream,
     /// );
@@ -296,22 +282,18 @@ impl Engine {
         metrics: Arc<ff_observability::Metrics>,
         completions: Option<CompletionStream>,
     ) -> Self {
-        // v0.12 PR-7a transitional downcast. Scanners today still
-        // speak ferriskey directly; until PR-7b trait-ifies them,
-        // reach in for the embedded client. Only in-tree consumer is
-        // ff-server which always constructs a `ValkeyBackend`.
-        let client = match backend
+        // PR-7b (cairn #436): dispatch scanner spawn by backend family.
+        // Valkey scanners live inside ff-engine and still speak
+        // ferriskey directly, so they need the embedded client.
+        // Non-Valkey backends (Postgres, SQLite) self-spawn their own
+        // reconciler supervisor during connect; the engine only
+        // contributes the router + optional completion dispatch loop.
+        // Unknown backends get the same treatment as non-Valkey ones —
+        // the engine never panics on a foreign `EngineBackend` impl.
+        let valkey_client = backend
             .as_any()
             .downcast_ref::<ff_backend_valkey::ValkeyBackend>()
-        {
-            Some(vb) => vb.client().clone(),
-            None => panic!(
-                "Engine::start_* in v0.12 requires ValkeyBackend \
-                 (got backend_label={:?}); non-Valkey support lands \
-                 in v0.13 (PR-7b).",
-                backend.backend_label(),
-            ),
-        };
+            .map(|vb| vb.client().clone());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let num_partitions = config.partition_config.num_flow_partitions;
         let router = Arc::new(PartitionRouter::new(config.partition_config));
@@ -319,6 +301,35 @@ impl Engine {
         let mut handles = Vec::new();
 
         let scanner_filter = config.scanner_filter.clone();
+
+        // Short-circuit the Valkey-only scanner block for non-Valkey
+        // backends. Their reconcilers are already running under each
+        // backend's own `spawn_scanners` supervisor.
+        if valkey_client.is_none() {
+            tracing::info!(
+                backend_label = backend.backend_label(),
+                "engine started without in-tree scanner spawn; \
+                 backend owns its reconciler supervisor"
+            );
+            let listener_enabled = completions.is_some();
+            if let Some(stream) = completions {
+                handles.push(completion_listener::spawn_dispatch_loop(
+                    backend.clone(),
+                    stream,
+                    shutdown_rx,
+                ));
+            }
+            if listener_enabled {
+                tracing::info!("engine dispatch loop spawned (completion-driven DAG)");
+            }
+            return Self {
+                router,
+                shutdown_tx,
+                handles,
+            };
+        }
+        // Unwrap safe: `valkey_client.is_none()` returned above.
+        let client = valkey_client.expect("Valkey client present on Valkey path");
 
         // Lease expiry scanner
         let lease_scanner = Arc::new(LeaseExpiryScanner::with_filter_and_backend(

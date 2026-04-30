@@ -262,6 +262,23 @@ async fn noop_filter_skips_backend_entirely() {
     );
 }
 
+/// Cairn #436 regression guard: `Engine::start_with_metrics` must
+/// NOT panic on a non-Valkey `EngineBackend` impl. Prior to PR-7b
+/// it called `as_any().downcast_ref::<ValkeyBackend>()` and
+/// `panic!`d on `None`. This test hands a pure-mock backend (no
+/// Valkey type anywhere) and asserts construction + shutdown work.
+#[tokio::test]
+async fn engine_start_does_not_panic_on_non_valkey_backend() {
+    let mock = Arc::new(NamespaceOnlyBackend::default());
+    let backend: Arc<dyn EngineBackend> = mock;
+    let engine = ff_engine::Engine::start_with_metrics(
+        ff_engine::EngineConfig::default(),
+        backend,
+        Arc::new(ff_observability::Metrics::new()),
+    );
+    engine.shutdown().await;
+}
+
 // Silence unused-import lints on the big surface list — the stub
 // impls above reference every import, but the compiler counts them
 // per-attribute.

@@ -91,7 +91,12 @@ impl Scanner for BudgetResetScanner {
         let tag = p.hash_tag();
         let resets_key = budget_resets_key(&tag);
 
-        let now_ms = match crate::scanner::lease_expiry::server_time_ms(client).await {
+        let now_ms_res: Result<u64, String> = if let Some(ref b) = self.backend {
+            b.server_time_ms().await.map_err(|e| e.to_string())
+        } else {
+            crate::scanner::lease_expiry::server_time_ms_legacy(client).await.map_err(|e| e.to_string())
+        };
+        let now_ms = match now_ms_res {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(partition, error = %e, "budget_reset: failed to get server time");

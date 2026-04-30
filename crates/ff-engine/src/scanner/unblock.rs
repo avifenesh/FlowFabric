@@ -304,7 +304,7 @@ async fn scan_blocked_set(
                 check_budget_cleared(client, &core_key, budget_cache, partition_config).await
             }
             "waiting_for_quota" => {
-                check_quota_cleared(client, &core_key, eid_str, partition_config).await
+                check_quota_cleared(client, backend, &core_key, eid_str, partition_config).await
             }
             "waiting_for_capable_worker" => {
                 check_route_cleared(client, &core_key, caps_cache).await
@@ -318,7 +318,12 @@ async fn scan_blocked_set(
 
         // Unblock: trait-route → `EngineBackend::unblock_execution`
         // (Valkey: wraps `ff_unblock_execution` FCALL on {p:N}).
-        let now_ms = match crate::scanner::lease_expiry::server_time_ms(client).await {
+        let now_ms_res: Result<u64, String> = if let Some(b) = backend {
+            b.server_time_ms().await.map_err(|e| e.to_string())
+        } else {
+            crate::scanner::lease_expiry::server_time_ms_legacy(client).await.map_err(|e| e.to_string())
+        };
+        let now_ms = match now_ms_res {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
@@ -515,6 +520,7 @@ async fn is_budget_breached(
 /// Computes real {q:K} partition tag from quota_policy_id.
 async fn check_quota_cleared(
     client: &ferriskey::Client,
+    backend: Option<&Arc<dyn EngineBackend>>,
     core_key: &str,
     _eid_str: &str,
     config: &PartitionConfig,
@@ -590,7 +596,12 @@ async fn check_quota_cleared(
 
     // Check rate: clean window, count
     if rate_limit > 0 {
-        let now_ms = match crate::scanner::lease_expiry::server_time_ms(client).await {
+        let now_ms_res: Result<u64, String> = if let Some(b) = backend {
+            b.server_time_ms().await.map_err(|e| e.to_string())
+        } else {
+            crate::scanner::lease_expiry::server_time_ms_legacy(client).await.map_err(|e| e.to_string())
+        };
+        let now_ms = match now_ms_res {
             Ok(t) => t,
             Err(_) => return false,
         };
