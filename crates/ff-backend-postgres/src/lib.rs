@@ -1539,6 +1539,65 @@ impl EngineBackend for PostgresBackend {
     }
 }
 
+/// Resolve a `CompletionPayload` to the matching
+/// `ff_completion_event.event_id` for PR-7b cascade dispatch.
+///
+/// Mirrors the cursor-walk previously inlined in
+/// `ff-engine::completion_listener::run_completion_listener_postgres` —
+/// keyed on `(partition_key, execution_id_uuid, occurred_at_ms)`. The
+/// `partition_key` scoping is what makes this hit the
+/// `ff_completion_event_lookup_idx` composite instead of devolving into
+/// a cross-partition seq-scan; it's recoverable from the textual
+/// `ExecutionId` (`"<partition>:<uuid>"`).
+///
+/// Returns `None` if the outbox row isn't visible yet (race with the
+/// producing tx), the payload's execution id can't be parsed, or the
+/// partition prefix isn't an `i16` — all recoverable via the
+/// dependency_reconciler backstop. Transient sqlx errors are logged at
+/// `warn` with the query inputs and also fall back to `None`; the
+/// listener retries on the next payload and the reconciler covers the
+/// worst case.
+async fn resolve_event_id(
+    pool: &PgPool,
+    payload: &ff_core::backend::CompletionPayload,
+) -> Option<i64> {
+    let eid_str = payload.execution_id.as_str();
+    // ExecutionId is `{fp:N}:<uuid>`; split on the rightmost `:` so the
+    // `{fp:N}` hash-tag prefix stays intact.
+    let uuid_str = eid_str.rsplit_once(':').map(|(_, u)| u)?;
+    let uuid = uuid::Uuid::parse_str(uuid_str).ok()?;
+    // The payload's ExecutionId is already validated (construction
+    // enforces the `{fp:N}:<uuid>` shape), so `.partition()` is
+    // infallible. Narrow to `i16` for the partition_key column.
+    let partition_key = i16::try_from(payload.execution_id.partition()).ok()?;
+    let occurred_at_ms = payload.produced_at_ms.0;
+
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT event_id FROM ff_completion_event \
+         WHERE partition_key = $1 AND execution_id = $2 AND occurred_at_ms = $3 \
+         ORDER BY event_id ASC LIMIT 1",
+    )
+    .bind(partition_key)
+    .bind(uuid)
+    .bind(occurred_at_ms)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::warn!(
+                partition_key,
+                execution_id = %uuid,
+                occurred_at_ms,
+                error = %err,
+                "resolve_event_id: ff_completion_event lookup failed; falling back to \
+                 dependency_reconciler backstop"
+            );
+            None
+        }
+    }
+}
+
 /// Narrow a `Partition`'s `u16` index into the `i16` the Postgres
 /// schema uses as its partition-key column. FlowFabric partitions
 /// max out well below `i16::MAX` in practice (production deployments
@@ -1547,40 +1606,6 @@ impl EngineBackend for PostgresBackend {
 /// `ValidationKind::InvalidInput` rather than silently substituting a
 /// fallback — a silently mis-routed reconciler would
 /// corrupt-by-omission without diagnostics.
-/// Resolve a `CompletionPayload` to the matching
-/// `ff_completion_event.event_id` for PR-7b cascade dispatch.
-///
-/// Mirrors the cursor-walk previously inlined in
-/// `ff-engine::completion_listener::run_completion_listener_postgres` —
-/// keyed on `(execution_id_uuid, occurred_at_ms)`. Returns `None` if
-/// the outbox row isn't visible yet (race with the producing tx) or
-/// if the payload's execution id can't be parsed; in both cases the
-/// dependency_reconciler is the backstop.
-///
-/// Uses `last_seen = 0` (no cursor): cascade_completion is called
-/// per-payload from the push-based listener, so filtering by a cursor
-/// higher than 0 would miss valid replays.
-async fn resolve_event_id(
-    pool: &PgPool,
-    payload: &ff_core::backend::CompletionPayload,
-) -> Option<i64> {
-    let eid_str = payload.execution_id.as_str();
-    let uuid_str = eid_str.rsplit_once(':').map(|(_, u)| u)?;
-    let uuid = uuid::Uuid::parse_str(uuid_str).ok()?;
-
-    sqlx::query_scalar::<_, i64>(
-        "SELECT event_id FROM ff_completion_event \
-         WHERE execution_id = $1 AND occurred_at_ms = $2 \
-         ORDER BY event_id ASC LIMIT 1",
-    )
-    .bind(uuid)
-    .bind(payload.produced_at_ms.0)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-}
-
 fn partition_index_to_i16(partition: Partition) -> Result<i16, EngineError> {
     i16::try_from(partition.index).map_err(|_| EngineError::Validation {
         kind: ff_core::engine_error::ValidationKind::InvalidInput,
