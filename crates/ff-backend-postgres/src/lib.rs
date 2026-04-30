@@ -1591,6 +1591,7 @@ impl EngineBackend for PostgresBackend {
 
     // ── PR-7b / #453: typed-FCALL bodies ──
 
+    #[cfg(feature = "core")]
     async fn renew_lease(
         &self,
         args: ff_core::contracts::RenewLeaseArgs,
