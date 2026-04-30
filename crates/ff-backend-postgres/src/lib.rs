@@ -1623,6 +1623,22 @@ impl EngineBackend for PostgresBackend {
         crate::typed_ops::resume_execution(self.pool(), args).await
     }
 
+    #[cfg(feature = "core")]
+    async fn check_admission(
+        &self,
+        quota_policy_id: &ff_core::types::QuotaPolicyId,
+        _dimension: &str,
+        args: ff_core::contracts::CheckAdmissionArgs,
+    ) -> Result<ff_core::contracts::CheckAdmissionResult, EngineError> {
+        crate::typed_ops::check_admission(
+            self.pool(),
+            &self.partition_config,
+            quota_policy_id,
+            args,
+        )
+        .await
+    }
+
     // ── PR-7b Wave 0a: exec_core field read ──
 
     async fn read_exec_core_fields(
