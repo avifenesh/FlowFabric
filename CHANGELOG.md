@@ -31,6 +31,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **#33 / Phase 1: 7 SQLite typed-FCALL bodies (cairn parity).** Flips
+  `renew_lease`, `complete_execution`, `fail_execution`,
+  `resume_execution`, `check_admission`, `evaluate_flow_eligibility`,
+  `claim_execution` from the `Unavailable` default to real SQLite
+  bodies on `SqliteBackend`. Mirrors the PG shape at
+  `ff-backend-postgres/src/typed_ops.rs` modulo dialect:
+  - `FOR UPDATE` elided — `BEGIN IMMEDIATE` already holds RESERVED
+    lock, RFC-023 §4.1 A3 single-writer.
+  - `raw_fields->>'k'` → `json_extract(raw_fields, '$.k')`.
+  - PG `jsonb || patch` → SQLite `json_set(raw_fields, '$.k1', v1,
+    '$.k2', v2, ...)` (multi-key set in one call).
+  - `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` dropped —
+    `BEGIN IMMEDIATE` + single-writer is implicitly serialisable.
+  - UPSERT uses `ON CONFLICT ... DO UPDATE SET … = excluded.col`
+    (SQLite lowercase keyword) instead of `EXCLUDED.col`.
+  - `flow_id` is BLOB (Uuid::as_bytes) on SQLite vs `uuid` on PG; sqlx
+    handles the bind via Uuid.
+  - `attempt_index` is INTEGER (i64) on SQLite vs integer (i32) on PG.
+  - All write paths wrapped in `retry_serializable(|| …)` to absorb
+    `SQLITE_BUSY` under contention.
+
+  Fence-asymmetry (epoch-only) note from PG carries over — SQLite's
+  `ff_attempt` persists only `lease_epoch`; `lease_id` and `attempt_id`
+  live on the worker-side `Handle`.
+
+  Integration tests: 38 tests across 7 files
+  (`crates/ff-backend-sqlite/tests/typed_*.rs`); run against `:memory:`
+  — no env var gate — and execute in every CI matrix cell.
 - **#453 / PR-7b: `EngineBackend::fail_execution` — Postgres body.**
   Ports `ff_fail_execution` from `flowfabric.lua` with both retry and
   terminal branches. Parses the retry policy JSON envelope (fixed /

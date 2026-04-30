@@ -46,6 +46,7 @@ mod registry;
 pub mod retry;
 mod suspend_ops;
 mod tx_util;
+mod typed_ops;
 
 pub use backend::SqliteBackend;
 pub use errors::{MAX_ATTEMPTS, is_retryable_sqlite_busy};

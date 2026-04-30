@@ -583,13 +583,18 @@ as part of #449's own doc updates. Expected shape:
   [`CONSUMER_MIGRATION_0.13.md`](CONSUMER_MIGRATION_0.13.md) §Known
   limitations.
 
-**#453 / PR-7b — typed-FCALL bodies (cairn blocker):**
+**#453 / PR-7b — typed-FCALL bodies (cairn blocker):** SQLite bodies
+shipped in v0.13 Phase 1 (#33) mirroring PG with dialect swaps
+(`BEGIN IMMEDIATE` RESERVED lock; `json_set(doc, '$.k1', v1, '$.k2',
+v2, …)` multi-key patch; `excluded.col` UPSERT keyword lowercase).
+Tests in `crates/ff-backend-sqlite/tests/typed_*.rs`; 38 tests total,
+all run against `:memory:` in every CI matrix cell.
 
 | Method | Valkey | Postgres | SQLite | Notes |
 |---|---|---|---|---|
-| `renew_lease` | `impl` | `impl` | `Unavailable` (default, follow-up) | PG: `READ COMMITTED` tx + `FOR UPDATE` on `ff_attempt`. Fence validation is **epoch-only** (PG doesn't persist `lease_id`/`attempt_id` to disk; `lease_epoch` monotonic bump is sufficient to catch the same violations Valkey's full-triple check covers). Error map: `fence_required`→`Validation{InvalidInput}`, `stale_lease`→`State(StaleLease)`, `lease_expired`→`State(LeaseExpired)`, `execution_not_active`→`Contention(ExecutionNotActive{...})`. Integration test: `crates/ff-backend-postgres/tests/typed_renew_lease.rs`. |
-| `complete_execution` | `impl` | `impl` | `Unavailable` (default, follow-up) | PG: `READ COMMITTED` tx with `FOR UPDATE` on `ff_attempt` + `ff_exec_core`. Fence-or-operator-override gate matches Valkey — `source=OperatorOverride` skips epoch fence but lifecycle gate still fires. Flips `ff_exec_core` to terminal/completed + stores result payload; emits `ff_completion_event` (→ pg_notify DAG cascade) + `lease_event::EVENT_REVOKED`. Integration test: `crates/ff-backend-postgres/tests/typed_complete_execution.rs`. |
-| `fail_execution` | `impl` | `impl` | `Unavailable` (default, follow-up) | PG: retry/terminal branch mirrors Valkey. Retry policy JSON parsed into fixed/exponential backoff; `retry_count < max_retries` → `RetryScheduled { delay_until, next_attempt_index }`. Otherwise → `TerminalFailed` (flips to terminal/failed, emits completion outbox with `outcome='failed'`). Integration test: `crates/ff-backend-postgres/tests/typed_fail_execution.rs`. |
+| `renew_lease` | `impl` | `impl` | `impl` | PG: `READ COMMITTED` tx + `FOR UPDATE` on `ff_attempt`. Fence validation is **epoch-only** (PG doesn't persist `lease_id`/`attempt_id` to disk; `lease_epoch` monotonic bump is sufficient to catch the same violations Valkey's full-triple check covers). Error map: `fence_required`→`Validation{InvalidInput}`, `stale_lease`→`State(StaleLease)`, `lease_expired`→`State(LeaseExpired)`, `execution_not_active`→`Contention(ExecutionNotActive{...})`. Integration test: `crates/ff-backend-postgres/tests/typed_renew_lease.rs`. |
+| `complete_execution` | `impl` | `impl` | `impl` | PG: `READ COMMITTED` tx with `FOR UPDATE` on `ff_attempt` + `ff_exec_core`. Fence-or-operator-override gate matches Valkey — `source=OperatorOverride` skips epoch fence but lifecycle gate still fires. Flips `ff_exec_core` to terminal/completed + stores result payload; emits `ff_completion_event` (→ pg_notify DAG cascade) + `lease_event::EVENT_REVOKED`. Integration test: `crates/ff-backend-postgres/tests/typed_complete_execution.rs`. |
+| `fail_execution` | `impl` | `impl` | `impl` | PG: retry/terminal branch mirrors Valkey. Retry policy JSON parsed into fixed/exponential backoff; `retry_count < max_retries` → `RetryScheduled { delay_until, next_attempt_index }`. Otherwise → `TerminalFailed` (flips to terminal/failed, emits completion outbox with `outcome='failed'`). Integration test: `crates/ff-backend-postgres/tests/typed_fail_execution.rs`. |
 
 **PR-7b Wave 0a — backend-agnostic primitives + `start_*` no-panic (cairn #436):**
 
