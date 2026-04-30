@@ -8606,7 +8606,7 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(transport_fk)?;
         let mut out = std::collections::HashMap::with_capacity(fields.len());
-        for (name, val) in fields.iter().zip(values.into_iter()) {
+        for (name, val) in fields.iter().zip(values) {
             out.insert((*name).to_string(), val);
         }
         Ok(out)
