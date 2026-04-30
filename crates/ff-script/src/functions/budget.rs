@@ -270,6 +270,8 @@ impl FromFcallResult for ReportUsageResult {
 pub async fn ff_record_spend(
     conn: &ferriskey::Client,
     k: &BudgetOpKeys<'_>,
+    by_exec_key: &str,
+    by_exec_index: &str,
     args: &RecordSpendArgs,
     now: ff_core::types::TimestampMs,
 ) -> Result<ReportUsageResult, ScriptError> {
@@ -277,6 +279,8 @@ pub async fn ff_record_spend(
         k.usage_key.to_string(),
         k.limits_key.to_string(),
         k.def_key.to_string(),
+        by_exec_key.to_string(),
+        by_exec_index.to_string(),
     ];
 
     let pair_count = args.deltas.len();
@@ -291,7 +295,7 @@ pub async fn ff_record_spend(
         });
     }
 
-    let mut argv: Vec<String> = Vec::with_capacity(3 + pair_count * 2);
+    let mut argv: Vec<String> = Vec::with_capacity(4 + pair_count * 2);
     argv.push(pair_count.to_string());
     for (dim, delta) in &args.deltas {
         argv.push(dim.clone());
@@ -307,6 +311,9 @@ pub async fn ff_record_spend(
         usage_dedup_key(k.hash_tag, &args.idempotency_key)
     };
     argv.push(dedup_key_val);
+    // execution_id — Lua uses this to skip ledger writes when empty
+    // (belt-and-suspenders; Rust-side callers always pass it).
+    argv.push(args.execution_id.to_string());
 
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
@@ -315,6 +322,51 @@ pub async fn ff_record_spend(
         .await
         .map_err(ScriptError::Valkey)?;
     <ReportUsageResult as FromFcallResult>::from_fcall_result(&raw)
+}
+
+// ─── ff_release_budget ────────────────────────────────────────────────
+//
+// cairn #454 Phase 3b, option A — per-execution attribution reversal.
+// Reads the per-exec ledger hash and subtracts each dim from the
+// aggregate usage (clamped at 0 to guard against resets); deletes the
+// ledger; removes the execution from the index. Idempotent no-op when
+// no ledger entry exists for this execution.
+//
+// Lua KEYS (3): budget_usage, by_exec_hash, by_exec_index
+// Lua ARGV (2): budget_id, execution_id
+
+pub async fn ff_release_budget(
+    conn: &ferriskey::Client,
+    usage_key: &str,
+    by_exec_key: &str,
+    by_exec_index: &str,
+    args: &ReleaseBudgetArgs,
+) -> Result<(), ScriptError> {
+    let keys: Vec<String> = vec![
+        usage_key.to_string(),
+        by_exec_key.to_string(),
+        by_exec_index.to_string(),
+    ];
+    let argv: Vec<String> = vec![
+        args.budget_id.to_string(),
+        args.execution_id.to_string(),
+    ];
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let raw = conn
+        .fcall::<ferriskey::Value>("ff_release_budget", &key_refs, &argv_refs)
+        .await
+        .map_err(ScriptError::Valkey)?;
+    // Accept both "released" and "noop" as success (idempotent).
+    let r = FcallResult::parse(&raw)?.into_success()?;
+    match r.status.as_str() {
+        "OK" => Ok(()),
+        other => Err(ScriptError::Parse {
+            fcall: "ff_release_budget".into(),
+            execution_id: Some(args.execution_id.to_string()),
+            message: format!("unexpected status: {other}"),
+        }),
+    }
 }
 
 // ─── ff_reset_budget ──────────────────────────────────────────────────

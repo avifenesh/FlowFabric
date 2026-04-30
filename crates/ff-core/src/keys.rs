@@ -546,6 +546,20 @@ impl BudgetKeyContext {
         format!("ff:budget:{}:{}:executions", self.tag, self.bid)
     }
 
+    /// `ff:budget:{b:M}:<budget_id>:by_exec:<execution_id>` — per-execution
+    /// attribution ledger (cairn #454 option A). HASH of `dim -> delta`.
+    /// Written by `ff_record_spend` and reversed by `ff_release_budget`.
+    pub fn by_exec(&self, execution_id: &str) -> String {
+        format!("ff:budget:{}:{}:by_exec:{}", self.tag, self.bid, execution_id)
+    }
+
+    /// `ff:budget:{b:M}:<budget_id>:by_exec:index` — SET of execution_ids
+    /// with an active ledger entry. Lets admin flows enumerate pending
+    /// attributions (cairn #454).
+    pub fn by_exec_index(&self) -> String {
+        format!("ff:budget:{}:{}:by_exec:index", self.tag, self.bid)
+    }
+
     pub fn hash_tag(&self) -> &str {
         &self.tag
     }

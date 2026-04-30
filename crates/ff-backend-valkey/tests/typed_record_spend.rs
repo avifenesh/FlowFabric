@@ -137,6 +137,33 @@ async fn record_spend_ok_path() {
         .await
         .expect("record_spend Ok call");
     assert!(matches!(r, ReportUsageResult::Ok), "expected Ok, got {r:?}");
+
+    // cairn #454 Phase 3b — ledger was mirrored.
+    let by_exec_key = format!("ff:budget:{{b:0}}:{bid}:by_exec:{exec}");
+    let tokens: Option<String> = be
+        .client()
+        .hget(&by_exec_key, "tokens")
+        .await
+        .expect("hget ledger tokens");
+    assert_eq!(tokens.as_deref(), Some("10"), "ledger tokens must equal recorded delta");
+    let cost: Option<String> = be
+        .client()
+        .hget(&by_exec_key, "cost_cents")
+        .await
+        .expect("hget ledger cost");
+    assert_eq!(cost.as_deref(), Some("20"), "ledger cost_cents must equal recorded delta");
+
+    // Index tracks this execution.
+    let index_key = format!("ff:budget:{{b:0}}:{bid}:by_exec:index");
+    let is_member: bool = be
+        .client()
+        .cmd("SISMEMBER")
+        .arg(&index_key)
+        .arg(exec.to_string())
+        .execute()
+        .await
+        .expect("SISMEMBER index");
+    assert!(is_member, "execution must be in the by_exec index");
 }
 
 /// Path 2 — idempotent replay on the same `idempotency_key` returns
