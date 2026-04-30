@@ -22,9 +22,11 @@
 //! untouched so the 1s dispatcher cadence retains ownership of the
 //! happy path.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::{FlowIndexKeys, FlowKeyContext};
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::types::{ExecutionId, FlowId};
@@ -39,7 +41,8 @@ const BATCH_SIZE: usize = 50;
 pub struct EdgeCancelReconciler {
     interval: Duration,
     filter: ScannerFilter,
-    metrics: std::sync::Arc<ff_observability::Metrics>,
+    metrics: Arc<ff_observability::Metrics>,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl EdgeCancelReconciler {
@@ -51,19 +54,37 @@ impl EdgeCancelReconciler {
         Self::with_filter_and_metrics(
             interval,
             filter,
-            std::sync::Arc::new(ff_observability::Metrics::new()),
+            Arc::new(ff_observability::Metrics::new()),
         )
     }
 
     pub fn with_filter_and_metrics(
         interval: Duration,
         filter: ScannerFilter,
-        metrics: std::sync::Arc<ff_observability::Metrics>,
+        metrics: Arc<ff_observability::Metrics>,
     ) -> Self {
         Self {
             interval,
             filter,
             metrics,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 3: wire an `EngineBackend` so per-tuple reconcile
+    /// routes through the trait instead of a direct `FCALL` on the
+    /// raw `ferriskey::Client`.
+    pub fn with_filter_metrics_and_backend(
+        interval: Duration,
+        filter: ScannerFilter,
+        metrics: Arc<ff_observability::Metrics>,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            filter,
+            metrics,
+            backend: Some(backend),
         }
     }
 }
@@ -216,57 +237,79 @@ impl EdgeCancelReconciler {
             }
         };
 
-        let fctx = FlowKeyContext::new(flow_p, &flow_id);
-        let edgegroup_key = fctx.edgegroup(&downstream_eid);
-        let flow_id_s = flow_id.to_string();
-        let downstream_s = downstream_eid.to_string();
-        let keys = [pending_key, edgegroup_key.as_str()];
-        let argv = [flow_id_s.as_str(), downstream_s.as_str()];
-
-        let reply: Result<ferriskey::Value, _> = client
-            .fcall(
-                "ff_reconcile_sibling_cancel_group",
-                &keys,
-                &argv,
-            )
-            .await;
-
-        match reply {
-            Ok(val) => match extract_action(&val) {
-                Some(action) => {
-                    self.metrics.inc_sibling_cancel_reconcile(action);
-                    match action {
-                        "sremmed_stale" | "completed_drain" => {
-                            tracing::debug!(
-                                flow_id = %flow_id,
-                                downstream = %downstream_eid,
-                                action,
-                                "edge_cancel_reconciler: action applied"
-                            );
-                            ReconcileOutcome::Acted
-                        }
-                        // "no_op"
-                        _ => ReconcileOutcome::NoOp,
-                    }
-                }
-                None => {
+        // PR-7b Cluster 3: prefer the trait method when a backend is
+        // wired; fall back to a direct FCALL on the raw client for
+        // construction paths that did not supply a backend (test
+        // harnesses + legacy `new`/`with_filter`).
+        let action = match self.backend.as_ref() {
+            Some(backend) => match backend
+                .reconcile_sibling_cancel_group(*flow_p, &flow_id, &downstream_eid)
+                .await
+            {
+                Ok(a) => a.as_str(),
+                Err(e) => {
                     tracing::warn!(
                         flow_id = %flow_id,
                         downstream = %downstream_eid,
-                        "edge_cancel_reconciler: unparsable FCALL reply"
+                        error = %e,
+                        "edge_cancel_reconciler: trait call failed; retry next cycle"
                     );
-                    ReconcileOutcome::Error
+                    return ReconcileOutcome::Error;
                 }
             },
-            Err(e) => {
-                tracing::warn!(
+            None => {
+                let fctx = FlowKeyContext::new(flow_p, &flow_id);
+                let edgegroup_key = fctx.edgegroup(&downstream_eid);
+                let flow_id_s = flow_id.to_string();
+                let downstream_s = downstream_eid.to_string();
+                let keys = [pending_key, edgegroup_key.as_str()];
+                let argv = [flow_id_s.as_str(), downstream_s.as_str()];
+
+                let reply: Result<ferriskey::Value, _> = client
+                    .fcall(
+                        "ff_reconcile_sibling_cancel_group",
+                        &keys,
+                        &argv,
+                    )
+                    .await;
+
+                match reply {
+                    Ok(val) => match extract_action(&val) {
+                        Some(a) => a,
+                        None => {
+                            tracing::warn!(
+                                flow_id = %flow_id,
+                                downstream = %downstream_eid,
+                                "edge_cancel_reconciler: unparsable FCALL reply"
+                            );
+                            return ReconcileOutcome::Error;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            flow_id = %flow_id,
+                            downstream = %downstream_eid,
+                            error = %e,
+                            "edge_cancel_reconciler: FCALL failed; retry next cycle"
+                        );
+                        return ReconcileOutcome::Error;
+                    }
+                }
+            }
+        };
+
+        self.metrics.inc_sibling_cancel_reconcile(action);
+        match action {
+            "sremmed_stale" | "completed_drain" => {
+                tracing::debug!(
                     flow_id = %flow_id,
                     downstream = %downstream_eid,
-                    error = %e,
-                    "edge_cancel_reconciler: FCALL failed; retry next cycle"
+                    action,
+                    "edge_cancel_reconciler: action applied"
                 );
-                ReconcileOutcome::Error
+                ReconcileOutcome::Acted
             }
+            _ => ReconcileOutcome::NoOp,
         }
     }
 }
