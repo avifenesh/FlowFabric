@@ -504,11 +504,13 @@ impl Engine {
 
         // Flow summary projector (iterates flow partitions). Filter
         // accepted but not applied — see FlowProjector::with_filter
-        // rustdoc.
-        let flow_projector = Arc::new(FlowProjector::with_filter(
+        // rustdoc. Backend wiring (PR-7b Cluster 2b-B) routes the
+        // per-flow projection through `EngineBackend::project_flow_summary`.
+        let flow_projector = Arc::new(FlowProjector::with_filter_and_backend(
             config.flow_projector_interval,
             config.partition_config,
             scanner_filter.clone(),
+            backend.clone(),
         ));
         handles.push(supervised_spawn(
             flow_projector,

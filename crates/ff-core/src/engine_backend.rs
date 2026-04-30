@@ -2380,6 +2380,92 @@ pub trait EngineBackend: Send + Sync + 'static {
             op: "reconcile_quota_counters",
         })
     }
+
+    // ── PR-7b Cluster 2b-B — Projection + retention scanners ──────
+    //
+    // Two additional non-FCALL scanners routed through the trait so
+    // engine-side scanners stop touching `ferriskey::Client` directly.
+    // Both ride on aggregate reads + derived writes; neither is a thin
+    // single-FCALL passthrough.
+
+    /// Flow-projector scanner hook — sample flow members, derive an
+    /// aggregate `public_flow_state` + per-state counts, and write them
+    /// to the flow summary projection. Returns `Ok(true)` when the
+    /// summary was updated, `Ok(false)` when the flow had no members
+    /// or the index entry was defensively pruned (core missing).
+    ///
+    /// The derived `public_flow_state` written here is distinct from
+    /// `ff_flow_core.public_flow_state` — the former is a rollup
+    /// dashboard field, the latter is the authoritative mutation-guard
+    /// state owned by `create_flow` / `cancel_flow`. See
+    /// `ff_engine::scanner::flow_projector` module doc for the
+    /// two-sources contract.
+    ///
+    /// # Backend status
+    ///
+    /// - **Valkey:** lifts the pre-PR-7b Rust-composed
+    ///   SCARD + SRANDMEMBER + per-member HGET + HSET summary pattern.
+    ///   No new Lua function; the aggregation is inherently
+    ///   multi-round-trip (cross-partition member reads) and atomicity
+    ///   is neither required nor achievable against 256 partitions.
+    /// - **Postgres:** SELECT aggregates from `ff_exec_core` grouped by
+    ///   `public_state` for the flow's members, INSERT ... ON CONFLICT
+    ///   DO UPDATE into `ff_flow_summary` (migration 0019). One query
+    ///   per flow; partition-local aggregation.
+    /// - **SQLite:** `Unavailable` per RFC-023 Phase 3.5 (flow summary
+    ///   projection is a shared-deployment dashboard feature; local
+    ///   single-tenant SQLite deployments don't need it).
+    #[cfg(feature = "core")]
+    async fn project_flow_summary(
+        &self,
+        _partition: crate::partition::Partition,
+        _flow_id: &FlowId,
+        _now_ms: TimestampMs,
+    ) -> Result<bool, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "project_flow_summary",
+        })
+    }
+
+    /// Retention-trimmer scanner hook — delete terminal executions and
+    /// all their subordinate keys/rows once they are older than the
+    /// configured retention window. Returns the number of executions
+    /// actually purged in this call (so the scanner can loop when it
+    /// hits `batch_size`).
+    ///
+    /// Retention trimming is inherently a scan-and-delete loop over
+    /// time; the trait surface exists to remove engine-side Valkey
+    /// coupling, **not** to atomise the operation into a single
+    /// round-trip. Implementations may issue multiple round-trips
+    /// (e.g. per-execution cascade across sibling tables); the trait
+    /// contract is "make progress, bounded by batch_size".
+    ///
+    /// # Backend status
+    ///
+    /// - **Valkey:** lifts the pre-PR-7b ZRANGEBYSCORE + per-exec
+    ///   cascade-delete loop verbatim. Cluster-safe (all keys for one
+    ///   execution live on the same `{p:N}` slot).
+    /// - **Postgres:** `DELETE FROM ff_exec_core` for terminal rows
+    ///   past the cutoff plus explicit cascade DELETEs on every
+    ///   execution-scoped sibling table (no FK CASCADE in the schema).
+    ///   Single transaction per batch.
+    /// - **SQLite:** `Unavailable` per RFC-023 Phase 3.5. Single-tenant
+    ///   local deployments typically manage their own DB lifecycle and
+    ///   do not need a retention scanner.
+    #[cfg(feature = "core")]
+    async fn trim_retention(
+        &self,
+        _partition: crate::partition::Partition,
+        _lane_id: &LaneId,
+        _retention_ms: u64,
+        _now_ms: TimestampMs,
+        _batch_size: u32,
+        _filter: &crate::backend::ScannerFilter,
+    ) -> Result<u32, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "trim_retention",
+        })
+    }
 }
 
 /// RFC-016 Stage D outcome of a single
@@ -2997,6 +3083,68 @@ mod tests {
         {
             Err(EngineError::Unavailable { op }) => {
                 assert_eq!(op, "unblock_execution");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    // ── project_flow_summary (PR-7b Cluster 2b-B) ──
+
+    /// Default impl returns `Unavailable { op: "project_flow_summary" }`
+    /// so non-Valkey deployments get a typed `Unavailable` rather than
+    /// a panic. SQLite rides the default per RFC-023 Phase 3.5.
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_project_flow_summary_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+        use crate::types::FlowId;
+
+        let b = DefaultBackend;
+        let partition = Partition {
+            family: PartitionFamily::Flow,
+            index: 0,
+        };
+        let fid = FlowId::parse("11111111-1111-1111-1111-111111111111").unwrap();
+        match b
+            .project_flow_summary(partition, &fid, TimestampMs::from_millis(0))
+            .await
+        {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "project_flow_summary");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    // ── trim_retention (PR-7b Cluster 2b-B) ──
+
+    /// Default impl returns `Unavailable { op: "trim_retention" }` so
+    /// non-Valkey deployments get a typed `Unavailable` rather than a
+    /// panic. SQLite rides the default per RFC-023 Phase 3.5.
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_trim_retention_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+
+        let b = DefaultBackend;
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index: 0,
+        };
+        let lane = LaneId::new("default");
+        match b
+            .trim_retention(
+                partition,
+                &lane,
+                60_000,
+                TimestampMs::from_millis(0),
+                20,
+                &crate::backend::ScannerFilter::NOOP,
+            )
+            .await
+        {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "trim_retention");
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }

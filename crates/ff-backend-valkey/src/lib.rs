@@ -8335,6 +8335,7 @@ impl EngineBackend for ValkeyBackend {
             }),
         }
     }
+
     // ── PR-7b Cluster 2b-A — Tally-recompute reconciler scanners ─────
     //
     // Each method runs a full scan-and-fix pass on one partition using
@@ -8531,6 +8532,55 @@ impl EngineBackend for ValkeyBackend {
         }
 
         Ok(ReconcileCounts { processed, errors })
+    }
+
+    // ── PR-7b Cluster 2b-B — Projection + retention scanners ─────────
+
+    // PR-7b Cluster 2b-B: Rust-composed flow summary projection (no
+    // FCALL). Mirrors the scanner's pre-PR-7b behaviour verbatim —
+    // defensive core-exists prune, SRANDMEMBER sample, per-member
+    // cross-partition public_state HGET, derived public_flow_state,
+    // HSET summary, conditional SREM of the flow_index entry once
+    // every member has been observed as terminal.
+    async fn project_flow_summary(
+        &self,
+        partition: Partition,
+        flow_id: &FlowId,
+        now_ms: TimestampMs,
+    ) -> Result<bool, EngineError> {
+        project_flow_summary_impl(
+            &self.client,
+            partition,
+            flow_id,
+            now_ms,
+            &self.partition_config,
+        )
+        .await
+    }
+
+    // PR-7b Cluster 2b-B: retention trimming over one partition+lane.
+    // Lifts the ZRANGEBYSCORE + per-execution cascade-delete loop from
+    // the engine scanner. Returns the count of executions purged in
+    // this call so the scanner can loop if it saturated batch_size.
+    async fn trim_retention(
+        &self,
+        partition: Partition,
+        lane_id: &LaneId,
+        retention_ms: u64,
+        now_ms: TimestampMs,
+        batch_size: u32,
+        filter: &ff_core::backend::ScannerFilter,
+    ) -> Result<u32, EngineError> {
+        trim_retention_impl(
+            self,
+            partition,
+            lane_id,
+            retention_ms,
+            now_ms,
+            batch_size,
+            filter,
+        )
+        .await
     }
 }
 
@@ -9836,6 +9886,444 @@ async fn read_summary_impl(
         last_updated_ms,
         first_applied_ms,
     )))
+}
+
+// ── PR-7b Cluster 2b-B — flow_projector + retention_trimmer ───────────
+
+/// `project_flow_summary` Valkey impl. Mirrors the scanner's pre-PR-7b
+/// Rust-composed path: SRANDMEMBER sample, per-member cross-partition
+/// HGET on `public_state`, derived `public_flow_state`, HSET summary,
+/// conditional flow_index SREM once every member is observed terminal.
+///
+/// Returns `Ok(true)` when the summary hash was written, `Ok(false)`
+/// when the flow had no members (or the core was already gone and the
+/// index entry was pruned defensively).
+async fn project_flow_summary_impl(
+    client: &ferriskey::Client,
+    partition: Partition,
+    flow_id: &FlowId,
+    now_ms: TimestampMs,
+    partition_config: &PartitionConfig,
+) -> Result<bool, EngineError> {
+    const BATCH_SIZE: usize = 50;
+
+    let tag = partition.hash_tag();
+    let fid_string = flow_id.to_string();
+    let fid_str = fid_string.as_str();
+    let fidx = FlowIndexKeys::new(&partition);
+    let flow_index_key = fidx.flow_index();
+    let core_key = format!("ff:flow:{}:{}:core", tag, fid_str);
+    let members_key = format!("ff:flow:{}:{}:members", tag, fid_str);
+    let summary_key = format!("ff:flow:{}:{}:summary", tag, fid_str);
+    let now_ms_i64 = now_ms.0;
+
+    // Defensive prune: core missing means a retention purge / manual
+    // delete has already removed the flow. Drop the index entry so
+    // subsequent scans skip it.
+    let core_exists: bool = client.exists(&core_key).await.map_err(transport_fk)?;
+    if !core_exists {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(&flow_index_key)
+            .arg(fid_str)
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        return Ok(false);
+    }
+
+    let true_total: u64 = client
+        .cmd("SCARD")
+        .arg(&members_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    if true_total == 0 {
+        return Ok(false);
+    }
+
+    let member_eids: Vec<String> = client
+        .cmd("SRANDMEMBER")
+        .arg(&members_key)
+        .arg(BATCH_SIZE.to_string().as_str())
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    if member_eids.is_empty() {
+        return Ok(false);
+    }
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut sampled: u32 = 0;
+
+    for eid_str in &member_eids {
+        let eid = match ExecutionId::parse(eid_str) {
+            Ok(id) => id,
+            Err(_) => {
+                // Malformed member eid in flow members set — skip but
+                // surface so a persistent upstream bug is visible.
+                tracing::warn!(
+                    flow_id = fid_str,
+                    eid = eid_str.as_str(),
+                    "project_flow_summary: malformed member execution_id in flow members"
+                );
+                continue;
+            }
+        };
+        let member_partition = execution_partition(&eid, partition_config);
+        let ctx_tag = member_partition.hash_tag();
+        let member_core_key = format!("ff:exec:{}:{}:core", ctx_tag, eid_str);
+
+        let ps: Option<String> = client
+            .cmd("HGET")
+            .arg(&member_core_key)
+            .arg("public_state")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+
+        let state = ps.unwrap_or_else(|| "unknown".to_owned());
+        *counts.entry(state).or_insert(0) += 1;
+        sampled += 1;
+    }
+
+    let completed = *counts.get("completed").unwrap_or(&0);
+    let skipped = *counts.get("skipped").unwrap_or(&0);
+    let failed = *counts.get("failed").unwrap_or(&0);
+    let cancelled = *counts.get("cancelled").unwrap_or(&0);
+    let expired = *counts.get("expired").unwrap_or(&0);
+    let active = *counts.get("active").unwrap_or(&0);
+    let suspended = *counts.get("suspended").unwrap_or(&0);
+    let waiting = *counts.get("waiting").unwrap_or(&0);
+    let delayed = *counts.get("delayed").unwrap_or(&0);
+    let rate_limited = *counts.get("rate_limited").unwrap_or(&0);
+    let waiting_children = *counts.get("waiting_children").unwrap_or(&0);
+
+    let terminal_count = completed + skipped + failed + cancelled + expired;
+    let all_terminal = terminal_count == sampled && sampled > 0;
+
+    let flow_state = if all_terminal {
+        if failed > 0 || cancelled > 0 || expired > 0 {
+            "failed"
+        } else {
+            "completed"
+        }
+    } else if active > 0 {
+        "running"
+    } else if suspended > 0 || delayed > 0 || rate_limited > 0 || waiting_children > 0 {
+        "blocked"
+    } else {
+        "open"
+    };
+
+    let _: () = client
+        .cmd("HSET")
+        .arg(&summary_key)
+        .arg("total_members").arg(true_total.to_string().as_str())
+        .arg("sampled_members").arg(sampled.to_string().as_str())
+        .arg("members_completed").arg(completed.to_string().as_str())
+        .arg("members_failed").arg(failed.to_string().as_str())
+        .arg("members_cancelled").arg(cancelled.to_string().as_str())
+        .arg("members_expired").arg(expired.to_string().as_str())
+        .arg("members_skipped").arg(skipped.to_string().as_str())
+        .arg("members_active").arg(active.to_string().as_str())
+        .arg("members_suspended").arg(suspended.to_string().as_str())
+        .arg("members_waiting").arg(waiting.to_string().as_str())
+        .arg("members_delayed").arg(delayed.to_string().as_str())
+        .arg("members_rate_limited").arg(rate_limited.to_string().as_str())
+        .arg("members_waiting_children").arg(waiting_children.to_string().as_str())
+        .arg("public_flow_state").arg(flow_state)
+        .arg("last_summary_update_at").arg(now_ms_i64.to_string().as_str())
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    // Prune the flow_index entry only when we've observed EVERY member
+    // in this cycle and all of them are terminal. Sample-based pruning
+    // would freeze the summary mid-flight for flows larger than the
+    // sample size.
+    if all_terminal && (sampled as u64) == true_total {
+        let _: Option<i64> = client
+            .cmd("SREM")
+            .arg(&flow_index_key)
+            .arg(fid_str)
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+    }
+
+    Ok(true)
+}
+
+/// `trim_retention` Valkey impl. Scans `ff:idx:{p:N}:lane:<lane>:terminal`
+/// for executions scored (by completed_at) below the retention cutoff,
+/// per-execution cascade-deletes all subordinate keys, then finally
+/// drops `exec_core` + `policy` and the index entries. Returns the
+/// number of executions actually purged (skipped ones — custom
+/// retention not yet due — do not count).
+async fn trim_retention_impl(
+    backend: &ValkeyBackend,
+    partition: Partition,
+    lane_id: &LaneId,
+    retention_ms: u64,
+    now_ms: TimestampMs,
+    batch_size: u32,
+    filter: &ff_core::backend::ScannerFilter,
+) -> Result<u32, EngineError> {
+    let client = &backend.client;
+    let idx = IndexKeys::new(&partition);
+    let terminal_key = idx.lane_terminal(lane_id);
+    let now_ms_u64 = now_ms.0.max(0) as u64;
+    let cutoff = now_ms_u64.saturating_sub(retention_ms);
+
+    let expired: Vec<String> = client
+        .cmd("ZRANGEBYSCORE")
+        .arg(&terminal_key)
+        .arg("-inf")
+        .arg(cutoff.to_string().as_str())
+        .arg("LIMIT")
+        .arg("0")
+        .arg(batch_size.to_string().as_str())
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    if expired.is_empty() {
+        return Ok(0);
+    }
+
+    let mut processed: u32 = 0;
+    for eid_str in &expired {
+        // Issue #122: honour per-candidate ScannerFilter (namespace /
+        // instance tag). Filtered-out candidates are left in place so a
+        // differently-scoped scanner cycle can reach them.
+        if backend.scanner_skip_candidate(filter, eid_str).await {
+            continue;
+        }
+        // false = custom retention not yet expired; do not count.
+        // Log-and-continue on per-execution purge failures so one bad
+        // entry can't abort the whole batch (pre-refactor behavior).
+        match purge_retention_execution(
+            client,
+            &partition,
+            &idx,
+            eid_str,
+            &terminal_key,
+            now_ms_u64,
+            retention_ms,
+        )
+        .await
+        {
+            Ok(true) => processed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    partition = partition.index,
+                    execution_id = %eid_str,
+                    error = %e,
+                    "retention purge failed; continuing batch",
+                );
+            }
+        }
+    }
+
+    Ok(processed)
+}
+
+/// Cascading delete of all keys for one terminal execution. Returns
+/// `Ok(true)` on purge, `Ok(false)` if a per-exec custom retention
+/// override kept it alive. Subordinate keys are DELeted in chunks
+/// FIRST; exec_core + policy come LAST so a transient mid-cascade
+/// failure leaves the next pass enough state to rebuild the full
+/// del_keys list.
+async fn purge_retention_execution(
+    client: &ferriskey::Client,
+    partition: &Partition,
+    idx: &IndexKeys,
+    eid_str: &str,
+    terminal_key: &str,
+    now_ms: u64,
+    default_retention_ms: u64,
+) -> Result<bool, EngineError> {
+    let tag = partition.hash_tag();
+    let exec_core_key = format!("ff:exec:{}:{}:core", tag, eid_str);
+
+    let fields: Vec<Option<String>> = client
+        .cmd("HMGET")
+        .arg(&exec_core_key)
+        .arg("completed_at")
+        .arg("total_attempt_count")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    let completed_at: u64 = fields
+        .first()
+        .and_then(|v| v.as_ref())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let total_attempts: u32 = fields
+        .get(1)
+        .and_then(|v| v.as_ref())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if completed_at == 0 {
+        // exec_core already gone — just clean the index entry.
+        let _: u32 = client
+            .cmd("ZREM")
+            .arg(terminal_key)
+            .arg(eid_str)
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        return Ok(true);
+    }
+
+    let policy_key = format!("ff:exec:{}:{}:policy", tag, eid_str);
+    let retention_ms = read_retention_override_ms(client, &policy_key, default_retention_ms).await;
+
+    if now_ms < completed_at + retention_ms {
+        return Ok(false);
+    }
+
+    let mut del_keys: Vec<String> = Vec::with_capacity(16 + total_attempts as usize * 5);
+
+    del_keys.push(format!("ff:exec:{}:{}:payload", tag, eid_str));
+    del_keys.push(format!("ff:exec:{}:{}:result", tag, eid_str));
+    del_keys.push(format!("ff:exec:{}:{}:tags", tag, eid_str));
+    del_keys.push(format!("ff:exec:{}:{}:lease:current", tag, eid_str));
+    del_keys.push(format!("ff:exec:{}:{}:lease:history", tag, eid_str));
+    del_keys.push(format!("ff:exec:{}:{}:claim_grant", tag, eid_str));
+    del_keys.push(format!("ff:exec:{}:{}:attempts", tag, eid_str));
+    for i in 0..total_attempts {
+        del_keys.push(format!("ff:attempt:{}:{}:{}", tag, eid_str, i));
+        del_keys.push(format!("ff:attempt:{}:{}:{}:usage", tag, eid_str, i));
+        del_keys.push(format!("ff:attempt:{}:{}:{}:policy", tag, eid_str, i));
+        del_keys.push(format!("ff:stream:{}:{}:{}", tag, eid_str, i));
+        del_keys.push(format!("ff:stream:{}:{}:{}:meta", tag, eid_str, i));
+    }
+    del_keys.push(format!("ff:exec:{}:{}:suspension:current", tag, eid_str));
+
+    let deps_all_edges_key = format!("ff:exec:{}:{}:deps:all_edges", tag, eid_str);
+    let dep_edge_ids: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(&deps_all_edges_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    del_keys.push(format!("ff:exec:{}:{}:deps:meta", tag, eid_str));
+    del_keys.push(format!("ff:exec:{}:{}:deps:unresolved", tag, eid_str));
+    del_keys.push(deps_all_edges_key);
+    for edge_id in &dep_edge_ids {
+        del_keys.push(format!("ff:exec:{}:{}:dep:{}", tag, eid_str, edge_id));
+    }
+
+    let waitpoints_key = format!("ff:exec:{}:{}:waitpoints", tag, eid_str);
+    let wp_ids: Vec<String> = client
+        .cmd("SMEMBERS")
+        .arg(&waitpoints_key)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    del_keys.push(waitpoints_key);
+    for wp_id_str in &wp_ids {
+        del_keys.push(format!("ff:wp:{}:{}", tag, wp_id_str));
+        del_keys.push(format!("ff:wp:{}:{}:signals", tag, wp_id_str));
+        del_keys.push(format!("ff:wp:{}:{}:condition", tag, wp_id_str));
+    }
+
+    let signal_key = format!("ff:exec:{}:{}:signals", tag, eid_str);
+    let sig_ids: Vec<String> = client
+        .cmd("ZRANGE")
+        .arg(&signal_key)
+        .arg("0")
+        .arg("-1")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    del_keys.push(signal_key);
+    for sig_id_str in &sig_ids {
+        del_keys.push(format!("ff:signal:{}:{}", tag, sig_id_str));
+        del_keys.push(format!("ff:signal:{}:{}:payload", tag, sig_id_str));
+    }
+
+    for chunk in del_keys.chunks(500) {
+        let key_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+        let _: u32 = client
+            .cmd("DEL")
+            .arg(&key_refs)
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+    }
+
+    let _: u32 = client
+        .cmd("DEL")
+        .arg(&[exec_core_key.as_str(), policy_key.as_str()][..])
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    let _: u32 = client
+        .cmd("ZREM")
+        .arg(terminal_key)
+        .arg(eid_str)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    let all_exec_key = idx.all_executions();
+    let _: u32 = client
+        .cmd("SREM")
+        .arg(&all_exec_key)
+        .arg(eid_str)
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+
+    Ok(true)
+}
+
+/// Read `policy.stream_policy.retention_ttl_ms` override from the
+/// per-execution policy JSON; fall back to `default_retention_ms`
+/// when unset, missing, or malformed. Retention overrides are
+/// advisory — a transient read error returns the default rather
+/// than propagating, because the next retention pass will retry.
+async fn read_retention_override_ms(
+    client: &ferriskey::Client,
+    policy_key: &str,
+    default_retention_ms: u64,
+) -> u64 {
+    let policy_json: Option<String> = match client
+        .cmd("GET")
+        .arg(policy_key)
+        .execute()
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return default_retention_ms,
+    };
+
+    let json_str = match policy_json {
+        Some(s) if !s.is_empty() => s,
+        _ => return default_retention_ms,
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return default_retention_ms,
+    };
+
+    parsed
+        .get("stream_policy")
+        .and_then(|sp| sp.get("retention_ttl_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_retention_ms)
 }
 
 #[cfg(test)]
