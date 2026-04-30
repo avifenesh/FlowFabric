@@ -1647,6 +1647,14 @@ impl EngineBackend for PostgresBackend {
         crate::typed_ops::evaluate_flow_eligibility(self.pool(), args).await
     }
 
+    #[cfg(feature = "core")]
+    async fn claim_execution(
+        &self,
+        args: ff_core::contracts::ClaimExecutionArgs,
+    ) -> Result<ff_core::contracts::ClaimExecutionResult, EngineError> {
+        crate::typed_ops::claim_execution(self.pool(), &self.partition_config, args).await
+    }
+
     // ── PR-7b Wave 0a: exec_core field read ──
 
     async fn read_exec_core_fields(
