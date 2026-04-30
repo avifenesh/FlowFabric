@@ -31,9 +31,12 @@
 //! `LetRun` late-terminal metric; Stage E adds the full reconciler +
 //! observability polish. Crash-mid-cancel recovery is Stage D.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ff_core::backend::ScannerFilter;
+use ff_core::contracts::CancelExecutionArgs;
+use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::{
     ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys,
 };
@@ -41,8 +44,8 @@ use ff_core::partition::{
     execution_partition, Partition, PartitionConfig, PartitionFamily,
 };
 use ff_core::types::{
-    AttemptIndex, ExecutionId, FlowId, LaneId, WaitpointId,
-    WorkerInstanceId,
+    AttemptIndex, CancelSource, ExecutionId, FlowId, LaneId, TimestampMs,
+    WaitpointId, WorkerInstanceId,
 };
 
 use super::{ScanResult, Scanner};
@@ -63,7 +66,8 @@ pub struct EdgeCancelDispatcher {
     interval: Duration,
     partition_config: PartitionConfig,
     filter: ScannerFilter,
-    metrics: std::sync::Arc<ff_observability::Metrics>,
+    metrics: Arc<ff_observability::Metrics>,
+    backend: Option<Arc<dyn EngineBackend>>,
 }
 
 impl EdgeCancelDispatcher {
@@ -80,7 +84,7 @@ impl EdgeCancelDispatcher {
             interval,
             partition_config,
             filter,
-            std::sync::Arc::new(ff_observability::Metrics::new()),
+            Arc::new(ff_observability::Metrics::new()),
         )
     }
 
@@ -88,13 +92,33 @@ impl EdgeCancelDispatcher {
         interval: Duration,
         partition_config: PartitionConfig,
         filter: ScannerFilter,
-        metrics: std::sync::Arc<ff_observability::Metrics>,
+        metrics: Arc<ff_observability::Metrics>,
     ) -> Self {
         Self {
             interval,
             partition_config,
             filter,
             metrics,
+            backend: None,
+        }
+    }
+
+    /// PR-7b Cluster 3: wire an `EngineBackend` so per-sibling cancel
+    /// and per-group drain route through the trait instead of a
+    /// direct `FCALL` on the raw `ferriskey::Client`.
+    pub fn with_filter_metrics_and_backend(
+        interval: Duration,
+        partition_config: PartitionConfig,
+        filter: ScannerFilter,
+        metrics: Arc<ff_observability::Metrics>,
+        backend: Arc<dyn EngineBackend>,
+    ) -> Self {
+        Self {
+            interval,
+            partition_config,
+            filter,
+            metrics,
+            backend: Some(backend),
         }
     }
 }
@@ -291,7 +315,7 @@ impl EdgeCancelDispatcher {
                  draining tuple (likely already drained or racing retention)"
             );
             return self
-                .drain_group(client, pending_key, &edgegroup_key, &flow_id, &downstream_eid)
+                .drain_group(client, flow_p, &flow_id, &downstream_eid)
                 .await;
         }
 
@@ -338,13 +362,9 @@ impl EdgeCancelDispatcher {
             };
 
             self.metrics.inc_sibling_cancel_dispatched(static_reason);
-            match cancel_sibling(
-                client,
-                &self.partition_config,
-                &sib_eid,
-                reason_str,
-            )
-            .await
+            match self
+                .cancel_sibling(client, &sib_eid, reason_str)
+                .await
             {
                 SiblingDisposition::Cancelled => {
                     cancel_dispositions[0] += 1;
@@ -386,22 +406,49 @@ impl EdgeCancelDispatcher {
             }
         }
 
-        // Drain: atomic SREM + HDEL.
-        self.drain_group(client, pending_key, &edgegroup_key, &flow_id, &downstream_eid)
+        // Drain: atomic SREM + HDEL via trait.
+        self.drain_group(client, flow_p, &flow_id, &downstream_eid)
             .await
     }
 
     async fn drain_group(
         &self,
         client: &ferriskey::Client,
-        pending_key: &str,
-        edgegroup_key: &str,
+        flow_p: &Partition,
         flow_id: &FlowId,
         downstream_eid: &ExecutionId,
     ) -> GroupOutcome {
+        // PR-7b Cluster 3: prefer the trait method when a backend is
+        // wired; fall back to a direct FCALL on the raw client for
+        // construction paths that did not supply a backend (test
+        // harnesses + legacy `new`/`with_filter` call sites) so this
+        // refactor stays source-compatible with the existing scanner
+        // runner contract.
+        if let Some(backend) = self.backend.as_ref() {
+            return match backend
+                .drain_sibling_cancel_group(*flow_p, flow_id, downstream_eid)
+                .await
+            {
+                Ok(()) => GroupOutcome::Drained,
+                Err(e) => {
+                    tracing::warn!(
+                        flow_id = %flow_id,
+                        downstream = %downstream_eid,
+                        error = %e,
+                        "edge_cancel_dispatcher: drain (trait) failed; retry next cycle"
+                    );
+                    GroupOutcome::SkippedRetry
+                }
+            };
+        }
+
+        let fctx = FlowKeyContext::new(flow_p, flow_id);
+        let fidx = FlowIndexKeys::new(flow_p);
+        let pending_key = fidx.pending_cancel_groups();
+        let edgegroup_key = fctx.edgegroup(downstream_eid);
         let flow_id_str = flow_id.to_string();
         let downstream_eid_str = downstream_eid.to_string();
-        let keys = [pending_key, edgegroup_key];
+        let keys = [pending_key.as_str(), edgegroup_key.as_str()];
         let argv = [flow_id_str.as_str(), downstream_eid_str.as_str()];
         match client
             .fcall::<ferriskey::Value>(
@@ -423,6 +470,45 @@ impl EdgeCancelDispatcher {
             }
         }
     }
+
+    /// PR-7b Cluster 3: route per-sibling cancel through the trait
+    /// when a backend is wired. Falls back to the legacy direct-FCALL
+    /// path when the dispatcher was constructed without a backend
+    /// (test harnesses / `new`), preserving byte-identical KEYS/ARGV.
+    async fn cancel_sibling(
+        &self,
+        client: &ferriskey::Client,
+        sib_eid: &ExecutionId,
+        reason: &str,
+    ) -> SiblingDisposition {
+        if let Some(backend) = self.backend.as_ref() {
+            let args = CancelExecutionArgs {
+                execution_id: sib_eid.clone(),
+                reason: reason.to_owned(),
+                source: CancelSource::OperatorOverride,
+                lease_id: None,
+                lease_epoch: None,
+                attempt_id: None,
+                now: TimestampMs::now(),
+            };
+            return match backend.cancel_execution(args).await {
+                Ok(_) => SiblingDisposition::Cancelled,
+                // Lua `execution_not_active` maps to
+                // `Contention(ExecutionNotActive)` — the sibling is
+                // already terminal. Other `Contention` variants are
+                // genuinely transient so match only the exact kind.
+                Err(ff_core::engine_error::EngineError::Contention(
+                    ff_core::engine_error::ContentionKind::ExecutionNotActive { .. },
+                )) => SiblingDisposition::AlreadyTerminal,
+                Err(ff_core::engine_error::EngineError::NotFound { .. }) => {
+                    SiblingDisposition::NotFound
+                }
+                Err(_) => SiblingDisposition::TransientError,
+            };
+        }
+
+        cancel_sibling_fcall(client, &self.partition_config, sib_eid, reason).await
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -433,13 +519,19 @@ enum SiblingDisposition {
     TransientError,
 }
 
-/// Issue `ff_cancel_execution` against a sibling. Mirrors
-/// `cancel_reconciler::cancel_member` KEYS layout but with
+/// Legacy direct-FCALL sibling cancel — kept as a fallback for
+/// construction paths that do not supply an `EngineBackend` (test
+/// harnesses + `EdgeCancelDispatcher::new` / `with_filter`). Mirrors
+/// `cancel_reconciler::cancel_member` KEYS layout with
 /// `source = "operator_override"` — sibling-quorum cancels bypass
 /// lease-fence checks (no worker holds a lease stake here; the engine
 /// itself is pulling the plug). The `reason` is carried through as
 /// ARGV[2] and lands verbatim in exec_core's `cancellation_reason`.
-async fn cancel_sibling(
+///
+/// The backend-wired path in [`EdgeCancelDispatcher::cancel_sibling`]
+/// replaces this call at runtime once `ff-engine::lib` constructs the
+/// dispatcher with a backend.
+async fn cancel_sibling_fcall(
     client: &ferriskey::Client,
     partition_config: &PartitionConfig,
     sib_eid: &ExecutionId,

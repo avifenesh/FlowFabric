@@ -2203,6 +2203,93 @@ pub trait EngineBackend: Send + Sync + 'static {
             op: "unblock_execution",
         })
     }
+
+    /// RFC-016 Stage C — sibling-cancel group drain.
+    ///
+    /// After `edge_cancel_dispatcher` has issued
+    /// [`EngineBackend::cancel_execution`] against every listed
+    /// sibling of a `(flow_id, downstream_eid)` group, this trait
+    /// method atomically removes the tuple from the partition-local
+    /// pending-cancel-groups index and clears the per-group flag +
+    /// members state.
+    ///
+    /// Valkey: `FCALL ff_drain_sibling_cancel_group` (SREM +
+    /// HDEL in one Lua unit).
+    /// Postgres: `Unavailable` — PG's Wave-6b
+    /// `reconcilers::edge_cancel_dispatcher::dispatcher_tick`
+    /// owns the equivalent row drain inside its own per-group
+    /// transaction; the Valkey-shaped per-tuple call is not used on
+    /// the PG scanner path.
+    /// SQLite: `Unavailable` (mirrors PG; RFC-023 scope).
+    #[cfg(feature = "core")]
+    async fn drain_sibling_cancel_group(
+        &self,
+        _flow_partition: crate::partition::Partition,
+        _flow_id: &FlowId,
+        _downstream_eid: &ExecutionId,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unavailable {
+            op: "drain_sibling_cancel_group",
+        })
+    }
+
+    /// RFC-016 Stage D — sibling-cancel group reconcile (Invariant
+    /// Q6 safety net).
+    ///
+    /// Re-examines a `(flow_id, downstream_eid)` tuple in the
+    /// partition-local pending-cancel-groups index and returns one
+    /// of three atomic dispositions — see
+    /// [`SiblingCancelReconcileAction`] — so the crash-recovery
+    /// reconciler can drain stale or completed tuples without
+    /// fighting the Stage-C dispatcher.
+    ///
+    /// Valkey: `FCALL ff_reconcile_sibling_cancel_group`.
+    /// Postgres: `Unavailable` — PG's
+    /// `reconcilers::edge_cancel_reconciler::reconciler_tick`
+    /// owns the row-level reconcile inside its own batched tx.
+    /// SQLite: `Unavailable` (mirrors PG).
+    #[cfg(feature = "core")]
+    async fn reconcile_sibling_cancel_group(
+        &self,
+        _flow_partition: crate::partition::Partition,
+        _flow_id: &FlowId,
+        _downstream_eid: &ExecutionId,
+    ) -> Result<SiblingCancelReconcileAction, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "reconcile_sibling_cancel_group",
+        })
+    }
+}
+
+/// RFC-016 Stage D outcome of a single
+/// [`EngineBackend::reconcile_sibling_cancel_group`] call.
+///
+/// Cardinality is intentionally bounded to three so the
+/// `ff_sibling_cancel_reconcile_total{action}` metric label stays
+/// closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingCancelReconcileAction {
+    /// Pending tuple was stale (flag cleared or edgegroup absent);
+    /// SREM'd / DELETE'd without touching the group.
+    SremmedStale,
+    /// Flag still set but every listed sibling is already terminal —
+    /// an interrupted drain. Flag cleared + tuple drained.
+    CompletedDrain,
+    /// Flag set and at least one sibling non-terminal — dispatcher
+    /// owns this tuple; left untouched.
+    NoOp,
+}
+
+impl SiblingCancelReconcileAction {
+    /// Short label for observability (matches the Lua + PG action
+    /// strings exactly).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SremmedStale => "sremmed_stale",
+            Self::CompletedDrain => "completed_drain",
+            Self::NoOp => "no_op",
+        }
+    }
 }
 
 /// Which scanner invoked [`EngineBackend::expire_execution`].

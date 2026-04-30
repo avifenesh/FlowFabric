@@ -538,11 +538,12 @@ impl Engine {
         // `ff_drain_sibling_cancel_group`, issues per-sibling
         // `ff_cancel_execution` with sibling_quorum reasons.
         let edge_cancel_dispatcher = Arc::new(
-            scanner::edge_cancel_dispatcher::EdgeCancelDispatcher::with_filter_and_metrics(
+            scanner::edge_cancel_dispatcher::EdgeCancelDispatcher::with_filter_metrics_and_backend(
                 config.edge_cancel_dispatcher_interval,
                 config.partition_config,
                 scanner_filter.clone(),
                 metrics.clone(),
+                backend.clone(),
             ),
         );
         handles.push(supervised_spawn(
@@ -559,10 +560,11 @@ impl Engine {
         // by an engine crash. Runs at a slower cadence than the
         // dispatcher so it never fights the happy path.
         let edge_cancel_reconciler = Arc::new(
-            scanner::edge_cancel_reconciler::EdgeCancelReconciler::with_filter_and_metrics(
+            scanner::edge_cancel_reconciler::EdgeCancelReconciler::with_filter_metrics_and_backend(
                 config.edge_cancel_reconciler_interval,
                 scanner_filter.clone(),
                 metrics.clone(),
+                backend.clone(),
             ),
         );
         handles.push(supervised_spawn(
