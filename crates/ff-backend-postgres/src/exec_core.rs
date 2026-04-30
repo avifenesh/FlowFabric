@@ -56,7 +56,7 @@ use crate::error::map_sqlx_error;
 /// (`"{fp:N}:<uuid>"`). The constructors / [`ExecutionId::parse`]
 /// guarantee the `}:` separator exists and the suffix is a valid
 /// UUID.
-fn eid_uuid(eid: &ExecutionId) -> Uuid {
+pub(crate) fn eid_uuid(eid: &ExecutionId) -> Uuid {
     let s = eid.as_str();
     // Shape is enforced by ExecutionId constructors: `{fp:N}:<uuid>`.
     let suffix = s

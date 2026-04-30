@@ -31,6 +31,40 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **PR-7b Wave 0a: `Engine::start_*` no longer panics on non-Valkey
+  backends (cairn #436).** The v0.12 PR-7a transitional downcast —
+  `backend.as_any().downcast_ref::<ValkeyBackend>()` followed by
+  `panic!` when the cast returned `None` — is gone. `start_internal`
+  now probes for Valkey and, on hit, spawns the in-tree ferriskey-
+  speaking scanner supervisors as before; on miss (Postgres / SQLite /
+  any other `EngineBackend` impl) the engine trusts the backend to own
+  its own reconciler supervisor (`PostgresBackend::with_scanners`,
+  `SqliteBackend`'s built-in supervisor) and only wires the partition
+  router + optional completion dispatch loop. Closes the last blocker
+  from cairn's META #347 cluster (siblings #433/#434/#435 already
+  shipped in v0.12.0). Regression guard:
+  `engine_start_does_not_panic_on_non_valkey_backend` in
+  `crates/ff-engine/tests/scanner_namespace_point_read.rs` starts an
+  engine against a pure-Rust mock and asserts clean shutdown.
+- **PR-7b Wave 0a: `EngineBackend::server_time_ms` — backend-agnostic
+  wall-clock primitive.** Valkey (`TIME`), Postgres
+  (`EXTRACT(EPOCH FROM clock_timestamp())` — not `now()`, which is the
+  transaction start timestamp), and SQLite (`julianday('now')`) all
+  override; a `SystemTime::now()` default keeps out-of-tree impls
+  source-compatible. Used internally by 15 scanners to compute "due"
+  thresholds. Replaces the Valkey-only
+  `scanner::lease_expiry::server_time_ms(client)` helper (now
+  `server_time_ms_legacy`, retained as the `backend=None` fallback for
+  test fixtures).
+- **PR-7b Wave 0a: `EngineBackend::read_exec_core_fields` —
+  backend-agnostic exec_core field read.** Valkey issues `HMGET` on
+  the `ff:exec:{p:N}:<eid>:core` hash; Postgres SELECTs from
+  `ff_exec_core` with per-field CAST / `raw_fields ->>` routing;
+  SQLite does the same with `json_extract`. Default body returns
+  `Unavailable` so non-v0.13 backends keep compiling. Scanners
+  (`cancel_reconciler`, `suspension_timeout`, etc.) continue to use
+  direct HGETs on the Valkey-only fallback path; trait-ified rewrites
+  land in Wave 0b.
 - **PR-7b Cluster 2b-B: flow projector + retention trimmer scanners
   trait-routed (cairn #436).** Two new `EngineBackend` trait methods —
   `project_flow_summary(partition, flow_id, now_ms)` and

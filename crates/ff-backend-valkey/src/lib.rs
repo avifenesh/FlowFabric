@@ -8582,6 +8582,61 @@ impl EngineBackend for ValkeyBackend {
         )
         .await
     }
+
+    // ── PR-7b Wave 0a: exec_core field read ──
+
+    async fn read_exec_core_fields(
+        &self,
+        partition: ff_core::partition::Partition,
+        execution_id: &ff_core::types::ExecutionId,
+        fields: &[&str],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
+        use ff_core::keys::ExecKeyContext;
+        if fields.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ctx = ExecKeyContext::new(&partition, execution_id);
+        let core_key = ctx.core();
+        let values: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(core_key.as_str())
+            .arg(fields)
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        let mut out = std::collections::HashMap::with_capacity(fields.len());
+        for (name, val) in fields.iter().zip(values) {
+            out.insert((*name).to_string(), val);
+        }
+        Ok(out)
+    }
+
+    // ── PR-7b Wave 0a: clock primitive ──
+
+    async fn server_time_ms(&self) -> Result<u64, EngineError> {
+        let result: Vec<String> = self
+            .client
+            .cmd("TIME")
+            .execute()
+            .await
+            .map_err(transport_fk)?;
+        if result.len() < 2 {
+            return Err(EngineError::Transport {
+                backend: "valkey",
+                source: "TIME returned fewer than 2 elements".into(),
+            });
+        }
+        let secs: u64 = result[0].parse().map_err(|_| EngineError::Transport {
+            backend: "valkey",
+            source: "TIME: invalid seconds".into(),
+        })?;
+        let micros: u64 = result[1].parse().map_err(|_| EngineError::Transport {
+            backend: "valkey",
+            source: "TIME: invalid microseconds".into(),
+        })?;
+        Ok(secs.saturating_mul(1000).saturating_add(micros / 1000))
+    }
 }
 
 // ── Helpers for Cluster 2b-A reconcilers ─────────────────────────

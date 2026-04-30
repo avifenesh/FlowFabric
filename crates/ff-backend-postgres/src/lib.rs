@@ -1586,6 +1586,150 @@ impl EngineBackend for PostgresBackend {
         )
         .await
     }
+
+    // ── PR-7b Wave 0a: exec_core field read ──
+
+    async fn read_exec_core_fields(
+        &self,
+        partition: ff_core::partition::Partition,
+        execution_id: &ff_core::types::ExecutionId,
+        fields: &[&str],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
+        if fields.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // Cross-check: `partition` and `execution_id.partition()` must
+        // agree. A mismatch would silently read the wrong row (or miss)
+        // on Valkey via the `{p:N}` key tag, so surface it explicitly
+        // as a validation error here.
+        let derived: u16 = execution_id.partition();
+        if partition.index != derived {
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: format!(
+                    "read_exec_core_fields: partition mismatch (arg={}, eid={})",
+                    partition.index, derived
+                ),
+            });
+        }
+        let partition_key: i16 = partition.index as i16;
+        let exec_uuid = crate::exec_core::eid_uuid(execution_id);
+
+        // Build a single SELECT that projects each requested field to
+        // a text value. Fields are classified:
+        //  - canonical columns (lane_id, lifecycle_phase,
+        //    ownership_state, eligibility_state, public_state,
+        //    attempt_state, blocking_reason, cancellation_reason,
+        //    cancelled_by, attempt_index, flow_id, priority,
+        //    created_at_ms, terminal_at_ms, deadline_at_ms): CAST the
+        //    column to text. Scanner-facing aliases (current_attempt_index
+        //    → attempt_index, completed_at → terminal_at_ms,
+        //    cancel_reason → cancellation_reason) project the canonical
+        //    column.
+        //  - `required_capabilities` is `text[]` on PG; projected as CSV
+        //    via `array_to_string(..., ',')` to match Valkey's HMGET
+        //    string shape.
+        //  - `raw_fields` JSONB-resident names (current_waitpoint_id,
+        //    current_worker_instance_id, budget_ids, quota_policy_id)
+        //    project via `raw_fields ->> '<field>'`.
+        //  - Unknown names project NULL (absent-field parity with
+        //    Valkey HMGET).
+        let mut projections: Vec<String> = Vec::with_capacity(fields.len());
+        for field in fields {
+            let expr = match *field {
+                // Canonical exec_core columns.
+                "lane_id" | "lifecycle_phase" | "ownership_state" | "eligibility_state"
+                | "public_state" | "attempt_state" | "blocking_reason" | "cancellation_reason"
+                | "cancelled_by" => format!("{f}::text", f = field),
+                "attempt_index" => "attempt_index::text".to_string(),
+                "flow_id" => "flow_id::text".to_string(),
+                "priority" => "priority::text".to_string(),
+                "created_at_ms" => "created_at_ms::text".to_string(),
+                "terminal_at_ms" => "terminal_at_ms::text".to_string(),
+                "deadline_at_ms" => "deadline_at_ms::text".to_string(),
+                // Scanner-facing aliases that scan the same data from
+                // different angles.
+                "current_attempt_index" => "attempt_index::text".to_string(),
+                "completed_at" => "terminal_at_ms::text".to_string(),
+                "cancel_reason" => "cancellation_reason::text".to_string(),
+                // required_capabilities is `text[]` on PG; scanner
+                // callers expect a CSV string on Valkey. Convert.
+                "required_capabilities" => {
+                    "array_to_string(required_capabilities, ',')".to_string()
+                }
+                // Everything else lives under raw_fields JSONB.
+                other => {
+                    // Strict allowlist of raw_fields names the scanner
+                    // code reads. Any other name returns NULL.
+                    match other {
+                        "current_waitpoint_id"
+                        | "current_worker_instance_id"
+                        | "budget_ids"
+                        | "quota_policy_id" => format!("raw_fields ->> '{other}'"),
+                        _ => "NULL".to_string(),
+                    }
+                }
+            };
+            projections.push(expr);
+        }
+        let projection_sql = projections.join(", ");
+        let query = format!(
+            "SELECT {projection_sql} FROM ff_exec_core \
+             WHERE partition_key = $1 AND execution_id = $2"
+        );
+        let row_opt = sqlx::query(&query)
+            .bind(partition_key)
+            .bind(exec_uuid)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| EngineError::Transport {
+                backend: "postgres",
+                source: format!("read_exec_core_fields: {e}").into(),
+            })?;
+
+        let mut out = std::collections::HashMap::with_capacity(fields.len());
+        if let Some(row) = row_opt {
+            use sqlx::Row;
+            for (idx, field) in fields.iter().enumerate() {
+                let val: Option<String> =
+                    row.try_get(idx).map_err(|e| EngineError::Transport {
+                        backend: "postgres",
+                        source: format!("read_exec_core_fields[{field}]: {e}").into(),
+                    })?;
+                out.insert((*field).to_string(), val);
+            }
+        } else {
+            for field in fields {
+                out.insert((*field).to_string(), None);
+            }
+        }
+        Ok(out)
+    }
+
+    // ── PR-7b Wave 0a: clock primitive ──
+
+    async fn server_time_ms(&self) -> Result<u64, EngineError> {
+        // `clock_timestamp()` — `now()` returns the transaction start
+        // timestamp and would be stale under any long-running tx.
+        // Scanners use this to compute "due" windows, so the wall-
+        // clock read must be fresh. Matches the `flow.rs` convention.
+        let ms: i64 = sqlx::query_scalar(
+            "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+        )
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| EngineError::Transport {
+                backend: "postgres",
+                source: format!("server_time_ms: {e}").into(),
+            })?;
+        if ms < 0 {
+            return Err(EngineError::Transport {
+                backend: "postgres",
+                source: "server_time_ms: negative epoch".into(),
+            });
+        }
+        Ok(ms as u64)
+    }
 }
 
 /// Resolve a `CompletionPayload` to the matching
