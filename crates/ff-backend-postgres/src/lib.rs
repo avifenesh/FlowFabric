@@ -1603,15 +1603,23 @@ impl EngineBackend for PostgresBackend {
 
         // Build a single SELECT that projects each requested field to
         // a text value. Fields are classified:
-        //  - canonical column (lane_id, lifecycle_phase, ...): CAST the
-        //    column to text.
-        //  - `raw_fields` JSONB resident (current_attempt_index,
-        //    current_waitpoint_id, current_worker_instance_id,
-        //    budget_ids, quota_policy_id, completed_at, cancel_reason,
-        //    cancelled_by, required_capabilities-csv, public_state-extras,
-        //    etc.): `raw_fields ->> '<field>'`.
-        // Unknown fields project NULL (absent-field parity with Valkey
-        // HMGET).
+        //  - canonical columns (lane_id, lifecycle_phase,
+        //    ownership_state, eligibility_state, public_state,
+        //    attempt_state, blocking_reason, cancellation_reason,
+        //    cancelled_by, attempt_index, flow_id, priority,
+        //    created_at_ms, terminal_at_ms, deadline_at_ms): CAST the
+        //    column to text. Scanner-facing aliases (current_attempt_index
+        //    → attempt_index, completed_at → terminal_at_ms,
+        //    cancel_reason → cancellation_reason) project the canonical
+        //    column.
+        //  - `required_capabilities` is `text[]` on PG; projected as CSV
+        //    via `array_to_string(..., ',')` to match Valkey's HMGET
+        //    string shape.
+        //  - `raw_fields` JSONB-resident names (current_waitpoint_id,
+        //    current_worker_instance_id, budget_ids, quota_policy_id)
+        //    project via `raw_fields ->> '<field>'`.
+        //  - Unknown names project NULL (absent-field parity with
+        //    Valkey HMGET).
         let mut projections: Vec<String> = Vec::with_capacity(fields.len());
         for field in fields {
             let expr = match *field {
@@ -1687,7 +1695,13 @@ impl EngineBackend for PostgresBackend {
     // ── PR-7b Wave 0a: clock primitive ──
 
     async fn server_time_ms(&self) -> Result<u64, EngineError> {
-        let ms: i64 = sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint")
+        // `clock_timestamp()` — `now()` returns the transaction start
+        // timestamp and would be stale under any long-running tx.
+        // Scanners use this to compute "due" windows, so the wall-
+        // clock read must be fresh. Matches the `flow.rs` convention.
+        let ms: i64 = sqlx::query_scalar(
+            "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+        )
             .fetch_one(self.pool())
             .await
             .map_err(|e| EngineError::Transport {

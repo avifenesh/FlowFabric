@@ -2504,10 +2504,10 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Returns the backend's current wall-clock epoch milliseconds.
     ///
     /// Used by 15 scanners to compute "due" thresholds before issuing
-    /// per-partition due-scans. Previously a Valkey-only helper at
-    /// `crate::scanner::lease_expiry::server_time_ms(client)` issuing
-    /// `TIME`; this trait method is the backend-agnostic replacement
-    /// (cairn #436 / PR-7b Wave 0a).
+    /// per-partition due-scans. Previously a Valkey-only helper in
+    /// `ff-engine`'s `scanner::lease_expiry` issuing `TIME`; this
+    /// trait method is the backend-agnostic replacement (cairn #436 /
+    /// PR-7b Wave 0a).
     ///
     /// Every in-tree backend overrides. The default falls back to
     /// `SystemTime::now()` so out-of-tree `EngineBackend` impls (e.g.
@@ -2515,7 +2515,10 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// → v0.13.
     ///
     /// - **Valkey:** `TIME` command.
-    /// - **Postgres:** `SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint`.
+    /// - **Postgres:** `SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint`
+    ///   (not `now()` — `now()` is the transaction start timestamp,
+    ///   which is stale under any long-running tx; scanners need the
+    ///   true wall-clock read).
     /// - **SQLite:** `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`.
     #[cfg(feature = "core")]
     async fn server_time_ms(&self) -> Result<u64, EngineError> {
@@ -3207,6 +3210,38 @@ mod tests {
         {
             Err(EngineError::Unavailable { op }) => {
                 assert_eq!(op, "trim_retention");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    // ── read_exec_core_fields (PR-7b Wave 0a) ──
+
+    /// Default impl returns `Unavailable { op: "read_exec_core_fields" }`
+    /// so out-of-tree backends that pre-date v0.13 keep compiling while
+    /// surfacing a typed error on call. Empty-field input short-circuits
+    /// to `Ok(empty map)` in all in-tree impls; the default is triggered
+    /// only when the trait method itself is un-overridden.
+    #[cfg(feature = "core")]
+    #[tokio::test]
+    async fn default_read_exec_core_fields_is_unavailable() {
+        use crate::partition::{Partition, PartitionFamily};
+
+        let b = DefaultBackend;
+        let partition = Partition {
+            family: PartitionFamily::Execution,
+            index: 0,
+        };
+        let eid = ExecutionId::parse(
+            "{fp:0}:66666666-6666-6666-6666-666666666666",
+        )
+        .unwrap();
+        match b
+            .read_exec_core_fields(partition, &eid, &["lane_id"])
+            .await
+        {
+            Err(EngineError::Unavailable { op }) => {
+                assert_eq!(op, "read_exec_core_fields");
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }

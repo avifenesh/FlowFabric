@@ -48,7 +48,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   engine against a pure-Rust mock and asserts clean shutdown.
 - **PR-7b Wave 0a: `EngineBackend::server_time_ms` — backend-agnostic
   wall-clock primitive.** Valkey (`TIME`), Postgres
-  (`EXTRACT(EPOCH FROM now())`), and SQLite (`julianday('now')`) all
+  (`EXTRACT(EPOCH FROM clock_timestamp())` — not `now()`, which is the
+  transaction start timestamp), and SQLite (`julianday('now')`) all
   override; a `SystemTime::now()` default keeps out-of-tree impls
   source-compatible. Used internally by 15 scanners to compute "due"
   thresholds. Replaces the Valkey-only
