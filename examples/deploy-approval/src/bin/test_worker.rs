@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let config = WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(&args.host, args.port),
+        backend: Some(ff_core::backend::BackendConfig::valkey(&args.host, args.port)),
         worker_id: ff_core::types::WorkerId::new(format!("deploy-test-{}", args.kind)),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
             "deploy-test-{}-{}",

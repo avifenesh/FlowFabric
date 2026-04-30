@@ -49,7 +49,7 @@ async fn seed_partition_config(tc: &TestCluster) {
 
 async fn build_worker(suffix: &str) -> ff_sdk::FlowFabricWorker {
     let cfg = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: WorkerId::new(format!("list-edges-worker-{suffix}")),
         worker_instance_id: WorkerInstanceId::new(format!("list-edges-inst-{suffix}")),
         namespace: Namespace::new(NS),

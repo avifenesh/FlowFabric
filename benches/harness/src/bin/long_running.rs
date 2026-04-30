@@ -1051,10 +1051,10 @@ async fn drive_worker(
 ) -> Result<WorkerOutcome> {
     let instance_id = format!("bench-worker-{wi}-{}", uuid::Uuid::new_v4());
     let config = WorkerConfig {
-        backend: ff_core::backend::BackendConfig::valkey(
+        backend: Some(ff_core::backend::BackendConfig::valkey(
             env.valkey_host.clone(),
             env.valkey_port,
-        ),
+        )),
         worker_id: ff_core::types::WorkerId::new(format!("bench-worker-{wi}")),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(instance_id),
         namespace: ff_core::types::Namespace::new(&env.namespace),

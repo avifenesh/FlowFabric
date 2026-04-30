@@ -22,7 +22,34 @@ use ff_core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 /// break); construct via struct literal.
 pub struct WorkerConfig {
     /// Backend connection + shared timeouts / retry policy.
-    pub backend: BackendConfig,
+    ///
+    /// **v0.13 ergonomics fix (cairn, feedback_sdk_reclaim_ergonomics
+    /// Finding 2):** this field is only consumed by
+    /// [`FlowFabricWorker::connect`] (the URL-based Valkey-native
+    /// entry point that dials a fresh `ferriskey::Client`).
+    /// [`FlowFabricWorker::connect_with`] — the backend-agnostic
+    /// entry point that takes a pre-built `Arc<dyn EngineBackend>` —
+    /// ignores it entirely. Pre-v0.13 this field was required and
+    /// `connect_with` callers had to supply a placeholder
+    /// `BackendConfig::valkey(...)` just to satisfy the struct
+    /// literal; the SC-10 `incident-remediation` example surfaced
+    /// this as a rough edge.
+    ///
+    /// * `Some(cfg)` + [`FlowFabricWorker::connect`]: dial using
+    ///   `cfg` (unchanged behaviour).
+    /// * `None` + [`FlowFabricWorker::connect`]: rejected with
+    ///   [`SdkError::Config`]. The URL-based path needs a
+    ///   `BackendConfig` to dial.
+    /// * `None` + [`FlowFabricWorker::connect_with`]: clean —
+    ///   the injected backend is authoritative.
+    /// * `Some(cfg)` + [`FlowFabricWorker::connect_with`]:
+    ///   accepted but logs a WARN (`cfg` is ignored — the
+    ///   injected backend is authoritative).
+    ///
+    /// [`FlowFabricWorker::connect`]: crate::FlowFabricWorker::connect
+    /// [`FlowFabricWorker::connect_with`]: crate::FlowFabricWorker::connect_with
+    /// [`SdkError::Config`]: crate::SdkError::Config
+    pub backend: Option<BackendConfig>,
     /// Logical worker identity (e.g., "gpu-worker-pool-1").
     pub worker_id: WorkerId,
     /// Concrete worker process/runtime instance identity (e.g., container ID).

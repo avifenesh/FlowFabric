@@ -5,6 +5,30 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`WorkerConfig.backend` is now `Option<BackendConfig>` (SC-10
+  ergonomics follow-up, cairn-reported via
+  `feedback_sdk_reclaim_ergonomics.md` Finding 2).** Pre-v0.13 the
+  field was eager `BackendConfig`, but only
+  [`FlowFabricWorker::connect`] consumed it; the backend-agnostic
+  [`FlowFabricWorker::connect_with`] path ignored it entirely,
+  forcing `connect_with` callers to carry a placeholder
+  `BackendConfig::valkey(...)` just to satisfy the struct literal.
+  The v0.12 SC-10 `incident-remediation` example surfaced this as a
+  rough edge for the SQLite supervisor path. Semantics:
+  - `Some(cfg)` + `connect` — unchanged (dial using `cfg`).
+  - `None` + `connect` — rejected with `SdkError::Config` (the
+    URL-based path needs a `BackendConfig` to dial).
+  - `None` + `connect_with` — clean, no placeholder needed.
+  - `Some(cfg)` + `connect_with` — accepted, logs a `tracing::warn!`
+    because `cfg` is ignored (the injected backend is authoritative).
+  Existing `connect` callers migrate by wrapping their existing
+  `BackendConfig` in `Some(...)`; `connect_with` callers can drop
+  the placeholder and pass `None`. See
+  [`docs/CONSUMER_MIGRATION_0.13.md`](docs/CONSUMER_MIGRATION_0.13.md)
+  for the before/after snippet.
+
 ### Added
 
 - **PR-7b Cluster 1: foundation scanner operations on `EngineBackend`

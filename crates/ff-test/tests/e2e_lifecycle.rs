@@ -4370,7 +4370,7 @@ async fn test_max_concurrent_tasks_enforcement() {
 
     // Build a worker with max_concurrent_tasks = 2
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new("concurrency-test-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("concurrency-test-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -4956,7 +4956,7 @@ async fn test_claim_from_grant_rejects_at_capacity() {
     // is guaranteed to saturate. Use the standard worker identity
     // so both grants are issued to this worker_id.
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new(WORKER),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(WORKER_INST),
         namespace: ff_core::types::Namespace::new(NS),
@@ -5039,7 +5039,7 @@ async fn test_claim_from_grant_rejects_at_capacity() {
     // on the grant passes — we're modelling a retry from a fresh
     // worker process with free capacity, not a different identity.
     let second_worker_config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new(WORKER),
         // Distinct instance id so the alive-key SET NX guard in
         // `FlowFabricWorker::connect` doesn't reject us as a
@@ -5536,7 +5536,7 @@ async fn test_sdk_suspend_signal_resume_reclaim() {
 
     // Build SDK worker
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new("suspend-test-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("suspend-test-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -5727,7 +5727,7 @@ async fn test_sdk_all_methods_smoke() {
         .unwrap();
 
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new("sdk-smoke-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("sdk-smoke-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -5817,7 +5817,7 @@ async fn test_sdk_claim_retry_attempt_index() {
         .unwrap();
 
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new("retry-idx-worker"),
         worker_instance_id: ff_core::types::WorkerInstanceId::new("retry-idx-inst"),
         namespace: ff_core::types::Namespace::new(NS),
@@ -8863,7 +8863,7 @@ async fn build_reclaim_test_worker(
     worker_instance_id: &str,
 ) -> ff_sdk::FlowFabricWorker {
     let config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new(worker_id),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(worker_instance_id),
         namespace: ff_core::types::Namespace::new(NS),
@@ -9241,7 +9241,7 @@ async fn test_claim_from_resume_grant_rejects_at_capacity() {
     // Build a worker with max_concurrent_tasks=1 so the second
     // reclaim is guaranteed to saturate.
     let worker_config = ff_sdk::WorkerConfig {
-        backend: ff_test::fixtures::backend_config_from_env(),
+        backend: Some(ff_test::fixtures::backend_config_from_env()),
         worker_id: ff_core::types::WorkerId::new(WORKER),
         worker_instance_id: ff_core::types::WorkerInstanceId::new(WORKER_INST),
         namespace: ff_core::types::Namespace::new(NS),

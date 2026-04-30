@@ -387,11 +387,16 @@ async fn build_worker(
     worker_instance_id: &str,
     lane: &LaneId,
 ) -> Result<FlowFabricWorker> {
-    // `BackendConfig` is only consulted by `FlowFabricWorker::connect`
-    // (the Valkey-native entry point); `connect_with` ignores it and
-    // relies entirely on the injected `Arc<dyn EngineBackend>`.
+    // v0.13 ergonomics fix (feedback_sdk_reclaim_ergonomics Finding 2):
+    // `WorkerConfig.backend` is `Option<BackendConfig>` and the
+    // `connect_with` path — which takes a pre-built
+    // `Arc<dyn EngineBackend>` — accepts `None`. Pre-v0.13 this
+    // example carried a placeholder `BackendConfig::valkey("127.0.0.1",
+    // 6379)` here purely to satisfy the struct literal even though
+    // the SQLite supervisor never dialed Valkey. Passing `None` makes
+    // the intent explicit.
     let config = WorkerConfig {
-        backend: BackendConfig::valkey("127.0.0.1", 6379),
+        backend: None,
         worker_id: WorkerId::new(worker_id),
         worker_instance_id: WorkerInstanceId::new(worker_instance_id),
         namespace: Namespace::new("incidents"),
