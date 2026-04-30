@@ -119,6 +119,8 @@ mod signal_event;
 pub mod stream;
 pub mod suspend;
 pub mod suspend_ops;
+#[cfg(feature = "core")]
+pub(crate) mod typed_ops;
 pub mod version;
 
 pub use completion::{PostgresCompletionStream, COMPLETION_CHANNEL};
@@ -1585,6 +1587,16 @@ impl EngineBackend for PostgresBackend {
             filter,
         )
         .await
+    }
+
+    // ── PR-7b / #453: typed-FCALL bodies ──
+
+    #[cfg(feature = "core")]
+    async fn renew_lease(
+        &self,
+        args: ff_core::contracts::RenewLeaseArgs,
+    ) -> Result<ff_core::contracts::RenewLeaseResult, EngineError> {
+        crate::typed_ops::renew_lease(self.pool(), args).await
     }
 
     // ── PR-7b Wave 0a: exec_core field read ──

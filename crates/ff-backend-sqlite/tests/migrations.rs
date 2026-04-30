@@ -127,8 +127,8 @@ async fn sqlx_migration_ledger_records_all_14() {
             .await
             .expect("query _sqlx_migrations");
     assert_eq!(
-        count, 16,
-        "expected 16 successful migrations (0001..=0014 + 0016 + 0017), got {count}"
+        count, 17,
+        "expected 17 successful migrations (0001..=0014 + 0016 + 0017 + 0018), got {count}"
     );
 }
 
