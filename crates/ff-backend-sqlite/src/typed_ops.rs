@@ -42,11 +42,12 @@
 //! catches the same violations Valkey's full-triple check catches.
 
 use ff_core::contracts::{
-    CompleteExecutionArgs, CompleteExecutionResult, RenewLeaseArgs, RenewLeaseResult,
+    CompleteExecutionArgs, CompleteExecutionResult, FailExecutionArgs, FailExecutionResult,
+    RenewLeaseArgs, RenewLeaseResult, ResumeExecutionArgs, ResumeExecutionResult,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
 use ff_core::state::PublicState;
-use ff_core::types::{CancelSource, TimestampMs};
+use ff_core::types::{AttemptIndex, CancelSource, TimestampMs};
 use sqlx::Row;
 use sqlx::SqlitePool;
 
@@ -406,6 +407,408 @@ pub(crate) async fn complete_execution(
                 execution_id,
                 public_state: PublicState::Completed,
             })
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+/// Parsed retry policy envelope (mirror of PG helper at
+/// `ff-backend-postgres/src/typed_ops.rs::parse_retry_policy`).
+struct ParsedRetryPolicy {
+    max_retries: u32,
+    backoff: serde_json::Value,
+}
+
+fn parse_retry_policy(s: &str) -> ParsedRetryPolicy {
+    if s.is_empty() {
+        return ParsedRetryPolicy {
+            max_retries: 0,
+            backoff: serde_json::Value::Null,
+        };
+    }
+    let v: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+    let max_retries = v
+        .get("max_retries")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0) as u32;
+    let backoff = v.get("backoff").cloned().unwrap_or(serde_json::Value::Null);
+    ParsedRetryPolicy {
+        max_retries,
+        backoff,
+    }
+}
+
+fn compute_retry_delay_ms(backoff: &serde_json::Value, retry_count: u32) -> u64 {
+    let kind = backoff.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match kind {
+        "exponential" => {
+            let initial = backoff
+                .get("initial_delay_ms")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1_000);
+            let max_d = backoff
+                .get("max_delay_ms")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(60_000);
+            let mult = backoff
+                .get("multiplier")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(2.0);
+            let exp = mult.powi(retry_count as i32);
+            let delay = (initial as f64) * exp;
+            (delay.min(max_d as f64)) as u64
+        }
+        "fixed" => backoff
+            .get("delay_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(1_000),
+        _ => 1_000,
+    }
+}
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::fail_execution`].
+///
+/// Mirrors PG at `ff-backend-postgres/src/typed_ops.rs::fail_execution`
+/// with the retry/terminal branch split:
+///
+/// - Retry path (`retry_count < policy.max_retries`): flip exec_core
+///   to `runnable` / `delayed`; stash `pending_retry_reason`,
+///   `pending_previous_attempt_index`, bumped `retry_count`,
+///   `delay_until`, `failure_reason` in `raw_fields`. Return
+///   `RetryScheduled { delay_until, next_attempt_index }`.
+/// - Terminal path: flip exec_core to `terminal` / `failed`; emit
+///   completion outbox with `outcome='failed'` + lease-revoked outbox.
+///   Return `TerminalFailed`.
+///
+/// Fence-or-operator-override gate matches `complete_execution`.
+pub(crate) async fn fail_execution(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    args: FailExecutionArgs,
+) -> Result<FailExecutionResult, EngineError> {
+    let is_operator_override = matches!(args.source, CancelSource::OperatorOverride);
+    if args.fence.is_none() && !is_operator_override {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "fence_required".into(),
+        });
+    }
+
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let attempt_index = i64::from(args.attempt_index.0);
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let result = async {
+        // Read attempt row for fence.
+        let attempt_row = sqlx::query(q_attempt::SELECT_ATTEMPT_EPOCH_SQL)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        let Some(attempt_row) = attempt_row else {
+            return Err(EngineError::NotFound { entity: "attempt" });
+        };
+        let observed_epoch_i: i64 =
+            attempt_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+        let observed_epoch = u64::try_from(observed_epoch_i).unwrap_or(0);
+
+        if let Some(fence) = &args.fence
+            && observed_epoch != fence.lease_epoch.0
+        {
+            return Err(EngineError::State(StateKind::StaleLease));
+        }
+
+        // Read exec_core for lifecycle + retry_count.
+        let exec_row = sqlx::query(
+            r#"
+            SELECT lifecycle_phase,
+                   ownership_state,
+                   COALESCE(CAST(json_extract(raw_fields, '$.retry_count') AS INTEGER), 0)
+                       AS retry_count,
+                   COALESCE(json_extract(raw_fields, '$.current_attempt_id'), '')
+                       AS current_attempt_id,
+                   COALESCE(json_extract(raw_fields, '$.terminal_outcome'), 'none')
+                       AS terminal_outcome
+              FROM ff_exec_core
+             WHERE partition_key = ?1 AND execution_id = ?2
+            "#,
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+        let Some(exec_row) = exec_row else {
+            return Err(EngineError::NotFound { entity: "execution" });
+        };
+        let ownership_state: String = exec_row
+            .try_get("ownership_state")
+            .map_err(map_sqlx_error)?;
+        if ownership_state == "lease_revoked" {
+            return Err(EngineError::State(StateKind::LeaseRevoked));
+        }
+        let lifecycle_phase: String = exec_row
+            .try_get("lifecycle_phase")
+            .map_err(map_sqlx_error)?;
+        if lifecycle_phase != "active" {
+            let terminal_outcome: String =
+                exec_row.try_get("terminal_outcome").map_err(map_sqlx_error)?;
+            let current_attempt_id: String = exec_row
+                .try_get("current_attempt_id")
+                .map_err(map_sqlx_error)?;
+            return Err(EngineError::Contention(ContentionKind::ExecutionNotActive {
+                terminal_outcome,
+                lease_epoch: observed_epoch.to_string(),
+                lifecycle_phase,
+                attempt_id: current_attempt_id,
+            }));
+        }
+        let retry_count_i: i64 = exec_row.try_get("retry_count").map_err(map_sqlx_error)?;
+        let retry_count = u32::try_from(retry_count_i.max(0)).unwrap_or(0);
+
+        let policy = parse_retry_policy(&args.retry_policy_json);
+        let can_retry = retry_count < policy.max_retries;
+
+        let now = now_ms();
+
+        // Mark attempt terminal (both branches).
+        sqlx::query(
+            "UPDATE ff_attempt \
+                SET terminal_at_ms = ?1, outcome = 'failure', lease_expires_at_ms = NULL \
+              WHERE partition_key = ?2 AND execution_id = ?3 AND attempt_index = ?4",
+        )
+        .bind(now)
+        .bind(part)
+        .bind(exec_uuid)
+        .bind(attempt_index)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if can_retry {
+            let backoff_ms = compute_retry_delay_ms(&policy.backoff, retry_count);
+            let delay_until = now.saturating_add(backoff_ms as i64);
+            let next_attempt_index = attempt_index.saturating_add(1) as u32;
+
+            // Retry path: flip exec_core to runnable/delayed + stash
+            // pending retry lineage. SQLite `json_set` accepts multiple
+            // key/value pairs in one call — mirrors PG's
+            // `raw_fields || patch` semantic observably.
+            sqlx::query(
+                r#"
+                UPDATE ff_exec_core
+                   SET lifecycle_phase = 'runnable',
+                       ownership_state = 'unowned',
+                       eligibility_state = 'not_eligible_until_time',
+                       attempt_state = 'pending_retry_attempt',
+                       blocking_reason = 'waiting_for_retry_backoff',
+                       public_state = 'delayed',
+                       raw_fields = json_set(
+                           raw_fields,
+                           '$.pending_retry_reason', ?1,
+                           '$.pending_previous_attempt_index', ?2,
+                           '$.retry_count', ?3,
+                           '$.delay_until', ?4,
+                           '$.failure_reason', ?1
+                       )
+                 WHERE partition_key = ?5 AND execution_id = ?6
+                "#,
+            )
+            .bind(args.failure_reason.clone())
+            .bind(attempt_index.to_string())
+            .bind((retry_count + 1).to_string())
+            .bind(delay_until.to_string())
+            .bind(part)
+            .bind(exec_uuid)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let lease_ev = insert_lease_event(&mut conn, part, exec_uuid, "revoked", now).await?;
+            let emits = vec![(OutboxChannel::LeaseHistory, lease_ev)];
+
+            return Ok::<_, EngineError>((
+                FailExecutionResult::RetryScheduled {
+                    delay_until: TimestampMs::from_millis(delay_until),
+                    next_attempt_index: AttemptIndex::new(next_attempt_index),
+                },
+                emits,
+            ));
+        }
+
+        // Terminal path.
+        sqlx::query(
+            r#"
+            UPDATE ff_exec_core
+               SET lifecycle_phase = 'terminal',
+                   ownership_state = 'unowned',
+                   eligibility_state = 'not_applicable',
+                   attempt_state = 'attempt_terminal',
+                   public_state = 'failed',
+                   terminal_at_ms = ?1,
+                   raw_fields = json_set(
+                       raw_fields,
+                       '$.failure_reason', ?2,
+                       '$.terminal_outcome', 'failed'
+                   )
+             WHERE partition_key = ?3 AND execution_id = ?4
+            "#,
+        )
+        .bind(now)
+        .bind(args.failure_reason.clone())
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let completion_ev =
+            insert_completion_event_ev(&mut conn, part, exec_uuid, "failed", now).await?;
+        let lease_ev = insert_lease_event(&mut conn, part, exec_uuid, "revoked", now).await?;
+        let emits = vec![
+            (OutboxChannel::Completion, completion_ev),
+            (OutboxChannel::LeaseHistory, lease_ev),
+        ];
+
+        Ok((FailExecutionResult::TerminalFailed, emits))
+    }
+    .await;
+
+    match result {
+        Ok((outcome, emits)) => {
+            commit_or_rollback(&mut conn).await?;
+            dispatch_emits(pubsub, emits);
+            Ok(outcome)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::resume_execution`].
+///
+/// Mirrors PG at `ff-backend-postgres/src/typed_ops.rs::resume_execution`.
+/// No fence (caller is operator or signal delivery). Validates
+/// suspended-state + suspension_current row presence, flips to
+/// runnable, clears waitpoint/suspension refs, DELETEs suspension row.
+pub(crate) async fn resume_execution(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    args: ResumeExecutionArgs,
+) -> Result<ResumeExecutionResult, EngineError> {
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let result = async {
+        let exec_row = sqlx::query(
+            "SELECT lifecycle_phase FROM ff_exec_core \
+             WHERE partition_key = ?1 AND execution_id = ?2",
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+        let Some(exec_row) = exec_row else {
+            return Err(EngineError::NotFound { entity: "execution" });
+        };
+        let lifecycle_phase: String = exec_row
+            .try_get("lifecycle_phase")
+            .map_err(map_sqlx_error)?;
+        if lifecycle_phase != "suspended" {
+            return Err(EngineError::State(StateKind::ExecutionNotSuspended));
+        }
+
+        let susp_row = sqlx::query(
+            "SELECT 1 FROM ff_suspension_current \
+             WHERE partition_key = ?1 AND execution_id = ?2",
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+        if susp_row.is_none() {
+            return Err(EngineError::State(StateKind::ExecutionNotSuspended));
+        }
+
+        let (eligibility_state, blocking_reason, public_state) = if args.resume_delay_ms > 0 {
+            (
+                "not_eligible_until_time",
+                "waiting_for_resume_delay",
+                PublicState::Delayed,
+            )
+        } else {
+            (
+                "eligible_now",
+                "waiting_for_worker",
+                PublicState::Waiting,
+            )
+        };
+        let public_state_str = match public_state {
+            PublicState::Delayed => "delayed",
+            PublicState::Waiting => "waiting",
+            _ => "waiting",
+        };
+
+        // `trigger_type` is advisory; recorded nowhere on the PG path
+        // and we match that here. Suppress unused-field lint:
+        let _ = &args.trigger_type;
+
+        sqlx::query(
+            r#"
+            UPDATE ff_exec_core
+               SET lifecycle_phase = 'runnable',
+                   ownership_state = 'unowned',
+                   eligibility_state = ?1,
+                   attempt_state = 'attempt_interrupted',
+                   blocking_reason = ?2,
+                   public_state = ?3,
+                   raw_fields = json_set(
+                       raw_fields,
+                       '$.current_suspension_id', '',
+                       '$.current_waitpoint_id', ''
+                   )
+             WHERE partition_key = ?4 AND execution_id = ?5
+            "#,
+        )
+        .bind(eligibility_state)
+        .bind(blocking_reason)
+        .bind(public_state_str)
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(
+            "DELETE FROM ff_suspension_current \
+             WHERE partition_key = ?1 AND execution_id = ?2",
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok::<_, EngineError>(public_state)
+    }
+    .await;
+
+    match result {
+        Ok(public_state) => {
+            commit_or_rollback(&mut conn).await?;
+            let _ = pubsub;
+            Ok(ResumeExecutionResult::Resumed { public_state })
         }
         Err(e) => {
             rollback_quiet(&mut conn).await;

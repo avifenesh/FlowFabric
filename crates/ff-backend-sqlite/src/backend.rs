@@ -2615,6 +2615,24 @@ impl EngineBackend for SqliteBackend {
             .await
     }
 
+    async fn fail_execution(
+        &self,
+        args: ff_core::contracts::FailExecutionArgs,
+    ) -> Result<ff_core::contracts::FailExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::typed_ops::fail_execution(pool, pubsub, args.clone())).await
+    }
+
+    async fn resume_execution(
+        &self,
+        args: ff_core::contracts::ResumeExecutionArgs,
+    ) -> Result<ff_core::contracts::ResumeExecutionResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::typed_ops::resume_execution(pool, pubsub, args.clone())).await
+    }
+
     async fn progress(
         &self,
         handle: &Handle,
