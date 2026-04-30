@@ -3292,7 +3292,7 @@ impl EngineBackend for SqliteBackend {
 
     async fn read_exec_core_fields(
         &self,
-        _partition: ff_core::partition::Partition,
+        partition: ff_core::partition::Partition,
         execution_id: &ff_core::types::ExecutionId,
         fields: &[&str],
     ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
@@ -3300,6 +3300,15 @@ impl EngineBackend for SqliteBackend {
             return Ok(std::collections::HashMap::new());
         }
         let (part, exec_uuid) = split_exec_id(execution_id)?;
+        if part as u16 != partition.index {
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: format!(
+                    "read_exec_core_fields: partition mismatch (arg={}, eid={})",
+                    partition.index, part
+                ),
+            });
+        }
 
         // Classify fields: canonical columns CAST to text; known
         // raw_fields JSON names via json_extract; unknown names → NULL.

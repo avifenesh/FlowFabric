@@ -1591,14 +1591,28 @@ impl EngineBackend for PostgresBackend {
 
     async fn read_exec_core_fields(
         &self,
-        _partition: ff_core::partition::Partition,
+        partition: ff_core::partition::Partition,
         execution_id: &ff_core::types::ExecutionId,
         fields: &[&str],
     ) -> Result<std::collections::HashMap<String, Option<String>>, EngineError> {
         if fields.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let partition_key: i16 = execution_id.partition() as i16;
+        // Cross-check: `partition` and `execution_id.partition()` must
+        // agree. A mismatch would silently read the wrong row (or miss)
+        // on Valkey via the `{p:N}` key tag, so surface it explicitly
+        // as a validation error here.
+        let derived: u16 = execution_id.partition();
+        if partition.index != derived {
+            return Err(EngineError::Validation {
+                kind: ff_core::engine_error::ValidationKind::InvalidInput,
+                detail: format!(
+                    "read_exec_core_fields: partition mismatch (arg={}, eid={})",
+                    partition.index, derived
+                ),
+            });
+        }
+        let partition_key: i16 = partition.index as i16;
         let exec_uuid = crate::exec_core::eid_uuid(execution_id);
 
         // Build a single SELECT that projects each requested field to
