@@ -141,12 +141,11 @@ pub async fn verify_and_deliver(
         .map_err(|e| SignalBridgeError::Backend(SdkError::from(e)))?
         .ok_or(SignalBridgeError::UnknownWaitpoint)?;
 
-    // Constant-time compare — `subtle::ConstantTimeEq::ct_eq` returns
-    // `Choice` which is 0/1; `into()` produces a `bool`. Length
-    // mismatch short-circuits via ct_eq's own length check.
+    // Constant-time compare. `ConstantTimeEq::ct_eq` returns `Choice`;
+    // `bool::from(Choice)` is the idiomatic conversion.
     let stored_bytes = stored.as_bytes();
     let presented_bytes = presented.as_str().as_bytes();
-    if stored_bytes.ct_eq(presented_bytes).unwrap_u8() == 0 {
+    if !bool::from(stored_bytes.ct_eq(presented_bytes)) {
         return Err(SignalBridgeError::TokenMismatch);
     }
 
