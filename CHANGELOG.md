@@ -7,6 +7,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`scripts/run-all-examples.sh`** (phase 3a) — build-clean gate
+  that runs `cargo build --bins` across every `examples/*` Cargo
+  workspace and reports PASS/FAIL/SKIP per example. Exits non-zero
+  on any build failure. The mechanical starting point for the
+  CLAUDE.md §5 item 3 pre-tag check; the v0.13 release gate caught
+  three waitpoint-token blockers only because the rule was
+  tightened to "every example live-runs", but without a harness
+  the check was per-example manual shell work. `grafana` skips
+  (dashboard JSON only, no Cargo workspace). LLM-dependent
+  examples (`coding-agent`, `llm-race`) build clean without keys
+  and live-run in later pre-release-local phases — they're
+  intentionally out of CI scope. Filter with `FF_EXAMPLES_ONLY=a,b`.
+  Later phases (3b–3e) layer on live-run orchestration and CI
+  wiring.
 - **`FlowFabricWorker::claim_next_via_backend`** — un-gated
   scheduler-bypass scanner that drives claim through the
   `EngineBackend` trait. Replaces the `claim_next` feature-flag
