@@ -1200,6 +1200,26 @@ impl EngineBackend for PostgresBackend {
         budget::report_usage_admin_impl(&self.pool, &self.partition_config, budget_id, args).await
     }
 
+    // ── cairn #454 Phase 4a — per-execution ledger (option A) ────────
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.record_spend", skip_all)]
+    async fn record_spend(
+        &self,
+        args: ff_core::contracts::RecordSpendArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        budget::record_spend_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.release_budget", skip_all)]
+    async fn release_budget(
+        &self,
+        args: ff_core::contracts::ReleaseBudgetArgs,
+    ) -> Result<(), EngineError> {
+        budget::release_budget_impl(&self.pool, &self.partition_config, args).await
+    }
+
     // ── HMAC secret rotation (v0.7 migration-master Q4) ──
     //
     // Wave 4 replaces this stub with a single INSERT into
