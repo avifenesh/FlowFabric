@@ -101,9 +101,10 @@ pub mod snapshot;
 // so consumers can name `ClaimedTask` as a type.
 pub mod task;
 // v0.14 P1.2 — signal-bridge helper extracted from the v0.13
-// external-callback example. Uses `FlowFabricWorker::deliver_signal`
-// (Valkey-default-gated) so the module itself is gated in lockstep.
-#[cfg(feature = "valkey-default")]
+// external-callback example. Module is always compiled: every item it
+// names (`FlowFabricWorker::deliver_signal`, `Signal`, `SignalOutcome`,
+// `EngineBackend::read_waitpoint_token`) is available under
+// `--no-default-features --features sqlite` per RFC-023 Phase 1a.
 pub mod signal_bridge;
 // v0.12 PR-6: Valkey-specific connect preamble extracted from
 // `FlowFabricWorker::connect`. Gated behind `valkey-default` because

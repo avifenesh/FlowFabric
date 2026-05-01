@@ -45,7 +45,11 @@ use crate::task::{Signal, SignalOutcome};
 use crate::worker::FlowFabricWorker;
 use crate::SdkError;
 
-/// Outcome of a signal-bridge authentication + dispatch attempt.
+/// Error returned by a signal-bridge authentication + dispatch
+/// attempt. On success, [`verify_and_deliver`] returns the
+/// [`SignalOutcome`] from the underlying
+/// [`FlowFabricWorker::deliver_signal`] call; this enum only
+/// enumerates the rejection + fault cases.
 #[derive(Debug)]
 pub enum SignalBridgeError {
     /// The waitpoint has no stored token — it was consumed, expired,
