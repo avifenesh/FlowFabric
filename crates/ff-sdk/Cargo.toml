@@ -108,6 +108,11 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Constant-time byte comparison for the signal-bridge helper.
+# `subtle` is a well-audited rust-crypto crate, already pulled in
+# transitively by the workspace's crypto stack; adding it directly so
+# `ff_sdk::signal_bridge` doesn't depend on the transitive edge.
+subtle = { version = "2.5", default-features = false }
 # HTTP client for the admin REST surface (FlowFabricAdminClient).
 # default-features disabled to drop the native-tls backend; rustls is
 # what every other HTTP consumer in this workspace uses (ff-test,

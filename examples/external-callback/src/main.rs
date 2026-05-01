@@ -65,12 +65,12 @@ use ff_core::contracts::{
     SuspensionReasonCode, WaitpointBinding,
 };
 use ff_core::engine_backend::EngineBackend;
-use ff_core::partition::{Partition, PartitionFamily, PartitionKey};
 use ff_core::types::{
     AttemptIndex, ExecutionId, FlowId, LaneId, LeaseId, Namespace, SuspensionId, TimestampMs,
-    WaitpointId, WaitpointToken, WorkerId, WorkerInstanceId,
+    WaitpointToken, WorkerId, WorkerInstanceId,
 };
 use ff_sdk::admin::FlowFabricAdminClient;
+use ff_sdk::signal_bridge::{self, SignalBridgeError};
 use ff_sdk::task::Signal;
 use ff_sdk::{FlowFabricWorker, WorkerConfig};
 use tracing::info;
@@ -283,12 +283,13 @@ async fn run_sqlite() -> Result<()> {
     // flip one hex char in the issued token and watch the bridge reject.
     let tampered = tamper(&issued_token);
     info!(target: "external-actor", "[external-actor] (adversary attempt — posting with tampered token)");
-    match signal_bridge_verify_and_deliver(
+    match signal_bridge::verify_and_deliver_arc(
         &trait_obj,
         &worker,
         &exec_id,
         &waitpoint_id,
         &tampered,
+        callback_signal(tampered.clone()),
     )
     .await
     {
@@ -301,12 +302,13 @@ async fn run_sqlite() -> Result<()> {
 
     // Happy path: real token.
     info!(target: "external-actor", payload = "{approved: true}", "[external-actor] POST /callback with valid token");
-    signal_bridge_verify_and_deliver(
+    signal_bridge::verify_and_deliver_arc(
         &trait_obj,
         &worker,
         &exec_id,
         &waitpoint_id,
         &issued_token,
+        callback_signal(issued_token.clone()),
     )
     .await
     .map_err(|e| anyhow::anyhow!("signal-bridge deliver: {e}"))?;
@@ -349,102 +351,26 @@ async fn run_sqlite() -> Result<()> {
     Ok(())
 }
 
-// ────────────────────────────── signal-bridge shim ──────────────────────────────
+// ────────────────────────────── signal-bridge payload ──────────────────────────────
+//
+// The authentication + delivery shape (`verify_and_deliver` +
+// `SignalBridgeError`) lives in `ff_sdk::signal_bridge` as of v0.14;
+// this example constructs the domain-specific `Signal` payload the
+// bridge forwards on a successful HMAC check. Real callback bridges
+// would vary the signal name / category / source per integration.
 
-#[derive(Debug)]
-enum SignalBridgeError {
-    /// The waitpoint has no stored token (expired / already consumed /
-    /// never existed). Real bridges return HTTP 404.
-    UnknownWaitpoint,
-    /// Token presented by the caller does not match the stored token.
-    /// Real bridges return HTTP 401.
-    TokenMismatch,
-    /// Underlying backend / SDK failure.
-    Backend(anyhow::Error),
-}
-
-impl std::fmt::Display for SignalBridgeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownWaitpoint => write!(f, "unknown waitpoint"),
-            Self::TokenMismatch => write!(f, "token mismatch"),
-            Self::Backend(e) => write!(f, "backend: {e}"),
-        }
+fn callback_signal(token: WaitpointToken) -> Signal {
+    Signal {
+        signal_name: "callback".to_owned(),
+        signal_category: "external".to_owned(),
+        payload: Some(b"{\"approved\": true}".to_vec()),
+        source_type: "webhook".to_owned(),
+        source_identity: "approver@example.com".to_owned(),
+        idempotency_key: None,
+        // Overwritten by the bridge (see ff_sdk::signal_bridge rustdoc);
+        // supplied here for struct-completeness only.
+        waitpoint_token: token,
     }
-}
-
-/// The "signal-bridge" — authenticates an incoming callback POST
-/// against the stored waitpoint token, then dispatches a signal.
-///
-/// This is the shape cairn's control-plane signal-bridge implements
-/// in production: it reads the stored token via
-/// [`EngineBackend::read_waitpoint_token`] (#434), compares it
-/// constant-time against the HMAC presented by the external actor,
-/// and on match forwards through [`FlowFabricWorker::deliver_signal`].
-async fn signal_bridge_verify_and_deliver(
-    trait_obj: &Arc<dyn EngineBackend>,
-    worker: &FlowFabricWorker,
-    exec_id: &ExecutionId,
-    waitpoint_id: &WaitpointId,
-    presented: &WaitpointToken,
-) -> Result<(), SignalBridgeError> {
-    // Derive the partition key from the execution's own partition.
-    let partition = PartitionKey::from(&Partition {
-        family: PartitionFamily::Flow,
-        index: exec_id.partition(),
-    });
-
-    // #434 surface: read the stored token via the trait.
-    let stored = trait_obj
-        .read_waitpoint_token(partition, waitpoint_id)
-        .await
-        .map_err(|e| SignalBridgeError::Backend(e.into()))?
-        .ok_or(SignalBridgeError::UnknownWaitpoint)?;
-
-    // Constant-time compare — returns false immediately on length
-    // mismatch (acceptable leak: token length is not a secret, and all
-    // valid tokens share the `<kid>:<hex-digest>` shape with a
-    // fixed-size digest). The real bridge uses `subtle::ConstantTimeEq`;
-    // this example keeps the dependency footprint minimal and the
-    // `xor-accumulator` body below is constant-time for equal-length
-    // inputs, which is the security-relevant case (guarding against
-    // byte-timing oracles on the digest bytes).
-    if !constant_time_eq(stored.as_bytes(), presented.as_str().as_bytes()) {
-        return Err(SignalBridgeError::TokenMismatch);
-    }
-
-    // Forward through the public SDK signal surface. `deliver_signal`
-    // re-presents the token; the engine re-verifies HMAC server-side.
-    // The signal-bridge's token-check is defense-in-depth / early
-    // rejection — the authoritative check lives in the engine.
-    worker
-        .deliver_signal(
-            exec_id,
-            waitpoint_id,
-            Signal {
-                signal_name: "callback".to_owned(),
-                signal_category: "external".to_owned(),
-                payload: Some(b"{\"approved\": true}".to_vec()),
-                source_type: "webhook".to_owned(),
-                source_identity: "approver@example.com".to_owned(),
-                idempotency_key: None,
-                waitpoint_token: presented.clone(),
-            },
-        )
-        .await
-        .map_err(|e| SignalBridgeError::Backend(e.into()))?;
-    Ok(())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Flip one hex character of the signed digest so the HMAC compare
