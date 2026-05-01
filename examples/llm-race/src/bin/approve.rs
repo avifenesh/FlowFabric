@@ -5,15 +5,14 @@
 //! `Count { n: 2, DistinctSources }` resume condition counts it as a
 //! unique satisfier.
 //!
-//! The `--waitpoint-id` + `--waitpoint-token` pair is printed by the
-//! aggregator worker on suspend (look for
-//! `waitpoint_id=... waitpoint_token=...` in its log). ff-server dropped
-//! the token from `GET /v1/executions/{id}/pending-waitpoints` in v0.8.0
-//! (RFC-017 Stage E4); operators copy the values from the suspending
-//! worker's log. v0.14 adds an admin-surface `read_waitpoint_token` so
-//! this can go back to a fetch.
+//! The `--waitpoint-id` is printed by the aggregator worker on suspend.
+//! The raw HMAC `waitpoint_token` is fetched through the admin client's
+//! `read_waitpoint_token` helper (ff-sdk v0.14) — operators no longer
+//! copy it out of the worker's log.
 
 use clap::Parser;
+use ff_core::types::{ExecutionId, WaitpointId};
+use ff_sdk::admin::FlowFabricAdminClient;
 use llm_race_example::{ReviewPayload, DEFAULT_SERVER_URL};
 
 #[derive(Parser)]
@@ -27,9 +26,6 @@ struct Args {
     /// Waitpoint id printed by the aggregator on suspend.
     #[arg(long)]
     waitpoint_id: String,
-    /// Waitpoint HMAC token printed by the aggregator on suspend.
-    #[arg(long)]
-    waitpoint_token: String,
     /// Unique reviewer identity — the `Count { DistinctSources }`
     /// counter keys on this.
     #[arg(long)]
@@ -46,6 +42,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let http = reqwest::Client::new();
 
+    let admin = match args.api_token.as_deref() {
+        Some(t) => FlowFabricAdminClient::with_token(&args.server, t)?,
+        None => FlowFabricAdminClient::new(&args.server)?,
+    };
+    let execution_id = ExecutionId::parse(&args.execution_id)?;
+    let waitpoint_id = WaitpointId::parse(&args.waitpoint_id)?;
+    let waitpoint_token = admin
+        .read_waitpoint_token(&execution_id, &waitpoint_id)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "waitpoint {} token not found on server (consumed, expired, or unknown)",
+                args.waitpoint_id
+            )
+        })?;
+
     let payload = ReviewPayload {
         approved: args.approve,
         reviewer: args.reviewer.clone(),
@@ -61,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "payload": serde_json::to_vec(&payload)?,
         "payload_encoding": "json",
         "target_scope": "execution",
-        "waitpoint_token": args.waitpoint_token,
+        "waitpoint_token": waitpoint_token,
         "now": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as i64,

@@ -304,6 +304,49 @@ impl FlowFabricAdminClient {
         }
     }
 
+    /// Read the raw HMAC `waitpoint_token` for a specific
+    /// `(execution_id, waitpoint_id)` pair.
+    ///
+    /// # Operator-only
+    ///
+    /// The sibling `list_pending_waitpoints` API intentionally sanitises
+    /// this field (RFC-017 Stage E4 / v0.8.0 §8) — consumers correlate
+    /// via `(token_kid, token_fingerprint)` and normally obtain the raw
+    /// token from their own worker's `SuspendOutcome` at suspend time.
+    /// This admin method re-exposes the token behind the server's
+    /// bearer-auth layer so operator tooling (approval CLIs,
+    /// external-callback bridges) can fetch a delivery credential
+    /// programmatically instead of copy-pasting from worker logs.
+    ///
+    /// Deployments MUST run `ff-server` with `api_token` configured
+    /// when exposing this endpoint to untrusted networks. The embedded
+    /// transport has no auth boundary — access is gated by whoever
+    /// holds the `Arc<dyn EngineBackend>`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(token))` — HMAC token string suitable for
+    ///   `DeliverSignalArgs::waitpoint_token` / `/signal` request body.
+    /// * `Ok(None)` — waitpoint is unknown, consumed, expired, or the
+    ///   stored token column is empty.
+    /// * `Err(SdkError::AdminApi { status: 503, kind: Some("unavailable") })`
+    ///   — the backend (e.g. an out-of-tree implementation) has not
+    ///   overridden `EngineBackend::read_waitpoint_token`.
+    pub async fn read_waitpoint_token(
+        &self,
+        execution_id: &ff_core::types::ExecutionId,
+        waitpoint_id: &ff_core::types::WaitpointId,
+    ) -> Result<Option<String>, SdkError> {
+        match &self.transport {
+            AdminTransport::Http { http, base_url } => {
+                read_waitpoint_token_http(http, base_url, execution_id, waitpoint_id).await
+            }
+            AdminTransport::Embedded(backend) => {
+                read_waitpoint_token_embedded(backend.as_ref(), execution_id, waitpoint_id).await
+            }
+        }
+    }
+
     /// Request a lease-reclaim grant for an execution in
     /// `lease_expired_reclaimable` or `lease_revoked` state (RFC-024
     /// §3.5).
@@ -764,6 +807,92 @@ async fn issue_reclaim_grant_embedded(
             raw_body: String::new(),
         }),
     }
+}
+
+async fn read_waitpoint_token_http(
+    http: &reqwest::Client,
+    base_url: &str,
+    execution_id: &ff_core::types::ExecutionId,
+    waitpoint_id: &ff_core::types::WaitpointId,
+) -> Result<Option<String>, SdkError> {
+    // Percent-encode both path segments: execution_id carries `{fp:N}:`
+    // hash-tag punctuation; waitpoint_id is a UUID but be defensive.
+    let mut url = reqwest::Url::parse(base_url).map_err(|e| SdkError::Config {
+        context: "admin_client: read_waitpoint_token".into(),
+        field: Some("base_url".into()),
+        message: format!("invalid base_url '{}': {e}", base_url),
+    })?;
+    url.path_segments_mut()
+        .map_err(|_| SdkError::Config {
+            context: "admin_client: read_waitpoint_token".into(),
+            field: Some("base_url".into()),
+            message: format!("base_url '{}' cannot be a base", base_url),
+        })?
+        .extend(&[
+            "v1",
+            "executions",
+            execution_id.as_str(),
+            "waitpoints",
+            &waitpoint_id.to_string(),
+            "token",
+        ]);
+
+    let resp = http
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| SdkError::Http {
+            source: e,
+            context: format!("GET {url}"),
+        })?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status.is_success() {
+        #[derive(Deserialize)]
+        struct Body {
+            token: String,
+        }
+        let body: Body = resp.json().await.map_err(|e| SdkError::Http {
+            source: e,
+            context: "decode read_waitpoint_token response body".into(),
+        })?;
+        return Ok(Some(body.token));
+    }
+
+    let status_u16 = status.as_u16();
+    let raw = resp.text().await.map_err(|e| SdkError::Http {
+        source: e,
+        context: format!("read read_waitpoint_token error body (status {status_u16})"),
+    })?;
+    let parsed = serde_json::from_str::<AdminErrorBody>(&raw).ok();
+    Err(SdkError::AdminApi {
+        status: status_u16,
+        message: parsed
+            .as_ref()
+            .map(|b| b.error.clone())
+            .unwrap_or_else(|| raw.clone()),
+        kind: parsed.as_ref().and_then(|b| b.kind.clone()),
+        retryable: parsed.as_ref().and_then(|b| b.retryable),
+        raw_body: raw,
+    })
+}
+
+async fn read_waitpoint_token_embedded(
+    backend: &dyn EngineBackend,
+    execution_id: &ff_core::types::ExecutionId,
+    waitpoint_id: &ff_core::types::WaitpointId,
+) -> Result<Option<String>, SdkError> {
+    let partition =
+        ff_core::partition::PartitionKey::from(&ff_core::partition::Partition {
+            family: ff_core::partition::PartitionFamily::Flow,
+            index: execution_id.partition(),
+        });
+    backend
+        .read_waitpoint_token(partition, waitpoint_id)
+        .await
+        .map_err(|e| engine_err_to_admin(e, "read_waitpoint_token"))
 }
 
 async fn rotate_waitpoint_secret_embedded(
@@ -1381,6 +1510,38 @@ mod tests {
     // RESP handshake on `ClientBuilder::build`, so a local TCP
     // listener alone isn't sufficient) — expensive to construct for
     // one-line iteration-count coverage.
+
+    #[test]
+    fn read_waitpoint_token_url_percent_encodes_path_segments() {
+        // The execution id carries `{fp:N}:` literal punctuation;
+        // a naïve `format!` splice would ship those chars unencoded
+        // and the server would match the wrong route. Pin that the
+        // reqwest URL builder percent-encodes each segment.
+        use ff_core::types::{ExecutionId, WaitpointId};
+
+        let mut url = reqwest::Url::parse("http://x").unwrap();
+        let execution_id = ExecutionId::parse(
+            "{fp:7}:11111111-1111-1111-1111-111111111111",
+        )
+        .unwrap();
+        let waitpoint_id = WaitpointId::parse("22222222-2222-2222-2222-222222222222")
+            .unwrap();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(&[
+                "v1",
+                "executions",
+                execution_id.as_str(),
+                "waitpoints",
+                &waitpoint_id.to_string(),
+                "token",
+            ]);
+        assert_eq!(
+            url.as_str(),
+            "http://x/v1/executions/%7Bfp:7%7D:11111111-1111-1111-1111-111111111111\
+             /waitpoints/22222222-2222-2222-2222-222222222222/token"
+        );
+    }
 
     #[test]
     fn claim_for_worker_response_deserialises_opaque_partition_key() {

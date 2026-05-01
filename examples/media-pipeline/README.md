@@ -6,7 +6,7 @@ This example exercises three mechanisms shipped in Batch B:
 
 - **Capability routing** (RFC-009): each execution declares `required_capabilities`; each worker advertises its `capabilities`. The scheduler subset-matches so transcribe tasks never reach the embed worker, etc. Executions that cannot be matched to any capable worker block in `lane_blocked_route` and are promoted by the unblock scanner when a capable worker appears.
 - **Stream tail with terminal signal** (RFC-006): workers stream incremental output (transcribe lines, LLM tokens, embed completion) as frames; the submit and review CLIs tail concurrently and stop cleanly on the stream's `closed_at` / `closed_reason` terminal markers instead of timeout fallbacks.
-- **HMAC-signed waitpoint signals** (RFC-004): the summarize worker suspends and receives a `waitpoint_token`, which it prints as `WAITPOINT_TOKEN=...` alongside `REVIEW_NEEDED eid=... wp=...`. The review CLI takes both values as `--waitpoint-id` + `--waitpoint-token` flags (ff-server dropped the token from `GET /v1/executions/{id}/pending-waitpoints` in v0.8.0 per RFC-017 Stage E4; v0.14 adds an admin read-path). Tampering with the token (via `--tamper-token`) surfaces as a server-side `invalid_token` rejection.
+- **HMAC-signed waitpoint signals** (RFC-004): the summarize worker suspends and logs `REVIEW_NEEDED eid=... wp=...`. The review CLI takes just the waitpoint id and fetches the raw HMAC token via the ff-sdk admin client (`FlowFabricAdminClient::read_waitpoint_token`, added in v0.14) — no copy-paste from the worker log. Tampering with the fetched token (via `--tamper-token`) surfaces as a server-side `invalid_token` rejection.
 
 ## Architecture
 
@@ -92,12 +92,11 @@ cargo run --bin submit -- --audio samples/story.wav --title demo
 # Terminal C — as soon as submit prints "[submit] summarize=<uuid>",
 # start the reviewer. Watch the summarize worker log for
 #   REVIEW_NEEDED eid=<uuid> wp=<waitpoint-id>
-#   WAITPOINT_TOKEN=<hex>
-# and pass both through:
+# and pass the waitpoint id through; the HMAC token is fetched via
+# the ff-sdk admin client (`read_waitpoint_token`).
 cargo run --bin review -- \
     --execution-id <uuid> \
-    --waitpoint-id <waitpoint-id> \
-    --waitpoint-token <hex>
+    --waitpoint-id <waitpoint-id>
 ```
 
 The review CLI prints incoming `summary_token` frames while waiting for the suspend, then prompts `Approve? [y/n]:`.
@@ -133,7 +132,6 @@ cargo run --bin submit -- --audio samples/story.wav &
 cargo run --bin review -- \
     --execution-id <uuid> \
     --waitpoint-id <waitpoint-id> \
-    --waitpoint-token <hex> \
     --auto-approve
 
 # submit output stalls after "summarize done" because embed has no claimer.
@@ -149,7 +147,6 @@ cargo run --bin embed
 cargo run --bin review -- \
     --execution-id <summarize-uuid> \
     --waitpoint-id <waitpoint-id> \
-    --waitpoint-token <hex> \
     --tamper-token \
     --auto-approve
 ```

@@ -289,28 +289,26 @@ line — approvers need it.
 When the deploy worker suspends it prints a line like:
 
 ```
-[timeline] deploy_suspended execution_id=<eid> waitpoint_key=approval waitpoint_id=<wp-id> waitpoint_token=<token>
+[timeline] deploy_suspended execution_id=<eid> waitpoint_key=approval waitpoint_id=<wp-id>
 ```
 
-Copy `waitpoint_id` and `waitpoint_token` from that line — ff-server
-stopped exposing the token on the pending-waitpoints read endpoint in
-v0.8.0 (RFC-017 Stage E4), so approve takes it explicitly. v0.14 is
-adding an admin-surface `read_waitpoint_token` so a future version of
-this example can fetch it back.
+Copy `waitpoint_id` from that line. The raw HMAC `waitpoint_token` is
+fetched automatically via the ff-sdk admin client
+(`FlowFabricAdminClient::read_waitpoint_token`) — operators no longer
+paste it from the worker log. Set `FF_API_TOKEN` when the server runs
+with bearer auth.
 
 ```bash
 cargo run --release --bin approve -- \
   --flow-id <flow-id-from-submit> \
   --execution-id <deploy-execution-id> \
   --waitpoint-id <wp-id-from-deploy> \
-  --waitpoint-token <token-from-deploy> \
   --reviewer alice
 
 cargo run --release --bin approve -- \
   --flow-id <flow-id-from-submit> \
   --execution-id <deploy-execution-id> \
   --waitpoint-id <wp-id-from-deploy> \
-  --waitpoint-token <token-from-deploy> \
   --reviewer bob
 ```
 

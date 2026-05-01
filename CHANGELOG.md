@@ -5,6 +5,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`FlowFabricAdminClient::read_waitpoint_token`** — admin-surface
+  helper that fetches the raw HMAC `waitpoint_token` for a given
+  `(execution_id, waitpoint_id)`. Covers both the HTTP transport
+  (new route `GET /v1/executions/{id}/waitpoints/{wp_id}/token`,
+  bearer-auth gated via the server's existing `api_token` layer) and
+  the embedded transport (delegates to
+  `EngineBackend::read_waitpoint_token`). Returns `Ok(None)` when the
+  waitpoint is unknown, consumed, or expired. The sibling
+  `list_pending_waitpoints` endpoint intentionally continues to
+  sanitise the raw token (RFC-017 Stage E4); this new surface
+  re-exposes it only for operator tooling that holds the admin bearer.
+  The `deploy-approval/approve`, `media-pipeline/review`, and
+  `llm-race/approve` example CLIs drop their `--waitpoint-token` flag
+  and fetch through the admin client instead.
+
 ## [0.13.0] - 2026-05-01
 
 ### Changed
