@@ -1529,7 +1529,7 @@ pub(crate) async fn claim_execution(
 /// PG body for [`ff_core::engine_backend::EngineBackend::issue_grant_and_claim`].
 ///
 /// Cairn #454 Phase 4c — backend-atomic composition of `issue_claim_grant`
-/// + `claim_execution` in a single sqlx transaction. Mirrors Valkey's
+/// and `claim_execution` in a single sqlx transaction. Mirrors Valkey's
 /// `ff_issue_grant_and_claim` FCALL (Phase 3d, `c884bac`) with PG's
 /// lease-epoch-only fence.
 ///
