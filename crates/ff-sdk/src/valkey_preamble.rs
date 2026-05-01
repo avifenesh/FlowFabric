@@ -31,11 +31,13 @@ use crate::SdkError;
 /// Output of [`run`] — the bits `connect` threads back into the
 /// [`FlowFabricWorker`] struct.
 ///
-/// `capabilities_csv` / `capabilities_hash` are only populated when the
-/// `direct-valkey-claim` feature is active (same gate that owns the
-/// `worker_capabilities_csv` / `worker_capabilities_hash` struct
-/// fields); under `valkey-default` alone they are empty strings and
-/// unused.
+/// `capabilities_csv` / `capabilities_hash` fields are gated on the
+/// `direct-valkey-claim` feature because only the direct-claim code
+/// path reads them at claim time. The capability ingress validation,
+/// CSV compute, and `ff:worker:{id}:caps` + `ff:idx:workers`
+/// advertisement writes run on **every** worker (v0.13 ungate) — the
+/// unblock scanner needs the caps keys regardless of whether the
+/// worker uses direct-claim or server-routed claim.
 ///
 /// [`FlowFabricWorker`]: crate::FlowFabricWorker
 pub(crate) struct PreambleOutput {
@@ -55,12 +57,14 @@ pub(crate) struct PreambleOutput {
 ///    guard, TTL = 2 × `lease_ttl_ms`).
 /// 3. `HGETALL ff:config:partitions` (falls back to `PartitionConfig::default()`
 ///    on absence, which is the SDK-only-test shape).
-/// 4. (`direct-valkey-claim` only) capability ingress validation +
-///    sorted-dedup CSV compute + FNV-1a digest + full-CSV connect-time
-///    log.
-/// 5. (`direct-valkey-claim` only) `SET`/`DEL` of
-///    `ff:worker:{instance_id}:caps` + `SADD`/`SREM` of the
-///    `ff:idx:workers` index (caps-first write order is load-bearing).
+/// 4. Capability ingress validation + sorted-dedup CSV compute
+///    (always-on; v0.13 ungate). Under `direct-valkey-claim` the FNV-1a
+///    digest + full-CSV connect-time log also run.
+/// 5. `SET`/`DEL` of `ff:worker:{instance_id}:caps` + `SADD`/`SREM` of
+///    the `ff:idx:workers` index (always-on; v0.13 ungate — needed by
+///    the unblock scanner's `load_worker_caps_union` on both
+///    direct-claim and server-routed worker paths). Caps-first write
+///    order is load-bearing.
 pub(crate) async fn run(
     client: &Client,
     config: &WorkerConfig,

@@ -37,7 +37,9 @@ The other two cairn #454 methods (`deliver_approval_signal`,
 setup; the existing `deploy-approval` and `incident-remediation`
 examples already exercise the surrounding machinery. Parity and
 integration test coverage for those lives in
-`crates/ff-backend-{valkey,postgres,sqlite}/tests/typed_*_454.rs`.
+`crates/ff-backend-{valkey,postgres,sqlite}/tests/typed_record_spend.rs`,
+`typed_release_budget.rs`, `typed_deliver_approval_signal.rs`, and
+`typed_issue_grant_and_claim.rs`.
 
 ## Run
 
