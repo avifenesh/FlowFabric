@@ -21,9 +21,19 @@
 
 set -u
 set -o pipefail
+# `nullglob` so the loop iterates zero times when `examples/` is empty
+# or missing, instead of iterating once with the literal glob pattern
+# (which would feed `Cargo.toml check` a non-existent directory and
+# emit a confusing [FAIL] line). Combined with the preflight below.
+shopt -s nullglob
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXAMPLES_DIR="$ROOT/examples"
+
+if [ ! -d "$EXAMPLES_DIR" ]; then
+    echo "[run-all-examples] FATAL: $EXAMPLES_DIR does not exist" >&2
+    exit 2
+fi
 
 # Per-session opt-in filter. Empty = run everything.
 ONLY="${FF_EXAMPLES_ONLY:-}"
@@ -57,8 +67,9 @@ echo "[run-all-examples] root=$ROOT"
 echo
 
 # Single tempfile reused per iteration. `trap` ensures cleanup even on
-# SIGINT/SIGTERM so we don't leave orphans in /tmp.
-LOG_TMP="$(mktemp)"
+# SIGINT/SIGTERM so we don't leave orphans in /tmp. The template
+# argument is required on macOS/BSD mktemp.
+LOG_TMP="$(mktemp "${TMPDIR:-/tmp}/ff-run-all-examples.XXXXXX")"
 trap 'rm -f "$LOG_TMP"' EXIT
 
 for dir in "$EXAMPLES_DIR"/*/; do
@@ -79,7 +90,10 @@ for dir in "$EXAMPLES_DIR"/*/; do
     fi
 
     echo "[build] $name …"
-    if (cd "$dir" && cargo build --bins) >"$LOG_TMP" 2>&1; then
+    # `--locked` so an out-of-date Cargo.lock FAILs rather than silently
+    # rewrites the lockfile and leaves the working tree dirty — keeps
+    # the gate deterministic across CI + local.
+    if (cd "$dir" && cargo build --locked --bins) >"$LOG_TMP" 2>&1; then
         echo "[PASS] $name"
         PASS+=("$name")
     else
