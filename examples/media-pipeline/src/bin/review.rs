@@ -203,8 +203,12 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             anyhow::bail!(
-                "waitpoint token fetch returned None but state={recheck}; \
-                 this indicates waitpoint id drift or an expired waitpoint"
+                "waitpoint token fetch returned None (execution_id={}, \
+                 waitpoint_id={}) but state={recheck}; this indicates \
+                 waitpoint id drift or an expired waitpoint — re-check \
+                 the `REVIEW_NEEDED eid=... wp=...` line from the summarize worker",
+                args.execution_id,
+                args.waitpoint_id,
             );
         }
     };
