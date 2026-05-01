@@ -1353,11 +1353,14 @@ pub(crate) async fn deliver_approval_signal_impl(
     .fetch_optional(pool)
     .await
     .map_err(map_sqlx_error)?;
-    let authoritative_lane = LaneId::new(
-        lane_row
-            .map(|(s,)| s)
-            .unwrap_or_else(|| "default".to_owned()),
-    );
+    let authoritative_lane = match lane_row {
+        Some((s,)) => LaneId::new(s),
+        None => {
+            return Err(EngineError::NotFound {
+                entity: "execution",
+            });
+        }
+    };
     if authoritative_lane.as_str() != args.lane_id.as_str() {
         return Err(EngineError::Validation {
             kind: ValidationKind::InvalidInput,
