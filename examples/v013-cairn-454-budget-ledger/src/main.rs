@@ -121,12 +121,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = build_client(&BackendConfig::valkey(host.as_str(), port)).await?;
     ff_script::loader::ensure_library(&client).await?;
+    // Keep our own handle to the Valkey client for the demo's
+    // before/after HGETALL inspection (read_usage below). `ferriskey::Client`
+    // is cheap to clone. Production consumers route budget reads through
+    // `get_budget_status`; this example reads the storage key directly
+    // to visually demonstrate the ledger effect.
+    let client_for_inspection = client.clone();
     let backend: Arc<ValkeyBackend> = ValkeyBackend::from_client_and_partitions(client, demo_partitions());
 
     // Fresh budget per run — no cleanup needed between invocations.
     let bid = BudgetId::new();
     tracing::info!(budget = %bid, "creating demo budget (limits: tokens=1000, cost_cents=10000)");
-    create_demo_budget(backend.client(), &bid.to_string()).await;
+    create_demo_budget(&client_for_inspection, &bid.to_string()).await;
     let exec = ExecutionId::solo(&LaneId::new(LANE), &demo_partitions());
     tracing::info!(execution = %exec, "synthetic execution id (no flow attached — trait demo only)");
 
@@ -136,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     deltas.insert("cost_cents".into(), 4_200);
     let args = RecordSpendArgs::new(bid.clone(), exec.clone(), deltas, "demo-spend-1");
 
-    let before = read_usage(backend.client(), &bid.to_string()).await;
+    let before = read_usage(&client_for_inspection, &bid.to_string()).await;
     tracing::info!(?before, "budget usage BEFORE record_spend");
 
     let outcome = backend.record_spend(args).await?;
@@ -148,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => tracing::info!(?outcome, "record_spend: other variant"),
     }
 
-    let after_spend = read_usage(backend.client(), &bid.to_string()).await;
+    let after_spend = read_usage(&client_for_inspection, &bid.to_string()).await;
     tracing::info!(?after_spend, "budget usage AFTER record_spend (expect tokens=250, cost_cents=4200)");
 
     // Replaying the same idempotency key should be a no-op (counter
@@ -171,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- release_budget -------------------------------------------------
     let release_args = ReleaseBudgetArgs::new(bid.clone(), exec.clone());
     backend.release_budget(release_args).await?;
-    let after_release = read_usage(backend.client(), &bid.to_string()).await;
+    let after_release = read_usage(&client_for_inspection, &bid.to_string()).await;
     tracing::info!(?after_release, "budget usage AFTER release_budget (expect tokens=0, cost_cents=0)");
 
     // release_budget is idempotent — a second call on the same
