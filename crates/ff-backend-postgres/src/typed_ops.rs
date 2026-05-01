@@ -1732,19 +1732,19 @@ pub(crate) async fn issue_grant_and_claim(
         // Fresh path: mint a new attempt row at
         // `ff_exec_core.attempt_index` and bump the pointer.
         let attempt_index_i32 = current_attempt_index;
-        let attempt_type = if attempt_state == "pending_retry_attempt" {
-            AttemptType::Retry
-        } else if attempt_state == "pending_replay_attempt" {
-            AttemptType::Replay
-        } else {
-            AttemptType::Initial
-        };
-        let attempt_type_str = match attempt_type {
-            AttemptType::Initial => "initial",
-            AttemptType::Retry => "retry",
-            AttemptType::Reclaim => "reclaim",
-            AttemptType::Replay => "replay",
-            AttemptType::Fallback => "fallback",
+        // Fresh path reaches this branch only when attempt_state is one
+        // of the four resume-clean variants below (earlier invariant
+        // check on line 1678). Any other value here is corrupt state.
+        let attempt_type_str: &'static str = match attempt_state.as_str() {
+            "pending_retry_attempt" => "retry",
+            "pending_replay_attempt" => "replay",
+            "pending_first_attempt" | "initial" => "initial",
+            other => {
+                return Err(EngineError::Validation {
+                    kind: ValidationKind::Corruption,
+                    detail: format!("issue_grant_and_claim: unrecognized attempt_state={other}"),
+                });
+            }
         };
         sqlx::query(
             r#"
