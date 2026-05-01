@@ -7,6 +7,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`FlowFabricWorker::claim_next_via_backend`** — un-gated
+  scheduler-bypass scanner that drives claim through the
+  `EngineBackend` trait. Replaces the `claim_next` feature-flag
+  requirement for demo / embedded / bench consumers that can't or
+  don't want to opt into `direct-valkey-claim`. `claim_next` is
+  preserved as a back-compat alias under the existing feature flag.
+  As the rustdoc emphasizes, this path bypasses scheduler admission
+  controls (budget / quota); production deployments should use
+  [`FlowFabricWorker::claim_from_grant`] with scheduler-issued
+  grants. Same chunked-scan semantics + `None`-means-"poll-soon"
+  contract as `claim_next`. Struct fields previously gated behind
+  `direct-valkey-claim` (`worker_capabilities_hash`, `lane_index`,
+  `scan_cursor`) are now always-compiled since they're pure Rust
+  state — no Valkey-specific dependencies.
 - **`ff_sdk::signal_bridge` module** — `SignalBridgeError` enum
   (`UnknownWaitpoint`, `TokenMismatch`, `Backend(SdkError)`) and
   `verify_and_deliver` / `verify_and_deliver_arc` helpers. Extracts the
