@@ -30,14 +30,15 @@ use std::collections::{BTreeMap, HashMap};
 use ff_core::backend::UsageDimensions;
 use ff_core::contracts::{
     BudgetStatus, CreateBudgetArgs, CreateBudgetResult, CreateQuotaPolicyArgs,
-    CreateQuotaPolicyResult, ReportUsageAdminArgs, ReportUsageResult, ResetBudgetArgs,
-    ResetBudgetResult,
+    CreateQuotaPolicyResult, RecordSpendArgs, ReleaseBudgetArgs, ReportUsageAdminArgs,
+    ReportUsageResult, ResetBudgetArgs, ResetBudgetResult,
 };
 use ff_core::engine_error::{backend_context, EngineError, ValidationKind};
 use ff_core::partition::{budget_partition, quota_partition, PartitionConfig};
-use ff_core::types::{BudgetId, TimestampMs};
+use ff_core::types::{BudgetId, ExecutionId, TimestampMs};
 use serde_json::{json, Value as JsonValue};
 use sqlx::{PgPool, Row};
+use uuid::Uuid;
 
 use crate::error::map_sqlx_error;
 
@@ -901,6 +902,353 @@ pub(crate) async fn budget_reset_reconciler_apply(
     .bind(budget_id)
     .bind(now)
     .bind(reset_interval_ms)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────
+// cairn #454 Phase 4a — `record_spend` + `release_budget`
+// (per-execution ledger, option A; parity with Valkey PR #464).
+// ───────────────────────────────────────────────────────────────────
+
+/// Extract the bare UUID from an `ExecutionId` (formatted
+/// `{fp:N}:<uuid>`). `ff_budget_usage_by_exec.execution_id` is typed
+/// as `uuid`, not the wrapped hash-tag string, so we need the inner
+/// bytes. Mirrors `attempt::split_exec_id` but returns only the UUID.
+fn exec_uuid(eid: &ExecutionId) -> Result<Uuid, EngineError> {
+    let s = eid.as_str();
+    let rest = s.strip_prefix("{fp:").ok_or_else(|| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("execution_id missing `{{fp:` prefix: {s}"),
+    })?;
+    let close = rest.find("}:").ok_or_else(|| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("execution_id missing `}}:`: {s}"),
+    })?;
+    Uuid::parse_str(&rest[close + 2..]).map_err(|_| EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail: format!("execution_id UUID invalid: {s}"),
+    })
+}
+
+/// cairn #454 Phase 4a — `EngineBackend::record_spend`.
+///
+/// Per-execution budget spend with open-set dimensions. Structurally
+/// identical to [`report_usage_and_check_core`] (dedup INSERT → policy
+/// lock → per-dim admission → apply increments → soft-breach book-
+/// keeping), with two deltas from option A:
+///
+/// 1. The idempotency key is `args.idempotency_key` (caller-computed
+///    SHA-256 hex per RFC cairn #454 Q1) instead of
+///    `UsageDimensions::dedup_key`.
+/// 2. After the aggregate UPSERT the same deltas land in the
+///    `ff_budget_usage_by_exec` per-execution ledger (new 0020 table)
+///    so `release_budget` can reverse just this execution's
+///    attribution. Matches Valkey's `HINCRBY` into
+///    `ff:budget:...:by_exec:<execution_id>`.
+pub(crate) async fn record_spend_impl(
+    pool: &PgPool,
+    partition_config: &PartitionConfig,
+    args: RecordSpendArgs,
+) -> Result<ReportUsageResult, EngineError> {
+    let partition = budget_partition(&args.budget_id, partition_config);
+    let partition_key: i16 = partition.index as i16;
+    let budget_id_str = args.budget_id.to_string();
+    let exec_uuid = exec_uuid(&args.execution_id)?;
+    let now = now_ms();
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    // ── Dedup (reuses the existing `ff_budget_usage_dedup` infra) ──
+    let dedup_owned: Option<String> = if args.idempotency_key.is_empty() {
+        None
+    } else {
+        let inserted = sqlx::query(
+            "INSERT INTO ff_budget_usage_dedup \
+                 (partition_key, dedup_key, outcome_json, applied_at_ms, expires_at_ms) \
+             VALUES ($1, $2, '{}'::jsonb, $3, $4) \
+             ON CONFLICT (partition_key, dedup_key) DO NOTHING \
+             RETURNING applied_at_ms",
+        )
+        .bind(partition_key)
+        .bind(&args.idempotency_key)
+        .bind(now)
+        .bind(now + DEDUP_TTL_MS)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if inserted.is_none() {
+            let row = sqlx::query(
+                "SELECT outcome_json FROM ff_budget_usage_dedup \
+                 WHERE partition_key = $1 AND dedup_key = $2",
+            )
+            .bind(partition_key)
+            .bind(&args.idempotency_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+            let outcome: JsonValue = row.get("outcome_json");
+            tx.commit().await.map_err(map_sqlx_error)?;
+            // cairn #454 Phase 3 parity with Valkey `ff_record_spend`:
+            // dedup-hit always returns `AlreadyApplied` regardless of
+            // the original outcome (SET `dedup_key "1"` in Lua —
+            // outcome is not replayed). We still consult the stored
+            // outcome only to verify the row isn't an orphaned empty
+            // placeholder (in which case a prior in-flight caller
+            // crashed; we treat it the same — AlreadyApplied).
+            let _ = outcome; // placeholder read, semantics match Valkey
+            return Ok(ReportUsageResult::AlreadyApplied);
+        }
+        Some(args.idempotency_key.clone())
+    };
+
+    // ── Load policy row with `FOR NO KEY UPDATE` (same lock-mode
+    //    discipline as `report_usage_and_check_core`). ──
+    let policy_row = sqlx::query(
+        "SELECT policy_json FROM ff_budget_policy \
+         WHERE partition_key = $1 AND budget_id = $2 FOR NO KEY UPDATE",
+    )
+    .bind(partition_key)
+    .bind(&budget_id_str)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let policy: JsonValue = match policy_row {
+        Some(r) => r.get("policy_json"),
+        None => JsonValue::Object(Default::default()),
+    };
+    let hard_limits = limits_from_policy(&policy, "hard_limits");
+    let soft_limits = limits_from_policy(&policy, "soft_limits");
+
+    // ── Hard-breach pre-check: ANY dim over hard-limit rejects the
+    //    whole call (no increments applied, ledger untouched). ──
+    let mut per_dim_current: BTreeMap<String, u64> = BTreeMap::new();
+    for (dim, delta) in args.deltas.iter() {
+        let dim_key = dim_row_key(dim);
+        sqlx::query(
+            "INSERT INTO ff_budget_usage \
+                 (partition_key, budget_id, dimensions_key, current_value, updated_at_ms) \
+             VALUES ($1, $2, $3, 0, $4) \
+             ON CONFLICT (partition_key, budget_id, dimensions_key) DO NOTHING",
+        )
+        .bind(partition_key)
+        .bind(&budget_id_str)
+        .bind(&dim_key)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let row = sqlx::query(
+            "SELECT current_value FROM ff_budget_usage \
+             WHERE partition_key = $1 AND budget_id = $2 AND dimensions_key = $3 \
+             FOR UPDATE",
+        )
+        .bind(partition_key)
+        .bind(&budget_id_str)
+        .bind(&dim_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+        let cur: i64 = row.get("current_value");
+        let new_val = (cur as u64).saturating_add(*delta);
+
+        if let Some(hard) = hard_limits.get(dim)
+            && *hard > 0
+            && new_val > *hard
+        {
+            sqlx::query(
+                "UPDATE ff_budget_policy \
+                 SET breach_count      = breach_count + 1, \
+                     last_breach_at_ms = $3, \
+                     last_breach_dim   = $4, \
+                     updated_at_ms     = $3 \
+                 WHERE partition_key = $1 AND budget_id = $2",
+            )
+            .bind(partition_key)
+            .bind(&budget_id_str)
+            .bind(now)
+            .bind(dim)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let outcome = ReportUsageResult::HardBreach {
+                dimension: dim.clone(),
+                current_usage: cur as u64,
+                hard_limit: *hard,
+            };
+            if let Some(dk) = dedup_owned.as_deref() {
+                finalize_dedup(&mut tx, partition_key, dk, &outcome).await?;
+            }
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(outcome);
+        }
+        per_dim_current.insert(dim.clone(), new_val);
+    }
+
+    // ── Apply increments + soft-breach detection + mirror into the
+    //    per-execution ledger (new 0020 table). ──
+    let mut soft_breach: Option<ReportUsageResult> = None;
+    for (dim, delta) in args.deltas.iter() {
+        let dim_key = dim_row_key(dim);
+        let new_val = per_dim_current[dim];
+        sqlx::query(
+            "UPDATE ff_budget_usage \
+             SET current_value = current_value + $1, updated_at_ms = $2 \
+             WHERE partition_key = $3 AND budget_id = $4 AND dimensions_key = $5",
+        )
+        .bind(*delta as i64)
+        .bind(now)
+        .bind(partition_key)
+        .bind(&budget_id_str)
+        .bind(&dim_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Per-execution ledger UPSERT — additive on repeat
+        // `record_spend` for the same (budget, exec, dim).
+        sqlx::query(
+            "INSERT INTO ff_budget_usage_by_exec \
+                 (partition_key, budget_id, execution_id, dimensions_key, \
+                  delta_total, updated_at_ms) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (partition_key, budget_id, execution_id, dimensions_key) \
+             DO UPDATE SET delta_total = ff_budget_usage_by_exec.delta_total + EXCLUDED.delta_total, \
+                           updated_at_ms = EXCLUDED.updated_at_ms",
+        )
+        .bind(partition_key)
+        .bind(&budget_id_str)
+        .bind(exec_uuid)
+        .bind(&dim_key)
+        .bind(*delta as i64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if soft_breach.is_none()
+            && let Some(soft) = soft_limits.get(dim)
+            && *soft > 0
+            && new_val > *soft
+        {
+            soft_breach = Some(ReportUsageResult::SoftBreach {
+                dimension: dim.clone(),
+                current_usage: new_val,
+                soft_limit: *soft,
+            });
+        }
+    }
+
+    if soft_breach.is_some() {
+        sqlx::query(
+            "UPDATE ff_budget_policy \
+             SET soft_breach_count = soft_breach_count + 1, \
+                 updated_at_ms     = $3 \
+             WHERE partition_key = $1 AND budget_id = $2",
+        )
+        .bind(partition_key)
+        .bind(&budget_id_str)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+    }
+
+    let outcome = soft_breach.unwrap_or(ReportUsageResult::Ok);
+    if let Some(dk) = dedup_owned.as_deref() {
+        finalize_dedup(&mut tx, partition_key, dk, &outcome).await?;
+    }
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(outcome)
+}
+
+/// cairn #454 Phase 4a — `EngineBackend::release_budget`.
+///
+/// Reverses a single execution's contribution to a budget aggregate
+/// using the per-exec ledger from 0020. Scans all
+/// `ff_budget_usage_by_exec` rows for (budget, exec), subtracts each
+/// `delta_total` from the matching aggregate (clamped at 0 — matches
+/// the Valkey `math.max(0, ...)` semantics), then DELETEs the ledger
+/// rows. Idempotent: empty ledger ⇒ no-op `Ok(())`.
+pub(crate) async fn release_budget_impl(
+    pool: &PgPool,
+    partition_config: &PartitionConfig,
+    args: ReleaseBudgetArgs,
+) -> Result<(), EngineError> {
+    let partition = budget_partition(&args.budget_id, partition_config);
+    let partition_key: i16 = partition.index as i16;
+    let budget_id_str = args.budget_id.to_string();
+    let exec_uuid = exec_uuid(&args.execution_id)?;
+    let now = now_ms();
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+
+    // Scan the ledger under `FOR UPDATE` so concurrent
+    // `record_spend` on the same (budget, exec, dim) serialises
+    // on the row lock rather than racing the DELETE.
+    let rows = sqlx::query(
+        "SELECT dimensions_key, delta_total \
+         FROM ff_budget_usage_by_exec \
+         WHERE partition_key = $1 AND budget_id = $2 AND execution_id = $3 \
+         FOR UPDATE",
+    )
+    .bind(partition_key)
+    .bind(&budget_id_str)
+    .bind(exec_uuid)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if rows.is_empty() {
+        // No prior record_spend for this execution ⇒ nothing to
+        // reverse. Idempotent no-op, matching Valkey's behaviour when
+        // `ff:budget:...:by_exec:<exec>` doesn't exist.
+        tx.commit().await.map_err(map_sqlx_error)?;
+        return Ok(());
+    }
+
+    for row in &rows {
+        let dim: String = row.get("dimensions_key");
+        let delta: i64 = row.get("delta_total");
+        sqlx::query(
+            "UPDATE ff_budget_usage \
+             SET current_value = GREATEST(0::bigint, current_value - $1), \
+                 updated_at_ms = $2 \
+             WHERE partition_key = $3 AND budget_id = $4 AND dimensions_key = $5",
+        )
+        .bind(delta)
+        .bind(now)
+        .bind(partition_key)
+        .bind(&budget_id_str)
+        .bind(&dim)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+    }
+
+    sqlx::query(
+        "DELETE FROM ff_budget_usage_by_exec \
+         WHERE partition_key = $1 AND budget_id = $2 AND execution_id = $3",
+    )
+    .bind(partition_key)
+    .bind(&budget_id_str)
+    .bind(exec_uuid)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
