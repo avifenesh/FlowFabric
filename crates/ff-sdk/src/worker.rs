@@ -145,9 +145,11 @@ pub struct FlowFabricWorker {
         Option<Arc<dyn ff_core::completion_backend::CompletionBackend>>,
 }
 
-/// Number of partitions scanned per `claim_next_via_backend()` poll.
-/// Keeps idle backend load at O(PARTITION_SCAN_CHUNK) per worker-second
-/// instead of O(num_flow_partitions).
+/// Number of partitions scanned per scheduler-bypass claim poll
+/// (`claim_next_via_backend` and its `direct-valkey-claim`-gated
+/// back-compat alias `claim_next`). Keeps idle backend load at
+/// O(PARTITION_SCAN_CHUNK) per worker-second instead of
+/// O(num_flow_partitions).
 const PARTITION_SCAN_CHUNK: usize = 32;
 
 impl FlowFabricWorker {
