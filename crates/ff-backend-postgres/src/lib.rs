@@ -1685,6 +1685,18 @@ impl EngineBackend for PostgresBackend {
         crate::typed_ops::claim_execution(self.pool(), &self.partition_config, args).await
     }
 
+    // Cairn #454 Phase 4c — backend-atomic `issue_claim_grant` +
+    // `claim_execution` composition. sqlx tx ensures a mid-op crash
+    // cannot leak a dangling grant (auto-rollback on drop).
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.issue_grant_and_claim", skip_all)]
+    async fn issue_grant_and_claim(
+        &self,
+        args: ff_core::contracts::IssueGrantAndClaimArgs,
+    ) -> Result<ff_core::contracts::ClaimGrantOutcome, EngineError> {
+        crate::typed_ops::issue_grant_and_claim(self.pool(), &self.partition_config, args).await
+    }
+
     // ── PR-7b Wave 0a: exec_core field read ──
 
     async fn read_exec_core_fields(
