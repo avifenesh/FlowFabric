@@ -515,6 +515,78 @@ async fn test_signal_delivery_with_tampered_token_rejected() {
     );
 }
 
+/// v0.14 — `GET /v1/executions/{id}/waitpoints/{wp_id}/token` returns
+/// the raw HMAC token for an existing waitpoint. Admin-surface parity
+/// with `EngineBackend::read_waitpoint_token`.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_get_waitpoint_token_returns_token_after_suspend() {
+    let api = TestApi::setup().await;
+    let tc = TestCluster::connect().await;
+
+    let eid = tc.new_execution_id();
+    let (lease_id, epoch, attempt_id) = fcall_create_and_claim(&tc, &eid).await;
+    let (wp_id, _wp_key, expected_token) =
+        fcall_suspend(&tc, &eid, &lease_id, &epoch, &attempt_id).await;
+
+    let resp = api
+        .client
+        .get(api.url(&format!("/v1/executions/{eid}/waitpoints/{wp_id}/token")))
+        .send()
+        .await
+        .expect("waitpoint-token request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Pin the no-store header on the success path: the token is a
+    // bearer-equivalent HMAC credential and must not be persisted by
+    // intermediaries.
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "waitpoint_token response must carry Cache-Control: no-store"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("body parse");
+    let token = body
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("response must carry `token` field");
+    assert_eq!(token, expected_token);
+}
+
+/// Unknown waitpoint id → 404 (backend returns Ok(None)).
+#[tokio::test]
+#[serial_test::serial]
+async fn test_get_waitpoint_token_unknown_id_returns_404() {
+    let api = TestApi::setup().await;
+    let tc = TestCluster::connect().await;
+
+    let eid = tc.new_execution_id();
+    let _ = fcall_create_and_claim(&tc, &eid).await;
+    let unknown_wp = WaitpointId::new();
+
+    let resp = api
+        .client
+        .get(api.url(&format!(
+            "/v1/executions/{eid}/waitpoints/{unknown_wp}/token"
+        )))
+        .send()
+        .await
+        .expect("waitpoint-token request failed");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // no-store also on the 404 path so intermediaries can't cache
+    // negative lookups (would leak "waitpoint id {X} unknown" signal).
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "404 response must also carry Cache-Control: no-store"
+    );
+}
+
 /// A nonexistent execution returns 404.
 #[tokio::test]
 #[serial_test::serial]
