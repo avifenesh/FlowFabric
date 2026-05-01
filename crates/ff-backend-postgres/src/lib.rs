@@ -34,7 +34,8 @@ use ff_core::contracts::{
     AddExecutionToFlowArgs, AddExecutionToFlowResult, ApplyDependencyToChildArgs,
     ApplyDependencyToChildResult, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
     CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
-    DeliverSignalArgs, DeliverSignalResult, EdgeDependencyPolicy, EdgeDirection, EdgeSnapshot,
+    DeliverApprovalSignalArgs, DeliverSignalArgs, DeliverSignalResult, EdgeDependencyPolicy,
+    EdgeDirection, EdgeSnapshot,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
     ListPendingWaitpointsResult, ListSuspendedPage, SetEdgeGroupPolicyResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
@@ -778,6 +779,15 @@ impl EngineBackend for PostgresBackend {
         args: DeliverSignalArgs,
     ) -> Result<DeliverSignalResult, EngineError> {
         suspend_ops::deliver_signal_impl(&self.pool, &self.partition_config, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.deliver_approval_signal", skip_all)]
+    async fn deliver_approval_signal(
+        &self,
+        args: DeliverApprovalSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError> {
+        suspend_ops::deliver_approval_signal_impl(&self.pool, &self.partition_config, args).await
     }
 
     #[cfg(feature = "core")]
