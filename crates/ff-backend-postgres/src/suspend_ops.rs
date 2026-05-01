@@ -26,16 +26,17 @@ use ff_core::backend::{
 };
 use ff_core::contracts::{
     AdditionalWaitpointBinding, ClaimResumedExecutionArgs, ClaimResumedExecutionResult,
-    ClaimedResumedExecution, CompositeBody, DeliverSignalArgs, DeliverSignalResult,
-    ListPendingWaitpointsArgs, ListPendingWaitpointsResult, PendingWaitpointInfo, ResumeCondition,
-    SignalMatcher, SuspendArgs, SuspendOutcome, SuspendOutcomeDetails, WaitpointBinding,
+    ClaimedResumedExecution, CompositeBody, DeliverApprovalSignalArgs, DeliverSignalArgs,
+    DeliverSignalResult, ListPendingWaitpointsArgs, ListPendingWaitpointsResult,
+    PendingWaitpointInfo, ResumeCondition, SignalMatcher, SuspendArgs, SuspendOutcome,
+    SuspendOutcomeDetails, WaitpointBinding,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, ValidationKind};
 use ff_core::handle_codec::{encode as encode_opaque, HandlePayload};
 use ff_core::partition::PartitionConfig;
 use ff_core::types::{
-    AttemptId, AttemptIndex, ExecutionId, LeaseEpoch, LeaseFence, SignalId, SuspensionId,
-    TimestampMs, WaitpointId,
+    AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseEpoch, LeaseFence, SignalId, SuspensionId,
+    TimestampMs, WaitpointId, WaitpointToken,
 };
 use serde_json::{json, Value as JsonValue};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -1318,4 +1319,97 @@ pub(crate) async fn read_waitpoint_token_impl(
     .await
     .map_err(map_sqlx_error)?;
     Ok(row.map(|(t,)| t).filter(|s| !s.is_empty()))
+}
+
+// ─── deliver_approval_signal ─────────────────────────────────────────────
+//
+// Cairn #454 Phase 4b (Postgres parity with the Valkey PR #465 body).
+//
+// The operator path never carries the waitpoint HMAC token — the
+// backend reads it server-side from `ff_waitpoint_pending`, verifies
+// the caller's `lane_id` matches `ff_exec_core.lane_id`, composes a
+// `DeliverSignalArgs` (signal_category="approval" / source_type=
+// "operator" / target_scope="execution" / idempotency_key=
+// "approval:<signal>:<suffix>"), and dispatches through the shared
+// `deliver_signal_impl`. The inner body re-verifies the HMAC token
+// we just read, and its SERIALIZABLE tx enforces dedup / capacity
+// invariants unchanged.
+
+pub(crate) async fn deliver_approval_signal_impl(
+    pool: &PgPool,
+    partition_config: &PartitionConfig,
+    args: DeliverApprovalSignalArgs,
+) -> Result<DeliverSignalResult, EngineError> {
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+
+    // 1. Authoritative lane_id comes from exec_core, not the caller.
+    //    Matches the Valkey HGET lane_id guard (PR #465 Copilot review).
+    let lane_row: Option<(String,)> = sqlx::query_as(
+        "SELECT lane_id FROM ff_exec_core \
+         WHERE partition_key = $1 AND execution_id = $2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    let authoritative_lane = match lane_row {
+        Some((s,)) => LaneId::new(s),
+        None => {
+            return Err(EngineError::NotFound {
+                entity: "execution",
+            });
+        }
+    };
+    if authoritative_lane.as_str() != args.lane_id.as_str() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "lane_mismatch: args.lane_id={} exec_core.lane_id={}",
+                args.lane_id.as_str(),
+                authoritative_lane.as_str()
+            ),
+        });
+    }
+
+    // 2. Server-side token lookup. Missing row → NotFound(waitpoint).
+    let partition = ff_core::partition::Partition {
+        family: ff_core::partition::PartitionFamily::Execution,
+        index: part as u16,
+    };
+    let pkey = ff_core::partition::PartitionKey::from(&partition);
+    let token_str = read_waitpoint_token_impl(pool, &pkey, &args.waitpoint_id)
+        .await?
+        .ok_or(EngineError::NotFound {
+            entity: "waitpoint",
+        })?;
+
+    // 3. Compose DeliverSignalArgs and dispatch. Single `now` sample
+    //    reused for `created_at` + `now` (PR #465 gemini review).
+    let now = TimestampMs::now();
+    let idempotency_key =
+        format!("approval:{}:{}", args.signal_name, args.idempotency_suffix);
+    let ds = DeliverSignalArgs {
+        execution_id: args.execution_id.clone(),
+        waitpoint_id: args.waitpoint_id.clone(),
+        signal_id: SignalId::new(),
+        signal_name: args.signal_name.clone(),
+        signal_category: "approval".to_owned(),
+        source_type: "operator".to_owned(),
+        source_identity: String::new(),
+        payload: None,
+        payload_encoding: None,
+        correlation_id: None,
+        idempotency_key: Some(idempotency_key),
+        target_scope: "execution".to_owned(),
+        created_at: Some(now),
+        dedup_ttl_ms: Some(args.signal_dedup_ttl_ms),
+        resume_delay_ms: None,
+        max_signals_per_execution: args.max_signals_per_execution,
+        signal_maxlen: args.maxlen,
+        waitpoint_token: WaitpointToken::new(token_str),
+        now,
+    };
+
+    deliver_signal_impl(pool, partition_config, ds).await
 }
