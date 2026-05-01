@@ -5,6 +5,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-01
+
 ### Changed
 
 - **`WorkerConfig.backend` is now `Option<BackendConfig>` (SC-10
@@ -31,6 +33,66 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **cairn #454 — 4 new `EngineBackend` control-plane methods (all 3 backends).**
+  `record_spend`, `release_budget`, `deliver_approval_signal`, and
+  `issue_grant_and_claim` join the typed trait surface with bodies on
+  Valkey, Postgres, and SQLite at landing. Closes the last cairn
+  control-plane gaps after #453 — consumers no longer need any raw
+  `ferriskey::Value` + `check_fcall_success` + `parse_*` calls on
+  the Valkey backend, and can reach the same methods via the backend-
+  agnostic trait on PG + SQLite.
+  - `record_spend(RecordSpendArgs)` → `ReportUsageResult` (per-execution
+    budget attribution). Valkey: `FCALL ff_record_spend` — per-execution
+    HASH keyed by dimension so `release_budget` can reverse reliably.
+    PG + SQLite: upsert into `ff_budget_usage_by_exec` (migration 0020)
+    under the budget's READ-COMMITTED / `BEGIN IMMEDIATE` tx; same
+    counter semantics as `ff_budget_usage` but scoped per
+    `(budget_id, execution_id, dimension)` so reversal is
+    idempotent-safe.
+  - `release_budget(ReleaseBudgetArgs)` → `()` (idempotent reversal).
+    Valkey: `FCALL ff_release_budget` decrements the aggregate budget
+    counter by the exact per-execution amount stamped by `record_spend`
+    then deletes the per-execution row. PG + SQLite: same shape via
+    `ff_budget_usage_by_exec` row read → aggregate counter decrement →
+    row DELETE, single tx. Missing-row returns `Ok(())` (already
+    released).
+  - `deliver_approval_signal(DeliverApprovalSignalArgs)` →
+    `DeliverSignalResult`. Valkey: `FCALL ff_deliver_approval_signal`
+    — thin specialisation over the existing suspend/signal path with
+    approval-typed payload validation. PG + SQLite: ports the same
+    shape into the suspend-signal tx (`ff_suspension_current` +
+    `ff_signal_event` outbox) with the approval validation inlined.
+  - `issue_grant_and_claim(IssueGrantAndClaimArgs)` →
+    `ClaimGrantOutcome`. Backend-atomic composition of
+    `issue_reclaim_grant` + `claim_from_grant` so reclaim handoff
+    runs in a single round-trip. Valkey: `FCALL
+    ff_issue_grant_and_claim` stitches the two existing Lua fns under
+    one FCALL envelope. Postgres + SQLite: single tx wraps both
+    helper queries — no mid-flight observable state where a grant
+    exists without a matching claim.
+  - **Migration 0020 — `ff_budget_usage_by_exec`** (PG + SQLite).
+    Per-execution budget attribution ledger keyed on
+    `(partition, budget_id, execution_id, dimension)`. Columns:
+    `amount_milli` (i64, matching the existing `ff_budget_usage`
+    shape), `attempt_index` (to disambiguate retries), `ts_ms`.
+    Indexes: primary key on the 4-tuple + lookup index on
+    `(execution_id, budget_id)` for the release path. Cascade-
+    DELETE on `ff_exec_core` drop so retention trimming cleans
+    per-execution budget rows.
+  - **Lua library version 31** — new FCALLs `ff_record_spend`,
+    `ff_release_budget`, `ff_deliver_approval_signal`, and
+    `ff_issue_grant_and_claim` land in `lua/budget.lua` +
+    `lua/scheduling.lua`. Loader auto-reloads from v30 on first
+    contact; per-execution HASH shape is additive to the existing
+    `ff:budget:*` keyspace (new sub-key, no migration-on-read
+    needed).
+  - Tests: per-backend integration tests at
+    `crates/ff-backend-valkey/tests/typed_*_454.rs`,
+    `crates/ff-backend-postgres/tests/typed_*_454.rs`, and
+    `crates/ff-backend-sqlite/tests/typed_*_454.rs` — error-matrix
+    coverage (missing row, already-released, fence mismatch, approval
+    validation failure, grant-race with foreign claim) per method per
+    backend.
 - **#33 / Phase 1: 7 SQLite typed-FCALL bodies (cairn parity).** Flips
   `renew_lease`, `complete_execution`, `fail_execution`,
   `resume_execution`, `check_admission`, `evaluate_flow_eligibility`,

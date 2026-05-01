@@ -1,11 +1,17 @@
 //! Review CLI — tail the summarize execution, deliver an HMAC-signed
 //! approval signal when it suspends, OR cancel on rejection.
 //!
-//! Demonstrates two Batch B primitives:
-//!   * `GET /v1/executions/{id}/pending-waitpoints` to fetch the token.
-//!   * `POST /v1/executions/{id}/signal` with the HMAC-bound token. The
-//!     `--tamper-token` flag mutates the token before send so the user
-//!     can watch the server reject it with `invalid_token`.
+//! Demonstrates `POST /v1/executions/{id}/signal` with the HMAC-bound
+//! token. The `--tamper-token` flag mutates the token before send so the
+//! user can watch the server reject it with `invalid_token`.
+//!
+//! The `--waitpoint-id` + `--waitpoint-token` pair is printed by the
+//! summarize worker on suspend (look for `REVIEW_NEEDED ... wp=...` and
+//! `WAITPOINT_TOKEN=...`). ff-server dropped the token from
+//! `GET /v1/executions/{id}/pending-waitpoints` in v0.8.0 (RFC-017 Stage
+//! E4); operators copy the values from the suspending worker's log.
+//! v0.14 adds an admin-surface `read_waitpoint_token` so this can go
+//! back to a fetch.
 //!
 //! # Decision protocol: both approve AND reject deliver a signed signal
 //!
@@ -52,6 +58,18 @@ struct Args {
     /// Summarize execution id to review.
     #[arg(long)]
     execution_id: String,
+
+    /// Waitpoint id printed by the summarize worker on suspend (look for
+    /// `REVIEW_NEEDED eid=... wp=...`).
+    #[arg(long)]
+    waitpoint_id: String,
+
+    /// HMAC waitpoint token printed by the summarize worker on suspend
+    /// (look for `WAITPOINT_TOKEN=...`). Required because ff-server
+    /// dropped the token from the pending-waitpoints read endpoint in
+    /// v0.8.0 (RFC-017 Stage E4).
+    #[arg(long)]
+    waitpoint_token: String,
 
     /// Non-interactive: skip the prompt and approve immediately.
     #[arg(long)]
@@ -151,7 +169,7 @@ async fn main() -> Result<()> {
     // "completed" is an OK outcome — the pipeline moved on without us.
     match wait_for_review_window(&client, &args).await? {
         ReviewOutcome::Suspended => {
-            println!("[review] execution suspended — fetching waitpoint token");
+            println!("[review] execution suspended — using CLI-supplied waitpoint token");
         }
         ReviewOutcome::AlreadyCompleted => {
             println!(
@@ -162,48 +180,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let waitpoints = fetch_pending_waitpoints(&client, &args).await?;
-    // NOTE: the server already scopes the /pending-waitpoints response to
-    // the execution_id in the URL (see Server::list_pending_waitpoints).
-    // No client-side re-check needed; listing the waitpoint's
-    // execution_id here would be cosmetic.
-    //
-    // We match on `required_signal_names` so if a future use case
-    // surfaces more than one concurrent waitpoint on the same
-    // execution, the reviewer picks the one that actually waits for
-    // SIGNAL_NAME_APPROVAL rather than the first item in whatever order
-    // the server returned. A waitpoint with an empty list is the
-    // wildcard case; accept it as a fallback for the v1 single-waitpoint
-    // shape.
-    let candidates: Vec<_> = waitpoints
-        .into_iter()
-        .filter(|w| w.state == "active" || w.state == "pending")
-        .collect();
-    let wp = candidates
-        .iter()
-        .find(|w| {
-            w.required_signal_names
-                .iter()
-                .any(|n| n == SIGNAL_NAME_APPROVAL)
-        })
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|w| w.required_signal_names.is_empty())
-        })
-        .cloned()
-        .context(
-            "no active waitpoint waiting for summary_approved signal (and no wildcard fallback)",
-        )?;
-
     let decision = prompt_decision(&args)?;
 
     match decision {
         ApprovalDecision::Approve => {
             let token = if args.tamper_token {
-                tamper(&wp.waitpoint_token)
+                tamper(&args.waitpoint_token)
             } else {
-                wp.waitpoint_token.clone()
+                args.waitpoint_token.clone()
             };
             let signal_payload = serde_json::to_vec(&ApprovalDecision::Approve)?;
 
@@ -217,12 +201,12 @@ async fn main() -> Result<()> {
             // with other signal kinds we might add later.
             let idempotency_key = format!(
                 "review-approve/{}/{}",
-                args.execution_id, wp.waitpoint_id
+                args.execution_id, args.waitpoint_id
             );
 
             let body = serde_json::json!({
                 "execution_id": args.execution_id,
-                "waitpoint_id": wp.waitpoint_id,
+                "waitpoint_id": args.waitpoint_id,
                 "signal_id": uuid::Uuid::new_v4().to_string(),
                 "signal_name": SIGNAL_NAME_APPROVAL,
                 "signal_category": "human_review",
@@ -318,9 +302,9 @@ async fn main() -> Result<()> {
             // reason). This is symmetric with --approve, so --tamper-token
             // exercises HMAC rejection on both outcomes.
             let token = if args.tamper_token {
-                tamper(&wp.waitpoint_token)
+                tamper(&args.waitpoint_token)
             } else {
-                wp.waitpoint_token.clone()
+                args.waitpoint_token.clone()
             };
             let signal_payload = serde_json::to_vec(&ApprovalDecision::Reject {
                 reason: reason.clone(),
@@ -328,12 +312,12 @@ async fn main() -> Result<()> {
 
             let idempotency_key = format!(
                 "review-reject/{}/{}",
-                args.execution_id, wp.waitpoint_id
+                args.execution_id, args.waitpoint_id
             );
 
             let body = serde_json::json!({
                 "execution_id": args.execution_id,
-                "waitpoint_id": wp.waitpoint_id,
+                "waitpoint_id": args.waitpoint_id,
                 "signal_id": uuid::Uuid::new_v4().to_string(),
                 "signal_name": SIGNAL_NAME_APPROVAL,
                 "signal_category": "human_review",
@@ -545,18 +529,6 @@ async fn recheck_state(client: &Client, args: &Args) -> Result<String> {
     Ok(v.as_str().unwrap_or("unknown").to_owned())
 }
 
-async fn fetch_pending_waitpoints(client: &Client, args: &Args) -> Result<Vec<PendingWaitpoint>> {
-    let url = format!(
-        "{}/v1/executions/{}/pending-waitpoints",
-        args.server, args.execution_id
-    );
-    let resp = client.get(&url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("pending-waitpoints failed: {}", resp.status());
-    }
-    Ok(resp.json().await?)
-}
-
 fn prompt_decision(args: &Args) -> Result<ApprovalDecision> {
     if args.auto_approve {
         return Ok(ApprovalDecision::Approve);
@@ -646,26 +618,6 @@ async fn drain_and_stop(tail: tokio::task::JoinHandle<()>) {
 }
 
 // ── Wire types ────────────────────────────────────────────────────────
-
-#[derive(Clone, Deserialize)]
-struct PendingWaitpoint {
-    waitpoint_id: String,
-    #[allow(dead_code)]
-    waitpoint_key: String,
-    state: String,
-    waitpoint_token: String,
-    #[serde(default)]
-    required_signal_names: Vec<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    created_at: Option<i64>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    activated_at: Option<i64>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    expires_at: Option<i64>,
-}
 
 #[derive(Deserialize)]
 struct StreamFrame {

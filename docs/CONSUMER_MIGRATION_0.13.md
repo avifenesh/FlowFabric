@@ -519,11 +519,17 @@ from the default impl so out-of-tree backends compile unchanged.
   fallback chained call — it returns `Unavailable` so consumers
   cannot silently pick up a non-atomic path.
 
-**Parity status at v0.13.** Trait + types + Unavailable defaults
-land in this release. Valkey bodies land next (ship vehicle: #454
-Phase 3). PG + SQLite bodies follow (#454 Phases 4 + 5). Consumers
-compile-check against `Unavailable` on PG / SQLite until the
-per-backend phases merge.
+**Parity status at v0.13.0 (ship).** All four methods ship bodies on
+all three backends in the v0.13.0 tag — Valkey (PRs #464/#465/#466),
+Postgres (#467/#468/#469), SQLite (#470). Migration 0020
+(`ff_budget_usage_by_exec`) lands alongside the PG + SQLite bodies; Lua
+library version bumped to 31 with new FCALLs `ff_record_spend`,
+`ff_release_budget`, `ff_deliver_approval_signal`, and
+`ff_issue_grant_and_claim`. No `Unavailable` cells remain in the
+`POSTGRES_PARITY_MATRIX.md` row for these methods. See the live
+`examples/v013-cairn-454-budget-ledger/` demo for a ~180-line end-to-
+end walkthrough of the `record_spend` + `release_budget` pair against
+a local Valkey.
 
 **Before (v0.12, cairn's pattern for record_spend):**
 
@@ -614,8 +620,9 @@ points to the tracking FlowFabric issue/PR pair.
 | #434 Waitpoint-token read on trait | #438 | v0.13 |
 | #435 `pg.create_waitpoint` | #437 | v0.13 |
 | #387 `ferriskey` ReadOnly auto-refresh | #426 + #427 + #429 chain | v0.12 (realised) |
-| #389 Typed FCALL outcomes (service-layer) | #442 | v0.13 (Valkey); PG + SQLite bodies follow-up |
-| #436 PR-7b — `Engine` non-Valkey backend routing | #441 + #443 + #444 + #445 + #446 + #447 + #449 + final scaffolding | v0.13 |
+| #389 Typed FCALL outcomes (service-layer) | #442 (trait) + #453 PG bodies (#455–#461) + #33 SQLite bodies (#462) | v0.13 (all three backends) |
+| #436 PR-7b — `Engine` non-Valkey backend routing | #441 + #443 + #444 + #445 + #446 + #447 + #449 + #452 | v0.13 |
+| #454 Budget ledger + approval signal + grant-and-claim | #463 trait + #464/#465/#466 Valkey + #467/#468/#469 PG + #470 SQLite | v0.13 (all three backends) |
 
 **Per-issue summary.**
 

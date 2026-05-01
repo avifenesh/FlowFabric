@@ -6,7 +6,7 @@ This example exercises three mechanisms shipped in Batch B:
 
 - **Capability routing** (RFC-009): each execution declares `required_capabilities`; each worker advertises its `capabilities`. The scheduler subset-matches so transcribe tasks never reach the embed worker, etc. Executions that cannot be matched to any capable worker block in `lane_blocked_route` and are promoted by the unblock scanner when a capable worker appears.
 - **Stream tail with terminal signal** (RFC-006): workers stream incremental output (transcribe lines, LLM tokens, embed completion) as frames; the submit and review CLIs tail concurrently and stop cleanly on the stream's `closed_at` / `closed_reason` terminal markers instead of timeout fallbacks.
-- **HMAC-signed waitpoint signals** (RFC-004): the summarize worker suspends and receives a `waitpoint_token`. The review CLI fetches that token from `GET /v1/executions/{id}/pending-waitpoints` and must include it in the resume signal. Tampering with the token (via `--tamper-token`) surfaces as a server-side `invalid_token` rejection.
+- **HMAC-signed waitpoint signals** (RFC-004): the summarize worker suspends and receives a `waitpoint_token`, which it prints as `WAITPOINT_TOKEN=...` alongside `REVIEW_NEEDED eid=... wp=...`. The review CLI takes both values as `--waitpoint-id` + `--waitpoint-token` flags (ff-server dropped the token from `GET /v1/executions/{id}/pending-waitpoints` in v0.8.0 per RFC-017 Stage E4; v0.14 adds an admin read-path). Tampering with the token (via `--tamper-token`) surfaces as a server-side `invalid_token` rejection.
 
 ## Architecture
 
@@ -90,8 +90,14 @@ cargo run --bin embed &
 cargo run --bin submit -- --audio samples/story.wav --title demo
 
 # Terminal C — as soon as submit prints "[submit] summarize=<uuid>",
-# start the reviewer against that UUID:
-cargo run --bin review -- --execution-id <uuid>
+# start the reviewer. Watch the summarize worker log for
+#   REVIEW_NEEDED eid=<uuid> wp=<waitpoint-id>
+#   WAITPOINT_TOKEN=<hex>
+# and pass both through:
+cargo run --bin review -- \
+    --execution-id <uuid> \
+    --waitpoint-id <waitpoint-id> \
+    --waitpoint-token <hex>
 ```
 
 The review CLI prints incoming `summary_token` frames while waiting for the suspend, then prompts `Approve? [y/n]:`.
@@ -124,7 +130,11 @@ Kill the embed worker before submitting, watch the pipeline block at the embed s
 ```bash
 # With only transcribe + summarize running:
 cargo run --bin submit -- --audio samples/story.wav &
-cargo run --bin review -- --execution-id <uuid> --auto-approve
+cargo run --bin review -- \
+    --execution-id <uuid> \
+    --waitpoint-id <waitpoint-id> \
+    --waitpoint-token <hex> \
+    --auto-approve
 
 # submit output stalls after "summarize done" because embed has no claimer.
 # Start the embed worker now:
@@ -138,6 +148,8 @@ cargo run --bin embed
 ```bash
 cargo run --bin review -- \
     --execution-id <summarize-uuid> \
+    --waitpoint-id <waitpoint-id> \
+    --waitpoint-token <hex> \
     --tamper-token \
     --auto-approve
 ```

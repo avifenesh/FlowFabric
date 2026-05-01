@@ -278,9 +278,21 @@ Expected timeline output (times approximate):
 # Terminal 6:
 cargo run --release --bin submit -- --prompt "..." --review
 
-# Aggregator will suspend. In two separate terminals (reviewers):
-cargo run --release --bin approve -- --execution-id <aggregator-eid> --reviewer alice
-cargo run --release --bin approve -- --execution-id <aggregator-eid> --reviewer bob
+# Aggregator will suspend. Watch its log for a line like
+#   waitpoint_id=<wp-id> waitpoint_token=<hex>
+# and pass both to each reviewer invocation (ff-server dropped the
+# token from the pending-waitpoints read endpoint in v0.8.0 per
+# RFC-017 Stage E4; v0.14 adds an admin read-path):
+cargo run --release --bin approve -- \
+    --execution-id <aggregator-eid> \
+    --waitpoint-id <wp-id> \
+    --waitpoint-token <hex> \
+    --reviewer alice
+cargo run --release --bin approve -- \
+    --execution-id <aggregator-eid> \
+    --waitpoint-id <wp-id> \
+    --waitpoint-token <hex> \
+    --reviewer bob
 ```
 
 After both distinct-source signals arrive, aggregator resumes and
