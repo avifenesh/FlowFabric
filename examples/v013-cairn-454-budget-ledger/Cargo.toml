@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "v013-cairn-454-budget-ledger-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "budget-ledger"
+path = "src/main.rs"
+
+[dependencies]
+ff-core = { path = "../../crates/ff-core" }
+ff-script = { path = "../../crates/ff-script" }
+ff-backend-valkey = { path = "../../crates/ff-backend-valkey" }
+ferriskey = { path = "../../ferriskey" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

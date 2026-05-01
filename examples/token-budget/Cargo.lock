@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "ferriskey"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -368,11 +368,11 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.12.0"
+version = "0.13.0"
 
 [[package]]
 name = "ff-scheduler"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
@@ -418,7 +418,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flowfabric"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "ff-backend-valkey",
  "ff-core",

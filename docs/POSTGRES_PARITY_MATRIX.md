@@ -522,24 +522,33 @@ the raw `ferriskey::Value` + `check_fcall_success` + `parse_*`
 pattern. Args/Result types already existed in `ff_core::contracts`;
 this landing adds the trait-method surface.
 
-Valkey ships bodies at landing; PG + SQLite inherit
-`EngineError::Unavailable` until follow-up parity work — same
-staging as RFC-024 reclaim primitives + `claim_execution` above.
+All three backends now ship bodies at v0.13.0. PG + SQLite were
+deferred to `Unavailable` at landing and filled in during the v0.13
+delivery (#453 for these 6 + `claim_execution`, plus #33 for SQLite).
 
 | Method | Valkey | Postgres | SQLite | Notes |
 |---|---|---|---|---|
-| `complete_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `complete(handle)`. Valkey pre-reads `lane_id` + `current_worker_instance_id` from `exec_core` then delegates to `ff_complete_execution`. |
-| `fail_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `fail(handle, …)`. Same `exec_core` pre-read pattern; delegates to `ff_fail_execution`. |
-| `renew_lease` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Service-layer peer of `renew(handle)`. No pre-read needed — `ExecKeyContext` suffices. Delegates to `ff_renew_lease`. |
-| `resume_execution` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Lifecycle transition from suspended to runnable. Valkey pre-reads `lane_id` + `current_waitpoint_id` from `exec_core` then delegates to `ff_resume_execution`. |
-| `check_admission` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Atomic admission check against a quota policy. Takes `quota_policy_id: &QuotaPolicyId` and `dimension: &str` outside the `CheckAdmissionArgs` struct — quota keys live on the `{q:<policy>}` partition that cannot be derived from `execution_id`, and widening the existing pub-fields struct would semver-break. Empty `dimension` → `"default"`. Delegates to `ff_check_admission_and_record`. |
-| `evaluate_flow_eligibility` | `impl` | `Unavailable` (default) | `Unavailable` (default) | Read-only eligibility status (`eligible`, `blocked_by_dependencies`, …). Delegates to `ff_evaluate_flow_eligibility`. |
+| `complete_execution` | `impl` | `impl` | `impl` | Service-layer peer of `complete(handle)`. Valkey pre-reads `lane_id` + `current_worker_instance_id` from `exec_core` then delegates to `ff_complete_execution`. PG + SQLite land in #453/2 + #33. |
+| `fail_execution` | `impl` | `impl` | `impl` | Service-layer peer of `fail(handle, …)`. Same `exec_core` pre-read pattern; delegates to `ff_fail_execution`. PG + SQLite land in #453/3 + #33. |
+| `renew_lease` | `impl` | `impl` | `impl` | Service-layer peer of `renew(handle)`. No pre-read needed — `ExecKeyContext` suffices. Delegates to `ff_renew_lease`. PG + SQLite land in #453/1 + #33. |
+| `resume_execution` | `impl` | `impl` | `impl` | Lifecycle transition from suspended to runnable. Valkey pre-reads `lane_id` + `current_waitpoint_id` from `exec_core` then delegates to `ff_resume_execution`. PG + SQLite land in #453/4 + #33. |
+| `check_admission` | `impl` | `impl` | `impl` | Atomic admission check against a quota policy. Takes `quota_policy_id: &QuotaPolicyId` and `dimension: &str` outside the `CheckAdmissionArgs` struct — quota keys live on the `{q:<policy>}` partition that cannot be derived from `execution_id`, and widening the existing pub-fields struct would semver-break. Empty `dimension` → `"default"`. Delegates to `ff_check_admission_and_record`. PG + SQLite land in #453/5 + #33. |
+| `evaluate_flow_eligibility` | `impl` | `impl` | `impl` | Read-only eligibility status (`eligible`, `blocked_by_dependencies`, …). Delegates to `ff_evaluate_flow_eligibility`. PG + SQLite land in #453/6 + #33. |
+| `claim_execution` | `impl` | `impl` | `impl` | Service-layer peer of `claim_for_worker` that takes `(execution_id, worker)` directly — bypasses scheduler lane-routing. Valkey: `FCALL ff_claim_execution`. PG + SQLite: single-tx attempt-insert + exec_core lifecycle flip, mirrors the PG `ff_attempt` row UPSERT shape. Lands in #453/7 + #33. |
 
-PG + SQLite parity for this surface is the v0.13 follow-up scope.
-Until the bodies land, consumers compiling against those backends
-receive `EngineError::Unavailable { op: "<name>" }` on dispatch — a
-terminal, non-retryable classification the `ErrorClass` mapping
-already handles.
+### cairn #454 — control-plane additions (v0.13)
+
+Four additional typed `EngineBackend` trait methods added during the
+v0.13 cycle to close the last raw-`ferriskey` dispatch sites in
+cairn's control plane. All four land bodies on every backend at
+v0.13.0 — no staged deferrals.
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `record_spend` | `impl` | `impl` | `impl` | Per-execution budget attribution via `ff_budget_usage_by_exec` (migration 0020). Valkey: `FCALL ff_record_spend` (per-execution HASH keyed by dimension). PG + SQLite: upsert under the budget's READ-COMMITTED / `BEGIN IMMEDIATE` tx — same counter semantics as `ff_budget_usage` but scoped per `(budget_id, execution_id, dimension)` so reversal is idempotent-safe. |
+| `release_budget` | `impl` | `impl` | `impl` | Idempotent reversal. Reads the per-execution stamp, decrements the aggregate counter by the exact recorded amount, DELETEs the per-execution row — all in one tx. Missing-row returns `Ok(())`. |
+| `deliver_approval_signal` | `impl` | `impl` | `impl` | Approval-typed specialisation over the suspend/signal path. Valkey: `FCALL ff_deliver_approval_signal`. PG + SQLite: inlined approval validation inside the `ff_suspension_current` + `ff_signal_event` outbox tx. |
+| `issue_grant_and_claim` | `impl` | `impl` | `impl` | Backend-atomic composition of `issue_reclaim_grant` + `claim_from_grant`. Valkey: single `FCALL ff_issue_grant_and_claim`. PG + SQLite: single tx wraps both helper queries — no mid-flight observable state where a grant exists without a matching claim. |
 
 ### PR-7b scanner + cairn #434 additions (v0.13)
 
