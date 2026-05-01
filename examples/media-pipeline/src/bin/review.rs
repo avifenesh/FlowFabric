@@ -5,13 +5,11 @@
 //! token. The `--tamper-token` flag mutates the token before send so the
 //! user can watch the server reject it with `invalid_token`.
 //!
-//! The `--waitpoint-id` + `--waitpoint-token` pair is printed by the
-//! summarize worker on suspend (look for `REVIEW_NEEDED ... wp=...` and
-//! `WAITPOINT_TOKEN=...`). ff-server dropped the token from
-//! `GET /v1/executions/{id}/pending-waitpoints` in v0.8.0 (RFC-017 Stage
-//! E4); operators copy the values from the suspending worker's log.
-//! v0.14 adds an admin-surface `read_waitpoint_token` so this can go
-//! back to a fetch.
+//! The `--waitpoint-id` is printed by the summarize worker on suspend
+//! (look for `REVIEW_NEEDED ... wp=...`). The raw HMAC
+//! `waitpoint_token` is fetched through the admin client's
+//! `read_waitpoint_token` helper (ff-sdk v0.14) — operators no longer
+//! copy it out of the worker's log.
 //!
 //! # Decision protocol: both approve AND reject deliver a signed signal
 //!
@@ -40,6 +38,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ff_core::types::{ExecutionId, WaitpointId};
+use ff_sdk::admin::FlowFabricAdminClient;
 use media_pipeline::{
     ApprovalDecision, FRAME_FIELD_PAYLOAD, FRAME_FIELD_TYPE, SIGNAL_NAME_APPROVAL,
 };
@@ -60,16 +60,10 @@ struct Args {
     execution_id: String,
 
     /// Waitpoint id printed by the summarize worker on suspend (look for
-    /// `REVIEW_NEEDED eid=... wp=...`).
+    /// `REVIEW_NEEDED eid=... wp=...`). The raw HMAC `waitpoint_token`
+    /// is resolved through the admin client at runtime (v0.14).
     #[arg(long)]
     waitpoint_id: String,
-
-    /// HMAC waitpoint token printed by the summarize worker on suspend
-    /// (look for `WAITPOINT_TOKEN=...`). Required because ff-server
-    /// dropped the token from the pending-waitpoints read endpoint in
-    /// v0.8.0 (RFC-017 Stage E4).
-    #[arg(long)]
-    waitpoint_token: String,
 
     /// Non-interactive: skip the prompt and approve immediately.
     #[arg(long)]
@@ -169,7 +163,7 @@ async fn main() -> Result<()> {
     // "completed" is an OK outcome — the pipeline moved on without us.
     match wait_for_review_window(&client, &args).await? {
         ReviewOutcome::Suspended => {
-            println!("[review] execution suspended — using CLI-supplied waitpoint token");
+            println!("[review] execution suspended — fetching waitpoint token");
         }
         ReviewOutcome::AlreadyCompleted => {
             println!(
@@ -180,14 +174,49 @@ async fn main() -> Result<()> {
         }
     }
 
+    // v0.14: fetch the HMAC waitpoint_token through the admin client.
+    // Only reached on the Suspended branch, so a missing token here is
+    // a legitimate error (race: peer reviewer consumed it between our
+    // state poll and this fetch — the state recheck paths below catch
+    // the concrete outcome).
+    let admin = match args.api_token.as_deref() {
+        Some(t) => FlowFabricAdminClient::with_token(&args.server, t)?,
+        None => FlowFabricAdminClient::new(&args.server)?,
+    };
+    let execution_id_parsed = ExecutionId::parse(&args.execution_id)?;
+    let waitpoint_id_parsed = WaitpointId::parse(&args.waitpoint_id)?;
+    let fetched_waitpoint_token = match admin
+        .read_waitpoint_token(&execution_id_parsed, &waitpoint_id_parsed)
+        .await?
+    {
+        Some(t) => t,
+        None => {
+            // Race: peer already consumed the waitpoint. Re-check state
+            // and surface the same "peer won" exit-0 path the /signal
+            // error handlers use below.
+            let recheck = recheck_state(&client, &args).await.unwrap_or_default();
+            if recheck == "completed" || recheck == "failed" || recheck == "cancelled" {
+                println!(
+                    "[review] waitpoint token missing and state={recheck} — peer won; exiting 0"
+                );
+                drain_and_stop(tail).await;
+                return Ok(());
+            }
+            anyhow::bail!(
+                "waitpoint token fetch returned None but state={recheck}; \
+                 this indicates waitpoint id drift or an expired waitpoint"
+            );
+        }
+    };
+
     let decision = prompt_decision(&args)?;
 
     match decision {
         ApprovalDecision::Approve => {
             let token = if args.tamper_token {
-                tamper(&args.waitpoint_token)
+                tamper(&fetched_waitpoint_token)
             } else {
-                args.waitpoint_token.clone()
+                fetched_waitpoint_token.clone()
             };
             let signal_payload = serde_json::to_vec(&ApprovalDecision::Approve)?;
 
@@ -302,9 +331,9 @@ async fn main() -> Result<()> {
             // reason). This is symmetric with --approve, so --tamper-token
             // exercises HMAC rejection on both outcomes.
             let token = if args.tamper_token {
-                tamper(&args.waitpoint_token)
+                tamper(&fetched_waitpoint_token)
             } else {
-                args.waitpoint_token.clone()
+                fetched_waitpoint_token.clone()
             };
             let signal_payload = serde_json::to_vec(&ApprovalDecision::Reject {
                 reason: reason.clone(),

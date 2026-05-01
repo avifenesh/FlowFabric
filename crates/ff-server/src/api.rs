@@ -587,6 +587,10 @@ pub fn router_with_metrics(
             "/v1/executions/{id}/pending-waitpoints",
             get(list_pending_waitpoints),
         )
+        .route(
+            "/v1/executions/{id}/waitpoints/{waitpoint_id}/token",
+            get(get_waitpoint_token),
+        )
         .route("/v1/executions/{id}/result", get(get_execution_result))
         .route(
             "/v1/executions/{id}/cancel",
@@ -935,6 +939,52 @@ async fn list_pending_waitpoints(
     let args = ff_core::contracts::ListPendingWaitpointsArgs::new(eid);
     let page = server.backend().list_pending_waitpoints(args).await?;
     Ok(Json(page.entries).into_response())
+}
+
+#[derive(Serialize)]
+struct WaitpointTokenResponse {
+    token: String,
+}
+
+/// Operator-only read of the raw HMAC `waitpoint_token` for a specific
+/// `(execution_id, waitpoint_id)`. Dispatches through
+/// [`EngineBackend::read_waitpoint_token`]; partition is derived from
+/// the path-parsed `ExecutionId`.
+///
+/// The sibling `/pending-waitpoints` route intentionally sanitises this
+/// field (RFC-017 Stage E4). This endpoint re-exposes it behind the
+/// server's bearer-auth layer so operator tooling (approval CLIs,
+/// external-callback bridges) can fetch a delivery credential
+/// programmatically instead of copy-pasting from worker logs. Without
+/// `api_token` configured the server accepts the call unauthenticated —
+/// production deployments MUST run with `api_token` set.
+///
+/// Returns 200 `{"token": "..."}` when present; 404 when the backend
+/// reports `Ok(None)` (waitpoint consumed, expired, or never existed).
+async fn get_waitpoint_token(
+    State(server): State<Arc<Server>>,
+    Path((id, waitpoint_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let eid = parse_execution_id(&id)?;
+    let wp_id = WaitpointId::parse(&waitpoint_id).map_err(|e| {
+        ApiError::from(ServerError::InvalidInput(format!(
+            "waitpoint_id: {e}"
+        )))
+    })?;
+    let partition = ff_core::partition::PartitionKey::from(&ff_core::partition::Partition {
+        family: ff_core::partition::PartitionFamily::Flow,
+        index: eid.partition(),
+    });
+    match server.backend().read_waitpoint_token(partition, &wp_id).await? {
+        Some(token) => Ok(Json(WaitpointTokenResponse { token }).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody::plain(
+                "waitpoint token not found (consumed, expired, or unknown id)".to_owned(),
+            )),
+        )
+            .into_response()),
+    }
 }
 
 /// Returns the raw result payload bytes written by the worker's
