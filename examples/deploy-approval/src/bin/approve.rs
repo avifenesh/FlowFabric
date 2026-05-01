@@ -24,7 +24,7 @@ struct Args {
     #[arg(long)]
     execution_id: String,
     /// Waitpoint id printed by `deploy` on suspend (look for
-    /// `[timeline] deploy_suspended ... waitpoint_id=...`). v0.14 the
+    /// `[timeline] deploy_suspended ... waitpoint_id=...`). In v0.14 the
     /// raw `waitpoint_token` is fetched through the admin client's
     /// `read_waitpoint_token` helper — callers no longer copy it from
     /// the worker log.

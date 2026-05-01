@@ -193,8 +193,18 @@ async fn main() -> Result<()> {
         None => {
             // Race: peer already consumed the waitpoint. Re-check state
             // and surface the same "peer won" exit-0 path the /signal
-            // error handlers use below.
-            let recheck = recheck_state(&client, &args).await.unwrap_or_default();
+            // error handlers use below. Propagate the recheck error —
+            // the decision between "peer won" and "drift" depends on
+            // an authoritative state read; silently defaulting to ""
+            // on a network blip would misclassify it as drift.
+            let recheck = recheck_state(&client, &args).await.with_context(|| {
+                format!(
+                    "waitpoint token fetch returned None for execution_id={}, \
+                     waitpoint_id={}; state recheck also failed, cannot \
+                     distinguish peer-won from waitpoint drift",
+                    args.execution_id, args.waitpoint_id,
+                )
+            })?;
             if recheck == "completed" || recheck == "failed" || recheck == "cancelled" {
                 println!(
                     "[review] waitpoint token missing and state={recheck} — peer won; exiting 0"
