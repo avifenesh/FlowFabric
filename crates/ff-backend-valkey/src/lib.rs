@@ -41,9 +41,10 @@ use ff_core::contracts::{
     AdditionalWaitpointBinding, BlockRouteArgs, BlockRouteOutcome, CancelFlowArgs,
     CancelFlowResult, ClaimExecutionArgs, ClaimExecutionResult, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult, CompositeBody,
-    ClaimGrantOutcome, CountKind, DeliverSignalArgs, DeliverSignalResult, EdgeDirection,
-    EdgeSnapshot, ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus, FlowSummary,
-    IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs, IssueReclaimGrantArgs,
+    ClaimGrantOutcome, CountKind, DeliverApprovalSignalArgs, DeliverSignalArgs, DeliverSignalResult,
+    EdgeDirection, EdgeSnapshot, ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus,
+    FlowSummary, IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs,
+    IssueReclaimGrantArgs,
     IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
     ListSuspendedPage, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
     RecordSpendArgs, ReleaseBudgetArgs, ScanEligibleArgs,
@@ -62,7 +63,7 @@ use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
 use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
 use ff_core::types::{
     AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseFence,
-    LeaseId, SignalId, TimestampMs, WaitpointId, WorkerId, WorkerInstanceId,
+    LeaseId, SignalId, TimestampMs, WaitpointId, WaitpointToken, WorkerId, WorkerInstanceId,
 };
 use ff_script::engine_error_ext::transport_script;
 use ff_script::error::ScriptError;
@@ -4137,6 +4138,123 @@ async fn deliver_signal_impl(
         .map_err(EngineError::from)
 }
 
+/// Cairn #454 Phase 3c — operator-driven approval-signal delivery.
+///
+/// Pre-shaped variant of [`deliver_signal_impl`] where the caller does
+/// **not** carry the waitpoint token. The backend reads the token from
+/// `ff:wp:<tag>:<wp_id>` via [`read_waitpoint_token_impl`], HMAC-verifies
+/// server-side (Lua `validate_waitpoint_token` inside `ff_deliver_signal`),
+/// and dispatches. The operator API never handles the token bytes.
+///
+/// Missing waitpoint → [`EngineError::NotFound`] `{ entity: "waitpoint" }`.
+/// Other invariants (execution-gone, dedup, capacity) surface unchanged
+/// through the shared [`ff_deliver_signal`] FCALL.
+#[tracing::instrument(
+    name = "ff.deliver_approval_signal",
+    skip_all,
+    fields(
+        backend = "valkey",
+        execution_id = %args.execution_id,
+        waitpoint_id = %args.waitpoint_id,
+        lane = %args.lane_id,
+    )
+)]
+async fn deliver_approval_signal_impl(
+    client: &ferriskey::Client,
+    partition_config: &PartitionConfig,
+    args: DeliverApprovalSignalArgs,
+) -> Result<DeliverSignalResult, EngineError> {
+    let partition = execution_partition(&args.execution_id, partition_config);
+    let partition_key = PartitionKey::from(&partition);
+
+    // Server-side token lookup. Cairn #454 comment 4355865937 option
+    // (a): the operator never carries the HMAC token; the backend
+    // reads it here and the Lua re-verifies it alongside the signal
+    // delivery in one FCALL.
+    let token_str = read_waitpoint_token_impl(client, &partition_key, &args.waitpoint_id)
+        .await?
+        .ok_or(EngineError::NotFound {
+            entity: "waitpoint",
+        })?;
+
+    // Compose DeliverSignalArgs. Conventions per the task brief:
+    //   - signal_category = "approval"
+    //   - source_type     = "operator"
+    //   - source_identity = ""          (cairn audit log holds decided_by)
+    //   - idempotency_key = approval:<signal_name>:<idempotency_suffix>
+    //   - target_scope    = "execution" (parity with deliver_signal default
+    //                                    used by ff-server + smoke)
+    //   - payload / payload_encoding / correlation_id / resume_delay_ms:
+    //     absent (approval signals carry no body; cairn stores side data).
+    let idempotency_key =
+        format!("approval:{}:{}", args.signal_name, args.idempotency_suffix);
+
+    // Pre-read the authoritative `lane_id` from `exec_core` — the same
+    // guard `deliver_signal_impl` uses. `ff_deliver_signal` mutates
+    // lane-specific index ZSETs purely from the KEYS we pass, so trusting
+    // the caller-supplied `args.lane_id` would let a stale or wrong value
+    // leak state into the wrong lane's suspended/eligible/delayed index
+    // (PR #465 Copilot review).
+    let ctx = ExecKeyContext::new(&partition, &args.execution_id);
+    let lane_str: Option<String> = client
+        .cmd("HGET")
+        .arg(ctx.core())
+        .arg("lane_id")
+        .execute()
+        .await
+        .map_err(transport_fk)?;
+    let authoritative_lane = LaneId::new(lane_str.unwrap_or_else(|| "default".to_owned()));
+    if authoritative_lane.as_str() != args.lane_id.as_str() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "lane_mismatch: args.lane_id={} exec_core.lane_id={}",
+                args.lane_id.as_str(),
+                authoritative_lane.as_str()
+            ),
+        });
+    }
+
+    // Capture one wall-clock sample and reuse it for both `created_at`
+    // and `now` so the args represent a single dispatch moment
+    // (PR #465 gemini review).
+    let now = TimestampMs::now();
+    let ds = DeliverSignalArgs {
+        execution_id: args.execution_id.clone(),
+        waitpoint_id: args.waitpoint_id.clone(),
+        signal_id: SignalId::new(),
+        signal_name: args.signal_name.clone(),
+        signal_category: "approval".to_owned(),
+        source_type: "operator".to_owned(),
+        source_identity: String::new(),
+        payload: None,
+        payload_encoding: None,
+        correlation_id: None,
+        idempotency_key: Some(idempotency_key),
+        target_scope: "execution".to_owned(),
+        created_at: Some(now),
+        dedup_ttl_ms: Some(args.signal_dedup_ttl_ms),
+        resume_delay_ms: None,
+        max_signals_per_execution: args.max_signals_per_execution,
+        signal_maxlen: args.maxlen,
+        waitpoint_token: WaitpointToken::new(token_str),
+        now,
+    };
+
+    // Dispatch through the shared deliver_signal body — same ExecKey /
+    // Index / lane-key wiring, and the same Lua FCALL re-verifies the
+    // token we just looked up.
+    let idx = IndexKeys::new(&partition);
+    let keys = SignalOpKeys {
+        ctx: &ctx,
+        idx: &idx,
+        lane_id: &authoritative_lane,
+    };
+    ff_deliver_signal(client, &keys, &ds)
+        .await
+        .map_err(EngineError::from)
+}
+
 /// Fresh-find claim implementation (Wave 2, v0.7).
 ///
 /// Scans the lane's eligible ZSET across every execution partition,
@@ -5803,6 +5921,20 @@ impl EngineBackend for ValkeyBackend {
             .await
             .map_err(|e| {
                 ff_core::engine_error::backend_context(e, "deliver_signal: FCALL ff_deliver_signal")
+            })
+    }
+
+    async fn deliver_approval_signal(
+        &self,
+        args: DeliverApprovalSignalArgs,
+    ) -> Result<DeliverSignalResult, EngineError> {
+        deliver_approval_signal_impl(&self.client, &self.partition_config, args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    e,
+                    "deliver_approval_signal: HGET ff:wp:<tag>:<wp_id> + FCALL ff_deliver_signal",
+                )
             })
     }
 
