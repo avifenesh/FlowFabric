@@ -537,6 +537,17 @@ async fn test_get_waitpoint_token_returns_token_after_suspend() {
         .expect("waitpoint-token request failed");
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // Pin the no-store header on the success path: the token is a
+    // bearer-equivalent HMAC credential and must not be persisted by
+    // intermediaries.
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "waitpoint_token response must carry Cache-Control: no-store"
+    );
+
     let body: serde_json::Value = resp.json().await.expect("body parse");
     let token = body
         .get("token")
@@ -565,6 +576,15 @@ async fn test_get_waitpoint_token_unknown_id_returns_404() {
         .await
         .expect("waitpoint-token request failed");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // no-store also on the 404 path so intermediaries can't cache
+    // negative lookups (would leak "waitpoint id {X} unknown" signal).
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "404 response must also carry Cache-Control: no-store"
+    );
 }
 
 /// A nonexistent execution returns 404.

@@ -975,16 +975,28 @@ async fn get_waitpoint_token(
         family: ff_core::partition::PartitionFamily::Flow,
         index: eid.partition(),
     });
-    match server.backend().read_waitpoint_token(partition, &wp_id).await? {
-        Some(token) => Ok(Json(WaitpointTokenResponse { token }).into_response()),
-        None => Ok((
+    let mut response = match server.backend().read_waitpoint_token(partition, &wp_id).await? {
+        Some(token) => Json(WaitpointTokenResponse { token }).into_response(),
+        None => (
             StatusCode::NOT_FOUND,
             Json(ErrorBody::plain(
                 "waitpoint token not found (consumed, expired, or unknown id)".to_owned(),
             )),
         )
-            .into_response()),
-    }
+            .into_response(),
+    };
+    // The token is a bearer-equivalent HMAC credential — disable HTTP
+    // caching on BOTH the 200 and 404 paths so intermediaries or
+    // browser-like clients don't persist the body, and also so the
+    // 404 (which is negative-cacheable by default) can't leak a
+    // "this waitpoint id is unknown" signal past its consumption.
+    response
+        .headers_mut()
+        .insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    Ok(response)
 }
 
 /// Returns the raw result payload bytes written by the worker's
