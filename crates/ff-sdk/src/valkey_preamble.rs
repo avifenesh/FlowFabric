@@ -121,7 +121,15 @@ pub(crate) async fn run(
     // tokens, `,`-bearing tokens, and whitespace/control chars so
     // operator misconfig fails loud at boot instead of silently
     // mis-routing forever.
-    #[cfg(feature = "direct-valkey-claim")]
+    //
+    // v0.13 ungate: these run on every worker, not just the
+    // `direct-valkey-claim` feature, because the server-routed claim
+    // path needs `ff:idx:workers` + `ff:worker:{id}:caps` populated for
+    // the unblock scanner's `load_worker_caps_union` read to promote
+    // `blocked_by_route` executions with `required_capabilities` →
+    // `runnable`. Without the writes, first-stage execs sit in
+    // `blocked_by_route` forever (caught in v0.13 release gate via the
+    // `media-pipeline` example).
     for cap in &config.capabilities {
         if cap.is_empty() {
             return Err(SdkError::Config {
@@ -150,7 +158,6 @@ pub(crate) async fn run(
             });
         }
     }
-    #[cfg(feature = "direct-valkey-claim")]
     let capabilities_csv: String = {
         let set: std::collections::BTreeSet<&str> = config
             .capabilities
@@ -197,13 +204,16 @@ pub(crate) async fn run(
         );
     }
 
-    // Non-authoritative advertisement of caps for operator visibility
-    // (CLI introspection, dashboards). The AUTHORITATIVE source for
-    // scheduling decisions is ARGV[9] on each claim. The caps STRING is
+    // Advertisement of caps for the unblock scanner + operator
+    // visibility (CLI introspection, dashboards). Per Phase 3d of
+    // cairn #453 the scanner's `load_worker_caps_union` drives
+    // `blocked_by_route → runnable` promotion; server-routed workers
+    // need these keys populated too, not just `direct-valkey-claim`
+    // ones. The AUTHORITATIVE source for scheduling decisions at
+    // claim-time is still ARGV[9] on each claim. The caps STRING is
     // written BEFORE the index SADD so that when the scheduler's
     // unblock scanner observes the id in the index, the caps key is
     // guaranteed to resolve to a non-stale CSV.
-    #[cfg(feature = "direct-valkey-claim")]
     {
         let caps_key = ff_core::keys::worker_caps_key(&config.worker_instance_id);
         let index_key = ff_core::keys::workers_index_key();
