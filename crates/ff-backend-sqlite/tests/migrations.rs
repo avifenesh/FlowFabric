@@ -127,8 +127,8 @@ async fn sqlx_migration_ledger_records_all_14() {
             .await
             .expect("query _sqlx_migrations");
     assert_eq!(
-        count, 17,
-        "expected 17 successful migrations (0001..=0014 + 0016 + 0017 + 0018), got {count}"
+        count, 18,
+        "expected 18 successful migrations (0001..=0014 + 0016 + 0017 + 0018 + 0020), got {count}"
     );
 }
 
@@ -193,5 +193,9 @@ async fn migration_annotation_ledger_populated() {
     let mut expected: Vec<i64> = (1..=14).collect();
     expected.push(16);
     expected.push(17);
+    // 0018: completion_event lookup idx (pre-existing). 0020: per-exec
+    // budget ledger (cairn #454 Phase 4a/5). Note: 0018_completion_event_lookup_idx
+    // does NOT insert into `ff_migration_annotation`; only 0020 is added here.
+    expected.push(20);
     assert_eq!(versions, expected);
 }

@@ -3053,6 +3053,50 @@ impl EngineBackend for SqliteBackend {
         crate::budget::report_usage_admin_impl(&self.inner.pool, budget_id, args).await
     }
 
+    // ── cairn #454 Phase 5 — typed-FCALL bodies for SQLite ──────────
+
+    #[cfg(feature = "core")]
+    async fn record_spend(
+        &self,
+        args: ff_core::contracts::RecordSpendArgs,
+    ) -> Result<ReportUsageResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| crate::typed_ops::record_spend(pool, args.clone())).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn release_budget(
+        &self,
+        args: ff_core::contracts::ReleaseBudgetArgs,
+    ) -> Result<(), EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| crate::typed_ops::release_budget(pool, args.clone())).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn deliver_approval_signal(
+        &self,
+        args: ff_core::contracts::DeliverApprovalSignalArgs,
+    ) -> Result<ff_core::contracts::DeliverSignalResult, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| {
+            crate::typed_ops::deliver_approval_signal(pool, pubsub, args.clone())
+        })
+        .await
+    }
+
+    #[cfg(feature = "core")]
+    async fn issue_grant_and_claim(
+        &self,
+        args: ff_core::contracts::IssueGrantAndClaimArgs,
+    ) -> Result<ff_core::contracts::ClaimGrantOutcome, EngineError> {
+        let pool = &self.inner.pool;
+        let pubsub = &self.inner.pubsub;
+        retry_serializable(|| crate::typed_ops::issue_grant_and_claim(pool, pubsub, args.clone()))
+            .await
+    }
+
     #[cfg(feature = "streaming")]
     async fn read_stream(
         &self,
