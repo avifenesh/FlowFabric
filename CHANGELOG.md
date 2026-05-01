@@ -7,6 +7,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`ff_sdk::signal_bridge` module** — `SignalBridgeError` enum
+  (`UnknownWaitpoint`, `TokenMismatch`, `Backend(SdkError)`) and
+  `verify_and_deliver` / `verify_and_deliver_arc` helpers. Extracts the
+  ad-hoc signal-bridge shape previously duplicated in
+  `examples/external-callback/`: reads the stored waitpoint token via
+  [`EngineBackend::read_waitpoint_token`], constant-time compares it
+  against the presented HMAC (via the `subtle` crate), and forwards
+  through [`FlowFabricWorker::deliver_signal`] on match. Consumers
+  building webhook / email-callback bridges can now depend on the
+  typed error surface instead of reinventing it. Gated behind
+  `valkey-default` for the v0.14 delivery; the trait reads it depends
+  on are in every backend's shipped surface as of v0.13.
 - **`FlowFabricAdminClient::read_waitpoint_token`** — admin-surface
   helper that fetches the raw HMAC `waitpoint_token` for a given
   `(execution_id, waitpoint_id)`. Covers both the HTTP transport

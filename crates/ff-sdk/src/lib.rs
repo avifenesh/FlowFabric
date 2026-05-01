@@ -100,6 +100,11 @@ pub mod snapshot;
 // reachable under `default-features = false, features = ["sqlite"]`
 // so consumers can name `ClaimedTask` as a type.
 pub mod task;
+// v0.14 P1.2 — signal-bridge helper extracted from the v0.13
+// external-callback example. Uses `FlowFabricWorker::deliver_signal`
+// (Valkey-default-gated) so the module itself is gated in lockstep.
+#[cfg(feature = "valkey-default")]
+pub mod signal_bridge;
 // v0.12 PR-6: Valkey-specific connect preamble extracted from
 // `FlowFabricWorker::connect`. Gated behind `valkey-default` because
 // the body is all ferriskey `client.cmd(...)` + `client.hgetall(...)`.
