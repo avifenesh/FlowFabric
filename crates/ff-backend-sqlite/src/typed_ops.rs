@@ -42,16 +42,24 @@
 //! catches the same violations Valkey's full-triple check catches.
 
 use ff_core::contracts::{
-    CheckAdmissionArgs, CheckAdmissionResult, CompleteExecutionArgs, CompleteExecutionResult,
-    FailExecutionArgs, FailExecutionResult, RenewLeaseArgs, RenewLeaseResult,
-    ResumeExecutionArgs, ResumeExecutionResult,
+    CheckAdmissionArgs, CheckAdmissionResult, ClaimGrantOutcome, CompleteExecutionArgs,
+    CompleteExecutionResult, DeliverApprovalSignalArgs, DeliverSignalArgs, DeliverSignalResult,
+    FailExecutionArgs, FailExecutionResult, IssueGrantAndClaimArgs, RecordSpendArgs,
+    ReleaseBudgetArgs, RenewLeaseArgs, RenewLeaseResult, ReportUsageResult, ResumeExecutionArgs,
+    ResumeExecutionResult,
 };
 use ff_core::engine_error::{ContentionKind, EngineError, StateKind, ValidationKind};
 use ff_core::partition::PartitionConfig;
 use ff_core::state::PublicState;
-use ff_core::types::{AttemptIndex, CancelSource, QuotaPolicyId, TimestampMs};
+use ff_core::types::{
+    AttemptId, AttemptIndex, CancelSource, ExecutionId, LaneId, LeaseEpoch, LeaseId, QuotaPolicyId,
+    SignalId, TimestampMs, WaitpointToken, WorkerId, WorkerInstanceId,
+};
+use serde_json::{json, Value as JsonValue};
 use sqlx::Row;
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
+use uuid::Uuid;
 
 use crate::backend::{
     begin_immediate, commit_or_rollback, insert_completion_event_ev, insert_lease_event,
@@ -1414,6 +1422,747 @@ pub(crate) async fn claim_execution(
                 ff_core::backend::stub_handle_fresh(),
             );
             Ok(ClaimExecutionResult::Claimed(claimed))
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// cairn #454 Phase 5 — SQLite bodies for the four typed-FCALL methods
+// (record_spend / release_budget / deliver_approval_signal /
+// issue_grant_and_claim). Mirrors the Postgres references in
+// `ff-backend-postgres/src/budget.rs`, `…/suspend_ops.rs`, and
+// `…/typed_ops.rs`. SQLite single-partition (partition_key = 0, per
+// `crate::budget::PART`) + single-writer (BEGIN IMMEDIATE + §4.1 A3)
+// replaces PG's partition-hash math, `FOR NO KEY UPDATE`, and
+// `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`.
+// ───────────────────────────────────────────────────────────────────
+
+const BUDGET_PART: i64 = 0;
+/// Dedup-expiry window. Same 24h constant as PG + SQLite budget.rs.
+const DEDUP_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+
+fn dim_row_key(name: &str) -> String {
+    name.to_string()
+}
+
+fn limits_from_policy(policy: &JsonValue, key: &str) -> BTreeMap<String, u64> {
+    policy
+        .get(key)
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn outcome_to_json_text(r: &ReportUsageResult) -> String {
+    match r {
+        ReportUsageResult::Ok => json!({"kind": "Ok"}),
+        ReportUsageResult::AlreadyApplied => json!({"kind": "AlreadyApplied"}),
+        ReportUsageResult::SoftBreach {
+            dimension,
+            current_usage,
+            soft_limit,
+        } => json!({
+            "kind": "SoftBreach",
+            "dimension": dimension,
+            "current_usage": current_usage,
+            "soft_limit": soft_limit,
+        }),
+        ReportUsageResult::HardBreach {
+            dimension,
+            current_usage,
+            hard_limit,
+        } => json!({
+            "kind": "HardBreach",
+            "dimension": dimension,
+            "current_usage": current_usage,
+            "hard_limit": hard_limit,
+        }),
+        _ => json!({"kind": "Ok"}),
+    }
+    .to_string()
+}
+
+/// Extract the bare UUID-as-text for the `ff_budget_usage_by_exec.execution_id`
+/// TEXT column (migration 0020).
+fn exec_uuid_text(eid: &ExecutionId) -> Result<String, EngineError> {
+    let (_, uuid) = split_exec_id(eid)?;
+    Ok(uuid.to_string())
+}
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::record_spend`].
+pub(crate) async fn record_spend(
+    pool: &SqlitePool,
+    args: RecordSpendArgs,
+) -> Result<ReportUsageResult, EngineError> {
+    let budget_id_str = args.budget_id.to_string();
+    let exec_uuid_str = exec_uuid_text(&args.execution_id)?;
+    let now = now_ms();
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let result = async {
+        // ── Dedup reservation ──
+        let dedup_owned: Option<String> = if args.idempotency_key.is_empty() {
+            None
+        } else {
+            let inserted = sqlx::query(
+                "INSERT INTO ff_budget_usage_dedup \
+                     (partition_key, dedup_key, outcome_json, applied_at_ms, expires_at_ms) \
+                 VALUES (?1, ?2, '{}', ?3, ?4) \
+                 ON CONFLICT (partition_key, dedup_key) DO NOTHING \
+                 RETURNING applied_at_ms",
+            )
+            .bind(BUDGET_PART)
+            .bind(&args.idempotency_key)
+            .bind(now)
+            .bind(now + DEDUP_TTL_MS)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+            if inserted.is_none() {
+                return Ok(ReportUsageResult::AlreadyApplied);
+            }
+            Some(args.idempotency_key.clone())
+        };
+
+        let policy_row = sqlx::query(
+            "SELECT policy_json FROM ff_budget_policy \
+             WHERE partition_key = ?1 AND budget_id = ?2",
+        )
+        .bind(BUDGET_PART)
+        .bind(&budget_id_str)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let policy: JsonValue = match policy_row {
+            Some(r) => {
+                let text: String = r.try_get("policy_json").map_err(map_sqlx_error)?;
+                serde_json::from_str(&text).unwrap_or_else(|_| JsonValue::Object(Default::default()))
+            }
+            None => JsonValue::Object(Default::default()),
+        };
+        let hard_limits = limits_from_policy(&policy, "hard_limits");
+        let soft_limits = limits_from_policy(&policy, "soft_limits");
+
+        let mut per_dim_current: BTreeMap<String, u64> = BTreeMap::new();
+        for (dim, delta) in args.deltas.iter() {
+            let dim_key = dim_row_key(dim);
+            sqlx::query(
+                "INSERT INTO ff_budget_usage \
+                     (partition_key, budget_id, dimensions_key, current_value, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, 0, ?4) \
+                 ON CONFLICT (partition_key, budget_id, dimensions_key) DO NOTHING",
+            )
+            .bind(BUDGET_PART)
+            .bind(&budget_id_str)
+            .bind(&dim_key)
+            .bind(now)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let row = sqlx::query(
+                "SELECT current_value FROM ff_budget_usage \
+                 WHERE partition_key = ?1 AND budget_id = ?2 AND dimensions_key = ?3",
+            )
+            .bind(BUDGET_PART)
+            .bind(&budget_id_str)
+            .bind(&dim_key)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+            let cur: i64 = row.try_get("current_value").map_err(map_sqlx_error)?;
+            let new_val = (cur as u64).saturating_add(*delta);
+
+            if let Some(hard) = hard_limits.get(dim)
+                && *hard > 0
+                && new_val > *hard
+            {
+                sqlx::query(
+                    "UPDATE ff_budget_policy \
+                     SET breach_count = breach_count + 1, \
+                         last_breach_at_ms = ?1, \
+                         last_breach_dim = ?2, \
+                         updated_at_ms = ?1 \
+                     WHERE partition_key = ?3 AND budget_id = ?4",
+                )
+                .bind(now)
+                .bind(dim)
+                .bind(BUDGET_PART)
+                .bind(&budget_id_str)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+
+                let outcome = ReportUsageResult::HardBreach {
+                    dimension: dim.clone(),
+                    current_usage: cur as u64,
+                    hard_limit: *hard,
+                };
+                if let Some(dk) = dedup_owned.as_deref() {
+                    finalize_dedup_spend(&mut conn, dk, &outcome).await?;
+                }
+                return Ok(outcome);
+            }
+            per_dim_current.insert(dim.clone(), new_val);
+        }
+
+        let mut soft_breach: Option<ReportUsageResult> = None;
+        for (dim, delta) in args.deltas.iter() {
+            let dim_key = dim_row_key(dim);
+            let new_val = per_dim_current[dim];
+            sqlx::query(
+                "UPDATE ff_budget_usage \
+                 SET current_value = current_value + ?1, updated_at_ms = ?2 \
+                 WHERE partition_key = ?3 AND budget_id = ?4 AND dimensions_key = ?5",
+            )
+            .bind(*delta as i64)
+            .bind(now)
+            .bind(BUDGET_PART)
+            .bind(&budget_id_str)
+            .bind(&dim_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(
+                "INSERT INTO ff_budget_usage_by_exec \
+                     (partition_key, budget_id, execution_id, dimensions_key, \
+                      delta_total, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (partition_key, budget_id, execution_id, dimensions_key) \
+                 DO UPDATE SET delta_total = delta_total + excluded.delta_total, \
+                               updated_at_ms = excluded.updated_at_ms",
+            )
+            .bind(BUDGET_PART)
+            .bind(&budget_id_str)
+            .bind(&exec_uuid_str)
+            .bind(&dim_key)
+            .bind(*delta as i64)
+            .bind(now)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if soft_breach.is_none()
+                && let Some(soft) = soft_limits.get(dim)
+                && *soft > 0
+                && new_val > *soft
+            {
+                soft_breach = Some(ReportUsageResult::SoftBreach {
+                    dimension: dim.clone(),
+                    current_usage: new_val,
+                    soft_limit: *soft,
+                });
+            }
+        }
+
+        if soft_breach.is_some() {
+            sqlx::query(
+                "UPDATE ff_budget_policy \
+                 SET soft_breach_count = soft_breach_count + 1, \
+                     updated_at_ms = ?1 \
+                 WHERE partition_key = ?2 AND budget_id = ?3",
+            )
+            .bind(now)
+            .bind(BUDGET_PART)
+            .bind(&budget_id_str)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        let outcome = soft_breach.unwrap_or(ReportUsageResult::Ok);
+        if let Some(dk) = dedup_owned.as_deref() {
+            finalize_dedup_spend(&mut conn, dk, &outcome).await?;
+        }
+        Ok::<_, EngineError>(outcome)
+    }
+    .await;
+
+    match result {
+        Ok(outcome) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+async fn finalize_dedup_spend(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    dedup_key: &str,
+    outcome: &ReportUsageResult,
+) -> Result<(), EngineError> {
+    let text = outcome_to_json_text(outcome);
+    sqlx::query(
+        "UPDATE ff_budget_usage_dedup SET outcome_json = ?1 \
+         WHERE partition_key = ?2 AND dedup_key = ?3",
+    )
+    .bind(text)
+    .bind(BUDGET_PART)
+    .bind(dedup_key)
+    .execute(&mut **conn)
+    .await
+    .map_err(map_sqlx_error)?;
+    Ok(())
+}
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::release_budget`].
+pub(crate) async fn release_budget(
+    pool: &SqlitePool,
+    args: ReleaseBudgetArgs,
+) -> Result<(), EngineError> {
+    let budget_id_str = args.budget_id.to_string();
+    let exec_uuid_str = exec_uuid_text(&args.execution_id)?;
+    let now = now_ms();
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let result: Result<(), EngineError> = async {
+        let rows = sqlx::query(
+            "SELECT dimensions_key, delta_total FROM ff_budget_usage_by_exec \
+             WHERE partition_key = ?1 AND budget_id = ?2 AND execution_id = ?3",
+        )
+        .bind(BUDGET_PART)
+        .bind(&budget_id_str)
+        .bind(&exec_uuid_str)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for row in &rows {
+            let dim: String = row.try_get("dimensions_key").map_err(map_sqlx_error)?;
+            let delta: i64 = row.try_get("delta_total").map_err(map_sqlx_error)?;
+            sqlx::query(
+                "UPDATE ff_budget_usage \
+                 SET current_value = MAX(0, current_value - ?1), \
+                     updated_at_ms = ?2 \
+                 WHERE partition_key = ?3 AND budget_id = ?4 AND dimensions_key = ?5",
+            )
+            .bind(delta)
+            .bind(now)
+            .bind(BUDGET_PART)
+            .bind(&budget_id_str)
+            .bind(&dim)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        sqlx::query(
+            "DELETE FROM ff_budget_usage_by_exec \
+             WHERE partition_key = ?1 AND budget_id = ?2 AND execution_id = ?3",
+        )
+        .bind(BUDGET_PART)
+        .bind(&budget_id_str)
+        .bind(&exec_uuid_str)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            commit_or_rollback(&mut conn).await?;
+            Ok(())
+        }
+        Err(e) => {
+            rollback_quiet(&mut conn).await;
+            Err(e)
+        }
+    }
+}
+
+/// SQLite body for
+/// [`ff_core::engine_backend::EngineBackend::deliver_approval_signal`].
+pub(crate) async fn deliver_approval_signal(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    args: DeliverApprovalSignalArgs,
+) -> Result<DeliverSignalResult, EngineError> {
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+
+    let lane_row: Option<(String,)> = sqlx::query_as(
+        "SELECT lane_id FROM ff_exec_core \
+         WHERE partition_key = ?1 AND execution_id = ?2",
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    let authoritative_lane = match lane_row {
+        Some((s,)) => LaneId::new(s),
+        None => {
+            return Err(EngineError::NotFound {
+                entity: "execution",
+            });
+        }
+    };
+    if authoritative_lane.as_str() != args.lane_id.as_str() {
+        return Err(EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: format!(
+                "lane_mismatch: args.lane_id={} exec_core.lane_id={}",
+                args.lane_id.as_str(),
+                authoritative_lane.as_str()
+            ),
+        });
+    }
+
+    let partition = ff_core::partition::Partition {
+        family: ff_core::partition::PartitionFamily::Execution,
+        index: part as u16,
+    };
+    let pkey = ff_core::partition::PartitionKey::from(&partition);
+    let token_str = crate::reads::read_waitpoint_token_impl(pool, &pkey, &args.waitpoint_id)
+        .await?
+        .ok_or(EngineError::NotFound {
+            entity: "waitpoint",
+        })?;
+
+    let now = TimestampMs::now();
+    let idempotency_key = format!("approval:{}:{}", args.signal_name, args.idempotency_suffix);
+    let ds = DeliverSignalArgs {
+        execution_id: args.execution_id.clone(),
+        waitpoint_id: args.waitpoint_id.clone(),
+        signal_id: SignalId::new(),
+        signal_name: args.signal_name.clone(),
+        signal_category: "approval".to_owned(),
+        source_type: "operator".to_owned(),
+        source_identity: String::new(),
+        payload: None,
+        payload_encoding: None,
+        correlation_id: None,
+        idempotency_key: Some(idempotency_key),
+        target_scope: "execution".to_owned(),
+        created_at: Some(now),
+        dedup_ttl_ms: Some(args.signal_dedup_ttl_ms),
+        resume_delay_ms: None,
+        max_signals_per_execution: args.max_signals_per_execution,
+        signal_maxlen: args.maxlen,
+        waitpoint_token: WaitpointToken::new(token_str),
+        now,
+    };
+
+    crate::suspend_ops::deliver_signal_impl(pool, pubsub, ds).await
+}
+
+/// SQLite body for
+/// [`ff_core::engine_backend::EngineBackend::issue_grant_and_claim`].
+pub(crate) async fn issue_grant_and_claim(
+    pool: &SqlitePool,
+    pubsub: &PubSub,
+    args: IssueGrantAndClaimArgs,
+) -> Result<ClaimGrantOutcome, EngineError> {
+    let (part, exec_uuid) = split_exec_id(&args.execution_id)?;
+    let lease_ttl_i64 = i64::try_from(args.lease_duration_ms).unwrap_or(i64::MAX);
+    let now = now_ms();
+    let new_expires = now.saturating_add(lease_ttl_i64);
+
+    let worker_id = WorkerId::new("operator");
+    let worker_instance_id = WorkerInstanceId::new("operator");
+    let lease_id = LeaseId::new();
+    let attempt_id = AttemptId::new();
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let result = async {
+        let exec_row = sqlx::query(
+            r#"
+            SELECT lifecycle_phase, ownership_state, eligibility_state,
+                   attempt_state, attempt_index,
+                   COALESCE(json_extract(raw_fields, '$.terminal_outcome'), 'none')
+                       AS terminal_outcome,
+                   COALESCE(json_extract(raw_fields, '$.current_attempt_id'), '')
+                       AS current_attempt_id
+              FROM ff_exec_core
+             WHERE partition_key = ?1 AND execution_id = ?2
+            "#,
+        )
+        .bind(part)
+        .bind(exec_uuid)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some(exec_row) = exec_row else {
+            return Err(EngineError::NotFound { entity: "execution" });
+        };
+        let lifecycle_phase: String =
+            exec_row.try_get("lifecycle_phase").map_err(map_sqlx_error)?;
+        let ownership_state: String =
+            exec_row.try_get("ownership_state").map_err(map_sqlx_error)?;
+        let eligibility_state: String =
+            exec_row.try_get("eligibility_state").map_err(map_sqlx_error)?;
+        let attempt_state: String =
+            exec_row.try_get("attempt_state").map_err(map_sqlx_error)?;
+        let current_attempt_index_i: i64 =
+            exec_row.try_get("attempt_index").map_err(map_sqlx_error)?;
+
+        let is_resume = attempt_state == "attempt_interrupted";
+
+        if !is_resume {
+            if lifecycle_phase != "runnable" {
+                let terminal_outcome: String =
+                    exec_row.try_get("terminal_outcome").map_err(map_sqlx_error)?;
+                let current_attempt_id: String = exec_row
+                    .try_get("current_attempt_id")
+                    .map_err(map_sqlx_error)?;
+                return Err(EngineError::Contention(ContentionKind::ExecutionNotActive {
+                    terminal_outcome,
+                    lease_epoch: String::new(),
+                    lifecycle_phase,
+                    attempt_id: current_attempt_id,
+                }));
+            }
+            if ownership_state != "unowned" {
+                return Err(EngineError::Contention(ContentionKind::LeaseConflict));
+            }
+            if eligibility_state != "eligible_now" && eligibility_state != "pending_claim" {
+                return Err(EngineError::Contention(
+                    ContentionKind::ExecutionNotLeaseable,
+                ));
+            }
+            if attempt_state == "running_attempt" {
+                return Err(EngineError::Conflict(
+                    ff_core::engine_error::ConflictKind::ActiveAttemptExists,
+                ));
+            }
+        }
+
+        let grant_id_bytes = Uuid::new_v4().as_bytes().to_vec();
+        sqlx::query(
+            r#"
+            INSERT INTO ff_claim_grant (
+                partition_key, grant_id, execution_id, kind,
+                worker_id, worker_instance_id, lane_id,
+                capability_hash, worker_capabilities,
+                route_snapshot_json, admission_summary,
+                grant_ttl_ms, issued_at_ms, expires_at_ms
+            ) VALUES (
+                ?1, ?2, ?3, 'claim',
+                ?4, ?5, ?6,
+                NULL, '[]',
+                NULL, NULL,
+                ?7, ?8, ?9
+            )
+            ON CONFLICT (partition_key, grant_id) DO NOTHING
+            "#,
+        )
+        .bind(part)
+        .bind(&grant_id_bytes)
+        .bind(exec_uuid)
+        .bind(worker_id.as_str())
+        .bind(worker_instance_id.as_str())
+        .bind(args.lane_id.as_str())
+        .bind(lease_ttl_i64)
+        .bind(now)
+        .bind(new_expires)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let (used_attempt_index, new_epoch_i): (i64, i64) = if is_resume {
+            sqlx::query(
+                "UPDATE ff_attempt \
+                    SET worker_id = ?1, worker_instance_id = ?2, \
+                        lease_epoch = lease_epoch + 1, \
+                        lease_expires_at_ms = ?3, started_at_ms = ?4, outcome = NULL \
+                  WHERE partition_key = ?5 AND execution_id = ?6 AND attempt_index = ?7",
+            )
+            .bind(worker_id.as_str())
+            .bind(worker_instance_id.as_str())
+            .bind(new_expires)
+            .bind(now)
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(current_attempt_index_i)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(
+                "UPDATE ff_exec_core \
+                    SET lifecycle_phase = 'active', ownership_state = 'leased', \
+                        eligibility_state = 'not_applicable', \
+                        public_state = 'running', attempt_state = 'running_attempt', \
+                        started_at_ms = COALESCE(started_at_ms, ?3) \
+                  WHERE partition_key = ?1 AND execution_id = ?2",
+            )
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(now)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let epoch_row = sqlx::query(
+                "SELECT lease_epoch FROM ff_attempt \
+                 WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3",
+            )
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(current_attempt_index_i)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+            let epoch: i64 = epoch_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+            (current_attempt_index_i, epoch)
+        } else {
+            let attempt_index_i = current_attempt_index_i;
+            let attempt_type_str: &'static str = match attempt_state.as_str() {
+                "pending_retry_attempt" => "retry",
+                "pending_replay_attempt" => "replay",
+                "pending_first_attempt" | "initial" => "initial",
+                other => {
+                    return Err(EngineError::Validation {
+                        kind: ValidationKind::Corruption,
+                        detail: format!(
+                            "issue_grant_and_claim: unrecognized attempt_state={other}"
+                        ),
+                    });
+                }
+            };
+            sqlx::query(
+                r#"
+                INSERT INTO ff_attempt (
+                    partition_key, execution_id, attempt_index,
+                    worker_id, worker_instance_id,
+                    lease_epoch, lease_expires_at_ms, started_at_ms,
+                    policy, raw_fields
+                ) VALUES (
+                    ?1, ?2, ?3,
+                    ?4, ?5,
+                    1, ?6, ?7,
+                    NULL,
+                    json_set('{}', '$.attempt_type', ?8, '$.attempt_id', ?9, '$.lease_id', ?10)
+                )
+                ON CONFLICT (partition_key, execution_id, attempt_index)
+                DO UPDATE SET
+                    worker_id = excluded.worker_id,
+                    worker_instance_id = excluded.worker_instance_id,
+                    lease_epoch = ff_attempt.lease_epoch + 1,
+                    lease_expires_at_ms = excluded.lease_expires_at_ms,
+                    started_at_ms = COALESCE(ff_attempt.started_at_ms, excluded.started_at_ms),
+                    raw_fields = json_patch(ff_attempt.raw_fields, excluded.raw_fields),
+                    terminal_at_ms = NULL,
+                    outcome = NULL
+                "#,
+            )
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index_i)
+            .bind(worker_id.as_str())
+            .bind(worker_instance_id.as_str())
+            .bind(new_expires)
+            .bind(now)
+            .bind(attempt_type_str)
+            .bind(attempt_id.to_string())
+            .bind(lease_id.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let epoch_row = sqlx::query(
+                "SELECT lease_epoch FROM ff_attempt \
+                 WHERE partition_key = ?1 AND execution_id = ?2 AND attempt_index = ?3",
+            )
+            .bind(part)
+            .bind(exec_uuid)
+            .bind(attempt_index_i)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+            let epoch: i64 = epoch_row.try_get("lease_epoch").map_err(map_sqlx_error)?;
+
+            let next_attempt_index = attempt_index_i.saturating_add(1);
+            sqlx::query(
+                r#"
+                UPDATE ff_exec_core
+                   SET lifecycle_phase = 'active',
+                       ownership_state = 'leased',
+                       eligibility_state = 'not_applicable',
+                       attempt_state = 'running_attempt',
+                       public_state = 'running',
+                       attempt_index = ?1,
+                       raw_fields = json_set(
+                           raw_fields,
+                           '$.current_attempt_id', ?2,
+                           '$.current_lease_id', ?3,
+                           '$.current_worker_id', ?4,
+                           '$.current_worker_instance_id', ?5,
+                           '$.pending_retry_reason', '',
+                           '$.pending_replay_reason', '',
+                           '$.pending_replay_requested_by', '',
+                           '$.pending_previous_attempt_index', ''
+                       )
+                 WHERE partition_key = ?6 AND execution_id = ?7
+                "#,
+            )
+            .bind(next_attempt_index)
+            .bind(attempt_id.to_string())
+            .bind(lease_id.to_string())
+            .bind(worker_id.as_str())
+            .bind(worker_instance_id.as_str())
+            .bind(part)
+            .bind(exec_uuid)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            (attempt_index_i, epoch)
+        };
+
+        sqlx::query(
+            "DELETE FROM ff_claim_grant \
+             WHERE partition_key = ?1 AND grant_id = ?2",
+        )
+        .bind(part)
+        .bind(&grant_id_bytes)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let ev = insert_lease_event(&mut conn, part, exec_uuid, "acquired", now).await?;
+        let emits = vec![(OutboxChannel::LeaseHistory, ev)];
+
+        Ok::<_, EngineError>((used_attempt_index, new_epoch_i, emits))
+    }
+    .await;
+
+    match result {
+        Ok((used_attempt_index, new_epoch_i, emits)) => {
+            commit_or_rollback(&mut conn).await?;
+            dispatch_emits(pubsub, emits);
+            let attempt_index =
+                AttemptIndex::new(u32::try_from(used_attempt_index.max(0)).unwrap_or(0));
+            let new_epoch = u64::try_from(new_epoch_i).unwrap_or(0);
+            Ok(ClaimGrantOutcome::new(
+                lease_id,
+                LeaseEpoch(new_epoch),
+                attempt_index,
+            ))
         }
         Err(e) => {
             rollback_quiet(&mut conn).await;
