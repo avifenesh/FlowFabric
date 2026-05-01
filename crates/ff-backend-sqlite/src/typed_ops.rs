@@ -1546,7 +1546,10 @@ pub(crate) async fn record_spend(
         let policy: JsonValue = match policy_row {
             Some(r) => {
                 let text: String = r.try_get("policy_json").map_err(map_sqlx_error)?;
-                serde_json::from_str(&text).unwrap_or_else(|_| JsonValue::Object(Default::default()))
+                serde_json::from_str(&text).map_err(|e| EngineError::Validation {
+                    kind: ValidationKind::Corruption,
+                    detail: format!("record_spend: ff_budget_policy.policy_json parse error: {e}"),
+                })?
             }
             None => JsonValue::Object(Default::default()),
         };
@@ -1620,12 +1623,17 @@ pub(crate) async fn record_spend(
         for (dim, delta) in args.deltas.iter() {
             let dim_key = dim_row_key(dim);
             let new_val = per_dim_current[dim];
+            // SQLite INTEGER is i64; reject deltas that would wrap negative.
+            let delta_i64 = i64::try_from(*delta).map_err(|_| EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!("record_spend: delta for dim={dim} exceeds i64::MAX ({delta})"),
+            })?;
             sqlx::query(
                 "UPDATE ff_budget_usage \
                  SET current_value = current_value + ?1, updated_at_ms = ?2 \
                  WHERE partition_key = ?3 AND budget_id = ?4 AND dimensions_key = ?5",
             )
-            .bind(*delta as i64)
+            .bind(delta_i64)
             .bind(now)
             .bind(BUDGET_PART)
             .bind(&budget_id_str)
@@ -1647,7 +1655,7 @@ pub(crate) async fn record_spend(
             .bind(&budget_id_str)
             .bind(&exec_uuid_str)
             .bind(&dim_key)
-            .bind(*delta as i64)
+            .bind(delta_i64)
             .bind(now)
             .execute(&mut *conn)
             .await
