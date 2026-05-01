@@ -25,17 +25,17 @@ set -o pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXAMPLES_DIR="$ROOT/examples"
 
-# Examples that do NOT run in CI's build-clean pass — either because
-# they have no Cargo.toml (grafana = dashboard JSON only) or their
-# build is LLM-dependent in ways the offline build can still satisfy
-# (coding-agent / llm-race build clean without any key, the SKIP is
-# reserved for future live-run phases).
-declare -A SKIP_REASON=(
-    [grafana]="dashboard JSON only — no Cargo workspace"
-)
-
 # Per-session opt-in filter. Empty = run everything.
 ONLY="${FF_EXAMPLES_ONLY:-}"
+
+# Skip rationale — case statement keeps the script portable to Bash 3.2
+# (macOS default). Prints empty string for non-matches.
+skip_reason() {
+    case "$1" in
+        grafana) echo "dashboard JSON only — no Cargo workspace" ;;
+        *) echo "" ;;
+    esac
+}
 
 declare -a PASS=()
 declare -a FAIL=()
@@ -56,12 +56,18 @@ echo "[run-all-examples] root=$ROOT"
 [ -n "$ONLY" ] && echo "[run-all-examples] FF_EXAMPLES_ONLY=$ONLY"
 echo
 
+# Single tempfile reused per iteration. `trap` ensures cleanup even on
+# SIGINT/SIGTERM so we don't leave orphans in /tmp.
+LOG_TMP="$(mktemp)"
+trap 'rm -f "$LOG_TMP"' EXIT
+
 for dir in "$EXAMPLES_DIR"/*/; do
     name="$(basename "$dir")"
     in_only "$name" || continue
 
-    if [ -n "${SKIP_REASON[$name]:-}" ]; then
-        echo "[SKIP] $name — ${SKIP_REASON[$name]}"
+    reason="$(skip_reason "$name")"
+    if [ -n "$reason" ]; then
+        echo "[SKIP] $name — $reason"
         SKIP+=("$name")
         continue
     fi
@@ -73,8 +79,7 @@ for dir in "$EXAMPLES_DIR"/*/; do
     fi
 
     echo "[build] $name …"
-    log_tmp="$(mktemp)"
-    if (cd "$dir" && cargo build --bins) >"$log_tmp" 2>&1; then
+    if (cd "$dir" && cargo build --bins) >"$LOG_TMP" 2>&1; then
         echo "[PASS] $name"
         PASS+=("$name")
     else
@@ -82,11 +87,10 @@ for dir in "$EXAMPLES_DIR"/*/; do
         # Surface the last 30 lines of cargo output so CI logs carry the
         # actual error without dumping the whole compile.
         echo "─── last 30 lines of cargo output ───"
-        tail -n 30 "$log_tmp"
+        tail -n 30 "$LOG_TMP"
         echo "─── end ───"
         FAIL+=("$name")
     fi
-    rm -f "$log_tmp"
     echo
 done
 
