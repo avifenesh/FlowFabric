@@ -31,20 +31,18 @@ use crate::SdkError;
 /// Output of [`run`] — the bits `connect` threads back into the
 /// [`FlowFabricWorker`] struct.
 ///
-/// `capabilities_csv` / `capabilities_hash` fields are gated on the
-/// `direct-valkey-claim` feature because only the direct-claim code
-/// path reads them at claim time. The capability ingress validation,
-/// CSV compute, and `ff:worker:{id}:caps` + `ff:idx:workers`
-/// advertisement writes run on **every** worker (v0.13 ungate) — the
-/// unblock scanner needs the caps keys regardless of whether the
-/// worker uses direct-claim or server-routed claim.
+/// v0.14: `capabilities_csv` / `capabilities_hash` are always-on —
+/// `claim_next_via_backend` needs the hash for its per-mismatch log
+/// surface regardless of which claim path the worker uses.
+///
+/// The `ff:worker:{id}:caps` + `ff:idx:workers` advertisement writes
+/// also run on every worker (v0.13 ungate) so the unblock scanner has
+/// caps keys regardless of direct-claim vs server-routed claim.
 ///
 /// [`FlowFabricWorker`]: crate::FlowFabricWorker
 pub(crate) struct PreambleOutput {
     pub partition_config: PartitionConfig,
-    #[cfg(feature = "direct-valkey-claim")]
     pub capabilities_csv: String,
-    #[cfg(feature = "direct-valkey-claim")]
     pub capabilities_hash: String,
 }
 
@@ -195,10 +193,8 @@ pub(crate) async fn run(
         csv
     };
 
-    #[cfg(feature = "direct-valkey-claim")]
     let capabilities_hash = ff_core::hash::fnv1a_xor8hex(&capabilities_csv);
 
-    #[cfg(feature = "direct-valkey-claim")]
     if !capabilities_csv.is_empty() {
         tracing::info!(
             worker_instance_id = %config.worker_instance_id,
@@ -264,9 +260,7 @@ pub(crate) async fn run(
 
     Ok(PreambleOutput {
         partition_config,
-        #[cfg(feature = "direct-valkey-claim")]
         capabilities_csv,
-        #[cfg(feature = "direct-valkey-claim")]
         capabilities_hash,
     })
 }

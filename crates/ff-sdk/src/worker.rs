@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-#[cfg(feature = "direct-valkey-claim")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -88,9 +87,7 @@ pub struct FlowFabricWorker {
     /// `valkey_preamble::run` for cross-reference; [`Self::connect_with`]-
     /// built workers compute the hash without the companion CSV log.
     /// Mirrors `ff-scheduler::claim::worker_caps_digest`.
-    #[cfg(feature = "direct-valkey-claim")]
     worker_capabilities_hash: String,
-    #[cfg(feature = "direct-valkey-claim")]
     lane_index: AtomicUsize,
     /// Concurrency cap for in-flight tasks. Permits are acquired or
     /// transferred by [`claim_next`] (feature-gated),
@@ -115,7 +112,6 @@ pub struct FlowFabricWorker {
     /// targets (wasm32, i686) `usize` is `u32` and wraps after ~4 years
     /// at 1 poll/sec — acceptable; on wrap, the modulo preserves
     /// correctness because the sequence simply restarts a new cycle.
-    #[cfg(feature = "direct-valkey-claim")]
     scan_cursor: AtomicUsize,
     /// The [`EngineBackend`] the Stage-1b trait forwarders route
     /// through.
@@ -149,10 +145,11 @@ pub struct FlowFabricWorker {
         Option<Arc<dyn ff_core::completion_backend::CompletionBackend>>,
 }
 
-/// Number of partitions scanned per `claim_next()` poll. Keeps idle Valkey
-/// load at O(PARTITION_SCAN_CHUNK) per worker-second instead of
+/// Number of partitions scanned per scheduler-bypass claim poll
+/// (`claim_next_via_backend` and its `direct-valkey-claim`-gated
+/// back-compat alias `claim_next`). Keeps idle backend load at
+/// O(PARTITION_SCAN_CHUNK) per worker-second instead of
 /// O(num_flow_partitions).
-#[cfg(feature = "direct-valkey-claim")]
 const PARTITION_SCAN_CHUNK: usize = 32;
 
 impl FlowFabricWorker {
@@ -246,9 +243,7 @@ impl FlowFabricWorker {
         // preservation is load-bearing. See `valkey_preamble::run`.
         let crate::valkey_preamble::PreambleOutput {
             partition_config,
-            #[cfg(feature = "direct-valkey-claim")]
             capabilities_csv: _worker_capabilities_csv,
-            #[cfg(feature = "direct-valkey-claim")]
             capabilities_hash: worker_capabilities_hash,
         } = crate::valkey_preamble::run(&client, &config).await?;
 
@@ -262,7 +257,6 @@ impl FlowFabricWorker {
             "FlowFabricWorker connected"
         );
 
-        #[cfg(feature = "direct-valkey-claim")]
         let scan_cursor_init = scan_cursor_seed(
             config.worker_instance_id.as_str(),
             partition_config.num_flow_partitions.max(1) as usize,
@@ -288,12 +282,9 @@ impl FlowFabricWorker {
             client: Some(client),
             config,
             partition_config,
-            #[cfg(feature = "direct-valkey-claim")]
             worker_capabilities_hash,
-            #[cfg(feature = "direct-valkey-claim")]
             lane_index: AtomicUsize::new(0),
             concurrency_semaphore,
-            #[cfg(feature = "direct-valkey-claim")]
             scan_cursor: AtomicUsize::new(scan_cursor_init),
             backend,
             completion_backend_handle,
@@ -425,17 +416,16 @@ impl FlowFabricWorker {
         // missing data via the wrong partition index.
         let partition_config = config.partition_config.unwrap_or_default();
 
-        #[cfg(feature = "direct-valkey-claim")]
         let scan_cursor_init = scan_cursor_seed(
             config.worker_instance_id.as_str(),
             partition_config.num_flow_partitions.max(1) as usize,
         );
 
-        // Build the capabilities CSV / hash inline for the
-        // direct-valkey-claim path. The validation mirrors `connect`'s
-        // ingress so the two entry points refuse the same malformed
-        // tokens.
-        #[cfg(feature = "direct-valkey-claim")]
+        // Capability validation + CSV/hash compute mirrors `connect`'s
+        // preamble (valkey_preamble::run) so both entry points refuse
+        // the same malformed tokens and populate the same
+        // `worker_capabilities_hash` used by claim_next_via_backend's
+        // per-mismatch log.
         for cap in &config.capabilities {
             if cap.is_empty() {
                 return Err(SdkError::Config {
@@ -464,7 +454,6 @@ impl FlowFabricWorker {
                 });
             }
         }
-        #[cfg(feature = "direct-valkey-claim")]
         let worker_capabilities_hash = {
             let set: std::collections::BTreeSet<&str> = config
                 .capabilities
@@ -481,12 +470,9 @@ impl FlowFabricWorker {
             client: None,
             config,
             partition_config,
-            #[cfg(feature = "direct-valkey-claim")]
             worker_capabilities_hash,
-            #[cfg(feature = "direct-valkey-claim")]
             lane_index: AtomicUsize::new(0),
             concurrency_semaphore,
-            #[cfg(feature = "direct-valkey-claim")]
             scan_cursor: AtomicUsize::new(scan_cursor_init),
             backend,
             completion_backend_handle: completion,
@@ -555,21 +541,40 @@ impl FlowFabricWorker {
         &self.partition_config
     }
 
-    /// Attempt to claim the next eligible execution.
+    /// Back-compat alias for [`Self::claim_next_via_backend`]. Stays
+    /// behind the `direct-valkey-claim` feature to preserve the prior
+    /// opt-in ergonomics; new consumers should call
+    /// [`Self::claim_next_via_backend`] directly (no feature flag
+    /// required) — v0.14 un-gating of the scheduler-bypass scanner.
+    #[cfg(feature = "direct-valkey-claim")]
+    pub async fn claim_next(&self) -> Result<Option<ClaimedTask>, SdkError> {
+        self.claim_next_via_backend().await
+    }
+
+    /// Attempt to claim the next eligible execution through the
+    /// [`EngineBackend`] trait — works on any backend with
+    /// `scan_eligible_executions` + `issue_claim_grant` + `claim_execution`
+    /// trait bodies (Valkey today; Postgres/SQLite when their
+    /// grant-consumer RFC lands).
     ///
-    /// Phase 1 simplified claim flow:
+    /// Simplified claim flow:
     /// 1. Pick a lane (round-robin across configured lanes)
-    /// 2. Issue a claim grant via `ff_issue_claim_grant` on the execution's partition
-    /// 3. Claim the execution via `ff_claim_execution`
-    /// 4. Read execution payload + tags
+    /// 2. Scan a [`PARTITION_SCAN_CHUNK`] window of partitions for
+    ///    eligible executions via `backend.scan_eligible_executions`
+    /// 3. Issue a claim grant via `backend.issue_claim_grant`
+    /// 4. Claim the execution via `backend.claim_execution`
     /// 5. Return a [`ClaimedTask`] with auto lease renewal
     ///
-    /// Gated behind the `direct-valkey-claim` feature — bypasses the
-    /// scheduler's budget / quota / capability admission checks. Enable
-    /// with `ff-sdk = { ..., features = ["direct-valkey-claim"] }` when
-    /// the scheduler hop would be measurement noise (benches) or when
-    /// the test harness needs a deterministic worker-local path. Prefer
-    /// the scheduler-routed HTTP claim path in production.
+    /// # Scheduler bypass — read before production use
+    ///
+    /// This path **bypasses the scheduler's budget / quota admission
+    /// checks**. Enable only when the scheduler hop is measurement
+    /// noise (benches, single-tenant dev, examples demonstrating the
+    /// claim primitive) or when the test harness wants a deterministic
+    /// worker-local path. For production, consume scheduler-issued
+    /// grants via [`Self::claim_from_grant`] — the scheduler enforces
+    /// budget breach, quota sliding-window, concurrency cap, and
+    /// capability-match checks before issuing grants.
     ///
     /// # `None` semantics
     ///
@@ -585,9 +590,10 @@ impl FlowFabricWorker {
     /// time". Backing off too aggressively on `None` can starve workers
     /// when work lives on partitions outside the current window.
     ///
-    /// Returns `Err` on Valkey errors or script failures.
-    #[cfg(feature = "direct-valkey-claim")]
-    pub async fn claim_next(&self) -> Result<Option<ClaimedTask>, SdkError> {
+    /// Returns `Err` on backend errors or script failures.
+    ///
+    /// [`claim_from_grant`]: FlowFabricWorker::claim_from_grant
+    pub async fn claim_next_via_backend(&self) -> Result<Option<ClaimedTask>, SdkError> {
         // Enforce max_concurrent_tasks: try to acquire a semaphore permit.
         // try_acquire returns immediately — if no permits available, the worker
         // is at capacity and should not claim more work.
@@ -1392,14 +1398,12 @@ impl FlowFabricWorker {
         })
     }
 
-    #[cfg(feature = "direct-valkey-claim")]
     fn next_lane(&self) -> LaneId {
         let idx = self.lane_index.fetch_add(1, Ordering::Relaxed) % self.config.lanes.len();
         self.config.lanes[idx].clone()
     }
 }
 
-#[cfg(feature = "direct-valkey-claim")]
 fn is_retryable_claim_error(err: &crate::EngineError) -> bool {
     use ff_core::error::ErrorClass;
     matches!(
@@ -1412,7 +1416,6 @@ fn is_retryable_claim_error(err: &crate::EngineError) -> bool {
 /// instance id with FNV-1a to place distinct worker processes on different
 /// partition windows from their first poll. Zero is valid for single-worker
 /// clusters but spreads work in multi-worker deployments.
-#[cfg(feature = "direct-valkey-claim")]
 fn scan_cursor_seed(worker_instance_id: &str, num_partitions: usize) -> usize {
     if num_partitions == 0 {
         return 0;
