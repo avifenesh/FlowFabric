@@ -275,6 +275,8 @@ pub(crate) async fn run(
                 .arg(ttl_ms_str.as_str())
                 .arg("registered_at_ms")
                 .arg(now_ms_str.as_str())
+                .arg("last_heartbeat_ms")
+                .arg(now_ms_str.as_str())
                 .execute::<Option<i64>>()
                 .await
             {

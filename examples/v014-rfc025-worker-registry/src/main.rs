@@ -48,6 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = BackendConfig::valkey(host, port);
     let backend = ValkeyBackend::connect(cfg).await?;
+    // `connect` dials the client but doesn't load the Lua library;
+    // `prepare` does. Demo is self-contained so call it explicitly.
+    backend.prepare().await?;
 
     let namespace = Namespace::new("rfc025-demo");
     let worker_id = WorkerId::new("gpu-pool-1");
