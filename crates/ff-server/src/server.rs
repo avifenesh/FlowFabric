@@ -727,6 +727,9 @@ impl Server {
         // (`budget_reset` today). Drained via `shutdown_prepare`.
         let scanner_cfg = ff_backend_sqlite::SqliteScannerConfig {
             budget_reset_interval: config.engine_config.budget_reset_interval,
+            // RFC-025 Phase 4: 30s default, matching PG's
+            // `worker_registry_ttl_interval`.
+            worker_registry_ttl_interval: std::time::Duration::from_secs(30),
         };
         sqlite_arc.with_scanners(scanner_cfg);
 

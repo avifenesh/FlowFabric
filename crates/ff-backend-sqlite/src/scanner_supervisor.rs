@@ -44,6 +44,11 @@ pub struct SqliteScannerConfig {
     /// is treated as disabled and not spawned, mirroring
     /// `tokio::time::interval`'s zero-duration panic safety.
     pub budget_reset_interval: Duration,
+    /// RFC-025 Phase 4: cadence for `worker_registry_ttl_sweep`.
+    /// Mirrors PG's `worker_registry_ttl_interval` (default 30s).
+    /// Zero disables the scanner — identical contract to
+    /// `budget_reset_interval`.
+    pub worker_registry_ttl_interval: Duration,
 }
 
 /// Spawned scanner supervisor. Holding this handle keeps the
@@ -125,10 +130,31 @@ pub fn spawn_scanners(pool: SqlitePool, cfg: SqliteScannerConfig) -> SqliteScann
         );
     }
 
+    // ── RFC-025 Phase 4: worker_registry_ttl_sweep ──
+    // Single-writer: no partition fan-out. One tick deletes every
+    // expired row in one transaction.
+    #[cfg(feature = "core")]
+    if !cfg.worker_registry_ttl_interval.is_zero() {
+        spawn_reconciler(
+            &mut js,
+            rx.clone(),
+            pool.clone(),
+            cfg.worker_registry_ttl_interval,
+            "sqlite.worker_registry_ttl_sweep",
+            |pool| {
+                Box::pin(async move {
+                    crate::worker_registry::ttl_sweep_tick(&pool)
+                        .await
+                        .map(|_| ())
+                })
+            },
+        );
+    }
+
     let scanners = js.len();
     tracing::info!(
         scanners,
-        "sqlite scanner supervisor spawned (RFC-023 Phase 3.5 — budget_reset N=1)"
+        "sqlite scanner supervisor spawned (RFC-023 Phase 3.5 budget_reset + RFC-025 Phase 4 worker_registry_ttl_sweep)"
     );
 
     SqliteScannerHandle {

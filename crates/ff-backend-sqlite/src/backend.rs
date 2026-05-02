@@ -2307,6 +2307,15 @@ fn sqlite_supports_base() -> Supports {
     s.cancel_flow_header = true;
     s.ack_cancel_member = true;
 
+    // ── RFC-025 worker registry (Phase 4) ──
+    // SQLite bodies live in `crate::worker_registry`; all five flip
+    // on here, matching the PG Phase-3 posture.
+    s.register_worker = true;
+    s.heartbeat_worker = true;
+    s.mark_worker_dead = true;
+    s.list_expired_leases = true;
+    s.list_workers = true;
+
     // ── Stay `false` (see struct-level rustdoc above) ──
     // s.claim_for_worker — RFC-023 §5 non-goal
     // s.subscribe_instance_tags — #311 all-backends
@@ -3522,6 +3531,60 @@ impl EngineBackend for SqliteBackend {
             });
         }
         Ok(ms as u64)
+    }
+
+    // ── RFC-025 Phase 4 — worker registry ───────────────────────
+    //
+    // Bodies live in `crate::worker_registry`; overrides here
+    // forward to those free functions. `#[cfg(feature = ...)]`
+    // gates match the trait declarations in ff-core.
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "sqlite.register_worker", skip_all)]
+    async fn register_worker(
+        &self,
+        args: ff_core::contracts::RegisterWorkerArgs,
+    ) -> Result<ff_core::contracts::RegisterWorkerOutcome, EngineError> {
+        crate::worker_registry::register_worker(&self.inner.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "sqlite.heartbeat_worker", skip_all)]
+    async fn heartbeat_worker(
+        &self,
+        args: ff_core::contracts::HeartbeatWorkerArgs,
+    ) -> Result<ff_core::contracts::HeartbeatWorkerOutcome, EngineError> {
+        crate::worker_registry::heartbeat_worker(&self.inner.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "sqlite.mark_worker_dead", skip_all)]
+    async fn mark_worker_dead(
+        &self,
+        args: ff_core::contracts::MarkWorkerDeadArgs,
+    ) -> Result<ff_core::contracts::MarkWorkerDeadOutcome, EngineError> {
+        crate::worker_registry::mark_worker_dead(&self.inner.pool, args).await
+    }
+
+    // list_expired_leases joins ff_attempt + ff_exec_core, which
+    // live under `core`. Require both features to keep the body's
+    // dep chain intact, mirroring the PG `#[cfg(all(...))]` posture.
+    #[cfg(all(feature = "core", feature = "suspension"))]
+    #[tracing::instrument(name = "sqlite.list_expired_leases", skip_all)]
+    async fn list_expired_leases(
+        &self,
+        args: ff_core::contracts::ListExpiredLeasesArgs,
+    ) -> Result<ff_core::contracts::ListExpiredLeasesResult, EngineError> {
+        crate::worker_registry::list_expired_leases(&self.inner.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "sqlite.list_workers", skip_all)]
+    async fn list_workers(
+        &self,
+        args: ff_core::contracts::ListWorkersArgs,
+    ) -> Result<ff_core::contracts::ListWorkersResult, EngineError> {
+        crate::worker_registry::list_workers(&self.inner.pool, args).await
     }
 }
 

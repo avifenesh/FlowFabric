@@ -13,9 +13,14 @@ description = "FlowFabric EngineBackend impl — SQLite dev-only backend (RFC-02
 [features]
 # Mirror ff-core / ff-backend-postgres feature topology so method-gate
 # `#[cfg]`s line up with the trait surface.
-default = ["core", "streaming"]
+default = ["core", "streaming", "suspension"]
 core = ["ff-core/core"]
 streaming = ["ff-core/streaming"]
+# RFC-025 Phase 4: `list_expired_leases` trait method rides
+# `ff-core`'s `suspension` gate. Default-on so the in-tree release
+# feature-set matches Valkey + Postgres parity. Downstream consumers
+# can disable via `default-features = false`.
+suspension = ["ff-core/suspension"]
 
 [dependencies]
 # Phase 1a: ff-core features match ff-backend-postgres so the SQLite
