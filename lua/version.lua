@@ -16,5 +16,5 @@
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '33'
+  return '34'
 end)
