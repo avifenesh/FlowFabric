@@ -7,3 +7,4 @@ pub mod scheduling;
 pub mod signal;
 pub mod stream;
 pub mod suspension;
+pub mod worker_registry;

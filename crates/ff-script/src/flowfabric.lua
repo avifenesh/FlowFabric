@@ -1292,7 +1292,7 @@ end
 -- drift fails the build.
 
 redis.register_function('ff_version', function(keys, args)
-  return '31'
+  return '32'
 end)
 
 
@@ -3728,6 +3728,75 @@ redis.register_function('ff_change_priority', function(keys, args)
   redis.call("ZADD", K.eligible_zset, new_score, A.execution_id)
 
   return ok(tostring(old_priority), tostring(A.new_priority))
+end)
+
+---------------------------------------------------------------------------
+-- RFC-025  ff_register_worker
+--
+-- Atomic worker-registry registration. Replaces the SDK preamble's
+-- three separate round trips (SET NX alive + SET caps + SADD index)
+-- with a single FCALL so a concurrent `mark_worker_dead` cannot
+-- interleave and leave a zombie `:caps` key behind.
+--
+-- Idempotent overwrite: re-registering the same instance_id refreshes
+-- TTL + caps + lanes and returns "refreshed". A fresh boot or a
+-- post-TTL re-registration returns "registered".
+--
+-- KEYS (3): alive_key (`ff:worker:{ns}:{inst}:alive`),
+--           caps_key  (`ff:worker:{ns}:{inst}:caps`),
+--           index_key (`ff:idx:{ns}:workers`)
+-- ARGV (6): instance_id, worker_id, lanes_csv (sorted),
+--           caps_csv (sorted), ttl_ms, now_ms
+---------------------------------------------------------------------------
+redis.register_function('ff_register_worker', function(keys, args)
+  local K = {
+    alive_key = keys[1],
+    caps_key  = keys[2],
+    index_key = keys[3],
+  }
+
+  local ttl_n = require_number(args[5], "ttl_ms")
+  if type(ttl_n) == "table" then return ttl_n end
+  local now_n = require_number(args[6], "now_ms")
+  if type(now_n) == "table" then return now_n end
+
+  local A = {
+    instance_id     = args[1],
+    worker_id       = args[2],
+    lanes_csv       = args[3] or "",
+    caps_csv        = args[4] or "",
+    ttl_ms          = ttl_n,
+    now_ms          = now_n,
+  }
+
+  local prior_alive = redis.call("EXISTS", K.alive_key)
+
+  -- Idempotent overwrite — no NX. Hot-restart with new caps is allowed.
+  redis.call("SET", K.alive_key, "1", "PX", tostring(A.ttl_ms))
+
+  -- HSET overwrites individual fields, so caps/lanes/ttl hot-swap on
+  -- a Refreshed path.
+  redis.call("HSET", K.caps_key,
+    "worker_id", A.worker_id,
+    "lanes_csv", A.lanes_csv,
+    "caps_csv", A.caps_csv,
+    "ttl_ms", tostring(A.ttl_ms),
+    "registered_at_ms", tostring(A.now_ms))
+
+  -- Match the alive-key TTL on the caps hash so both age out together
+  -- when the worker goes silent. Prevents a stale caps hash from
+  -- outliving the alive guard.
+  redis.call("PEXPIRE", K.caps_key, tostring(A.ttl_ms))
+
+  -- Index membership is TTL-free; mark_worker_dead or a follow-up
+  -- sweep removes it. SMEMBERS enumeration drives list_workers.
+  redis.call("SADD", K.index_key, A.instance_id)
+
+  if prior_alive == 0 then
+    return ok("registered")
+  else
+    return ok("refreshed")
+  end
 end)
 
 ---------------------------------------------------------------------------

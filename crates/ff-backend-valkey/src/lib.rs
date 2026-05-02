@@ -42,24 +42,35 @@ use ff_core::contracts::{
     CancelFlowResult, ClaimExecutionArgs, ClaimExecutionResult, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult, CompositeBody,
     ClaimGrantOutcome, CountKind, DeliverApprovalSignalArgs, DeliverSignalArgs, DeliverSignalResult,
-    EdgeDirection, EdgeSnapshot, ExecutionContext, ExecutionSnapshot, FlowSnapshot, FlowStatus,
-    FlowSummary, IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs,
+    EdgeDirection, EdgeSnapshot, ExecutionContext, ExecutionSnapshot,
+    ExpiredLeaseInfo, ExpiredLeasesCursor, FlowSnapshot, FlowStatus,
+    FlowSummary, HeartbeatWorkerArgs, HeartbeatWorkerOutcome, IssueClaimGrantArgs,
+    IssueClaimGrantOutcome, IssueGrantAndClaimArgs,
     IssueReclaimGrantArgs,
-    IssueReclaimGrantOutcome, ListExecutionsPage, ListFlowsPage, ListLanesPage,
-    ListSuspendedPage, ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
-    RecordSpendArgs, ReleaseBudgetArgs, ScanEligibleArgs,
+    IssueReclaimGrantOutcome, LIST_EXPIRED_LEASES_DEFAULT_LIMIT,
+    LIST_EXPIRED_LEASES_DEFAULT_MAX_PARTITIONS, LIST_EXPIRED_LEASES_MAX_LIMIT,
+    ListExecutionsPage, ListExpiredLeasesArgs, ListExpiredLeasesResult,
+    ListFlowsPage, ListLanesPage, ListSuspendedPage, ListWorkersArgs, ListWorkersResult,
+    MARK_WORKER_DEAD_REASON_MAX_BYTES, MarkWorkerDeadArgs, MarkWorkerDeadOutcome,
+    ReclaimExecutionArgs, ReclaimExecutionOutcome, ReclaimGrant,
+    RecordSpendArgs, RegisterWorkerArgs, RegisterWorkerOutcome,
+    ReleaseBudgetArgs, ScanEligibleArgs,
     ReportUsageResult, ResumeCondition, ResumePolicy, ResumeTarget,
     RotateWaitpointHmacSecretAllArgs, RotateWaitpointHmacSecretAllEntry,
     RotateWaitpointHmacSecretAllResult, RotateWaitpointHmacSecretArgs, SeedOutcome,
     SeedWaitpointHmacSecretArgs, SignalMatcher, SuspendArgs,
     SuspendOutcome, SuspendOutcomeDetails, SuspendedExecutionEntry, WaitpointBinding,
+    WorkerInfo,
 };
 use ff_core::partition::{Partition, PartitionFamily};
 use ff_core::engine_error::{StateKind, ValidationKind};
 use ff_core::partition::PartitionKey;
 use ff_core::engine_backend::{EngineBackend, ExpirePhase, ReconcileCounts, SiblingCancelReconcileAction};
 use ff_core::engine_error::EngineError;
-use ff_core::keys::{ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys};
+use ff_core::keys::{
+    ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys,
+    worker_alive_key_ns, worker_caps_key_ns, workers_index_key_ns,
+};
 use ff_core::partition::{PartitionConfig, execution_partition, flow_partition};
 use ff_core::types::{
     AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseFence,
@@ -85,6 +96,9 @@ use ff_script::functions::scheduling::{
 use ff_script::functions::budget::{BudgetOpKeys, ff_create_budget, ff_record_spend, ff_release_budget, ff_report_usage_and_check, ff_reset_budget};
 use ff_script::functions::quota::{QuotaOpKeys, ff_create_quota_policy};
 use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_deliver_signal};
+use ff_script::functions::worker_registry::{
+    RegisterWorkerArgv, RegisterWorkerKeys, ff_register_worker,
+};
 use ff_script::result::{FcallResult, FromFcallResult};
 
 pub mod backend_error;
@@ -155,6 +169,12 @@ fn valkey_supports_base() -> ff_core::capability::Supports {
     s.ack_cancel_member = true;
     s.claim_for_worker = true; // runtime-gated by capabilities() caller
     s.issue_reclaim_grant = true; // RFC-024 PR-F: Lua FCALLs exist pre-v0.12
+    // RFC-025 Phase 2 — worker-registry trait methods land on Valkey.
+    s.register_worker = true;
+    s.heartbeat_worker = true;
+    s.mark_worker_dead = true;
+    s.list_expired_leases = true;
+    s.list_workers = true;
     s.prepare = true;
     s.subscribe_lease_history = true;
     s.subscribe_completion = true;
@@ -8977,6 +8997,473 @@ impl EngineBackend for ValkeyBackend {
             source: "TIME: invalid microseconds".into(),
         })?;
         Ok(secs.saturating_mul(1000).saturating_add(micros / 1000))
+    }
+
+    // ── RFC-025 worker registry ──────────────────────────────────
+    //
+    // Keys are namespace-prefixed (§9.1). The SDK preamble keeps
+    // writing the pre-RFC-025 un-namespaced shape for the duration of
+    // the Phase 2→Phase 5 rollout — both write paths coexist until
+    // cairn migrates to the trait in Phase 5. Phase 2's PR description
+    // flags this gap.
+
+    async fn register_worker(
+        &self,
+        args: RegisterWorkerArgs,
+    ) -> Result<RegisterWorkerOutcome, EngineError> {
+        let alive_key = worker_alive_key_ns(&args.namespace, &args.worker_instance_id);
+        let caps_key = worker_caps_key_ns(&args.namespace, &args.worker_instance_id);
+        let index_key = workers_index_key_ns(&args.namespace);
+
+        let lanes_csv = args
+            .lanes
+            .iter()
+            .map(|l| l.0.as_str())
+            .collect::<Vec<&str>>()
+            .join(",");
+        let caps_csv = args
+            .capabilities
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(",");
+
+        let keys = RegisterWorkerKeys {
+            alive_key: alive_key.as_str(),
+            caps_key: caps_key.as_str(),
+            index_key: index_key.as_str(),
+        };
+        let argv = RegisterWorkerArgv {
+            instance_id: args.worker_instance_id.as_str(),
+            worker_id: args.worker_id.as_str(),
+            lanes_csv: lanes_csv.as_str(),
+            caps_csv: caps_csv.as_str(),
+            ttl_ms: args.liveness_ttl_ms,
+            now_ms: args.now.0,
+        };
+
+        ff_register_worker(&self.client, keys, argv)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_script(e),
+                "register_worker: FCALL ff_register_worker",
+            ))
+    }
+
+    async fn heartbeat_worker(
+        &self,
+        args: HeartbeatWorkerArgs,
+    ) -> Result<HeartbeatWorkerOutcome, EngineError> {
+        let alive_key = worker_alive_key_ns(&args.namespace, &args.worker_instance_id);
+        let caps_key = worker_caps_key_ns(&args.namespace, &args.worker_instance_id);
+
+        // Single-round-trip TTL lookup. Absent hash == no prior
+        // registration; callers re-register instead of heartbeating.
+        let stored_ttl: Option<String> = self
+            .client
+            .cmd("HGET")
+            .arg(caps_key.as_str())
+            .arg("ttl_ms")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "heartbeat_worker: HGET ttl_ms",
+            ))?;
+
+        let ttl_ms: u64 = match stored_ttl.as_deref() {
+            Some(s) if !s.is_empty() => s.parse().map_err(|e| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!("heartbeat_worker: stored ttl_ms not a u64: {e}"),
+            })?,
+            _ => return Ok(HeartbeatWorkerOutcome::NotRegistered),
+        };
+
+        // PEXPIRE returns 0 if the alive key no longer exists (TTL
+        // elapsed between HGET and PEXPIRE, or operator-initiated
+        // mark_worker_dead raced us).
+        let pexpire: i64 = self
+            .client
+            .cmd("PEXPIRE")
+            .arg(alive_key.as_str())
+            .arg(ttl_ms.to_string().as_str())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "heartbeat_worker: PEXPIRE alive",
+            ))?;
+
+        if pexpire == 0 {
+            Ok(HeartbeatWorkerOutcome::NotRegistered)
+        } else {
+            let next_expiry_ms = TimestampMs::from_millis(
+                args.now.0.saturating_add(ttl_ms as i64),
+            );
+            Ok(HeartbeatWorkerOutcome::Refreshed { next_expiry_ms })
+        }
+    }
+
+    async fn mark_worker_dead(
+        &self,
+        args: MarkWorkerDeadArgs,
+    ) -> Result<MarkWorkerDeadOutcome, EngineError> {
+        // RFC-025 §4 / §Rev-2 item 9: reason capped at 256 bytes, no
+        // control chars. Mirror `fail_execution`'s discipline.
+        if args.reason.len() > MARK_WORKER_DEAD_REASON_MAX_BYTES {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: format!(
+                    "reason: exceeds {} bytes (got {})",
+                    MARK_WORKER_DEAD_REASON_MAX_BYTES,
+                    args.reason.len()
+                ),
+            });
+        }
+        if args.reason.chars().any(|c| c.is_control()) {
+            return Err(EngineError::Validation {
+                kind: ValidationKind::InvalidInput,
+                detail: "reason: must not contain control characters".into(),
+            });
+        }
+
+        let alive_key = worker_alive_key_ns(&args.namespace, &args.worker_instance_id);
+        let caps_key = worker_caps_key_ns(&args.namespace, &args.worker_instance_id);
+        let index_key = workers_index_key_ns(&args.namespace);
+
+        // TODO(RFC-025 Phase 2): ferriskey's typed `Client` doesn't
+        // expose MULTI/EXEC directly today. For Phase 2 we issue three
+        // sequential commands; concurrent mark_worker_dead on the
+        // same instance_id is benign (idempotent no-op on the
+        // already-deleted branch). A concurrent register+mark race is
+        // the same hazard either path has — documented in §Non-goals
+        // item 1. Phase 5 can promote to a Lua FCALL if cairn's
+        // stress tests surface a real-world ordering bug.
+        let del_alive: i64 = self
+            .client
+            .cmd("DEL")
+            .arg(alive_key.as_str())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "mark_worker_dead: DEL alive",
+            ))?;
+        let del_caps: i64 = self
+            .client
+            .cmd("DEL")
+            .arg(caps_key.as_str())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "mark_worker_dead: DEL caps",
+            ))?;
+        let _: i64 = self
+            .client
+            .cmd("SREM")
+            .arg(index_key.as_str())
+            .arg(args.worker_instance_id.as_str())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "mark_worker_dead: SREM index",
+            ))?;
+
+        if del_alive == 0 && del_caps == 0 {
+            Ok(MarkWorkerDeadOutcome::NotRegistered)
+        } else {
+            Ok(MarkWorkerDeadOutcome::Marked)
+        }
+    }
+
+    async fn list_expired_leases(
+        &self,
+        args: ListExpiredLeasesArgs,
+    ) -> Result<ListExpiredLeasesResult, EngineError> {
+        // Namespace is enforced at the admin-route boundary, not the
+        // trait (§Rev-3 item 3). The underlying `ff:idx:{fp:N}:lease_expiry`
+        // ZSETs are namespace-agnostic — all execution partitions
+        // share the same lease-expiry index layout. Per-namespace
+        // filtering would require an exec_core HGET on every entry
+        // for `namespace`; that post-filter lands in Phase 3 when
+        // PG's schema makes the filter cheap. For Phase 2 on Valkey,
+        // the namespace arg is accepted-and-ignored; cross-namespace
+        // operator tooling is the documented consumer.
+        let _ = args.namespace;
+
+        let limit = args
+            .limit
+            .unwrap_or(LIST_EXPIRED_LEASES_DEFAULT_LIMIT)
+            .min(LIST_EXPIRED_LEASES_MAX_LIMIT) as usize;
+        let max_partitions = args
+            .max_partitions_per_call
+            .unwrap_or(LIST_EXPIRED_LEASES_DEFAULT_MAX_PARTITIONS);
+
+        let num_partitions = self.partition_config.num_flow_partitions;
+        if num_partitions == 0 {
+            return Ok(ListExpiredLeasesResult::new(Vec::new(), None));
+        }
+
+        // Partition-iteration start offset. Cursor exclusivity is
+        // handled at the merge step; the partition index where the
+        // cursor entry lives is the natural starting point.
+        let (start_partition, cursor_expires_ms, cursor_eid): (u16, i64, Option<String>) =
+            match args.after.as_ref() {
+                Some(c) => {
+                    let part = execution_partition(&c.execution_id, &self.partition_config);
+                    (
+                        part.index,
+                        c.expires_at_ms.0,
+                        Some(c.execution_id.to_string()),
+                    )
+                }
+                None => (0, 0, None),
+            };
+
+        // Stable `(expires_at_ms, execution_id)` order across the
+        // merged fan-out. Collect (score, eid, partition) so the
+        // exec_core HMGET can re-use the partition index without a
+        // second routing pass.
+        let mut merged: Vec<(i64, String, Partition)> = Vec::new();
+
+        let fan = max_partitions.min(num_partitions as u32) as u16;
+        for offset in 0..fan {
+            let idx_u16 = (start_partition + offset) % num_partitions;
+            let partition = Partition {
+                family: PartitionFamily::Execution,
+                index: idx_u16,
+            };
+            let idx = IndexKeys::new(&partition);
+            let key = idx.lease_expiry();
+
+            // Fetch up to `limit` per partition; merge reduces to
+            // `limit` across partitions below.
+            let entries: Vec<String> = self
+                .client
+                .cmd("ZRANGEBYSCORE")
+                .arg(key.as_str())
+                .arg("-inf")
+                .arg(args.as_of.0.to_string().as_str())
+                .arg("WITHSCORES")
+                .arg("LIMIT")
+                .arg("0")
+                .arg(limit.to_string().as_str())
+                .execute()
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "list_expired_leases: ZRANGEBYSCORE lease_expiry",
+                ))?;
+
+            // ZRANGEBYSCORE ... WITHSCORES returns flat [member,
+            // score, member, score, ...]; pair them up.
+            let mut it = entries.into_iter();
+            while let (Some(member), Some(score_str)) = (it.next(), it.next()) {
+                let score: i64 = score_str
+                    .parse()
+                    .map_err(|e| EngineError::Validation {
+                        kind: ValidationKind::Corruption,
+                        detail: format!("lease_expiry.score: bad score {score_str:?}: {e}"),
+                    })?;
+                merged.push((score, member, partition));
+            }
+        }
+
+        // Order: (expires_at_ms ASC, execution_id ASC). Cursor
+        // exclusivity: drop any entry <= cursor.
+        merged.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        if let Some(cursor_eid_ref) = cursor_eid.as_ref() {
+            merged.retain(|(score, eid, _)| {
+                *score > cursor_expires_ms
+                    || (*score == cursor_expires_ms && eid.as_str() > cursor_eid_ref.as_str())
+            });
+        }
+        let page_full = merged.len() > limit;
+        merged.truncate(limit);
+
+        // HGET exec_core for each candidate to materialise
+        // ExpiredLeaseInfo. Pipelined via ferriskey's sequential
+        // futures — the page cap (≤10_000) bounds cost.
+        let mut out: Vec<ExpiredLeaseInfo> = Vec::with_capacity(merged.len());
+        for (score, eid_str, partition) in &merged {
+            let execution_id = ExecutionId::parse(eid_str).map_err(|e| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!("lease_expiry.member: bad execution_id: {e}"),
+            })?;
+            let ctx = ExecKeyContext::new(partition, &execution_id);
+            let raw: Vec<Option<String>> = self
+                .client
+                .cmd("HMGET")
+                .arg(ctx.core().as_str())
+                .arg("current_lease_id")
+                .arg("current_lease_epoch")
+                .arg("current_attempt_index")
+                .arg("current_worker_instance_id")
+                .execute()
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "list_expired_leases: HMGET exec_core",
+                ))?;
+            let lease_id_str = raw.first().and_then(|v| v.clone()).unwrap_or_default();
+            let lease_epoch_str = raw.get(1).and_then(|v| v.clone()).unwrap_or_default();
+            let attempt_idx_str = raw.get(2).and_then(|v| v.clone()).unwrap_or_default();
+            let worker_inst_str = raw.get(3).and_then(|v| v.clone()).unwrap_or_default();
+
+            // Stale zset entry with an already-cleared lease — skip
+            // rather than fail. Lua-side lease expiry / revocation
+            // cleans the zset atomically, so this is only reached if
+            // a crash interleaved.
+            if lease_id_str.is_empty() || worker_inst_str.is_empty() {
+                continue;
+            }
+            let lease_id = LeaseId::parse(&lease_id_str).map_err(|e| EngineError::Validation {
+                kind: ValidationKind::Corruption,
+                detail: format!("current_lease_id: bad lease_id: {e}"),
+            })?;
+            let lease_epoch: u64 = lease_epoch_str.parse().unwrap_or(0);
+            let attempt_index: u32 = attempt_idx_str.parse().unwrap_or(0);
+
+            out.push(ExpiredLeaseInfo::new(
+                execution_id,
+                lease_id,
+                LeaseEpoch::new(lease_epoch),
+                WorkerInstanceId::new(worker_inst_str),
+                TimestampMs::from_millis(*score),
+                AttemptIndex::new(attempt_index),
+            ));
+        }
+
+        let cursor = if page_full {
+            out.last().map(|e| ExpiredLeasesCursor::new(e.expires_at_ms, e.execution_id.clone()))
+        } else {
+            None
+        };
+        Ok(ListExpiredLeasesResult::new(out, cursor))
+    }
+
+    async fn list_workers(
+        &self,
+        args: ListWorkersArgs,
+    ) -> Result<ListWorkersResult, EngineError> {
+        // Phase 2 scope: per-namespace listing only. Cross-namespace
+        // enumeration (`args.namespace = None`) would need a
+        // persistent namespace-registry on Valkey that doesn't exist
+        // today; the unblock scanner's `ff:idx:workers` global set
+        // predates RFC-025's namespace split and still mingles
+        // namespaces. Phase 3 (PG) lands the authoritative
+        // cross-namespace index via `ff_worker_registry` scan; until
+        // then operators that need a cross-ns view iterate
+        // namespaces out-of-band. Surfacing as `Unavailable` (not
+        // silently returning an empty page) so callers notice.
+        let ns = match args.namespace.as_ref() {
+            Some(ns) => ns,
+            None => {
+                return Err(EngineError::Unavailable {
+                    op: "list_workers (cross-namespace on Valkey — Phase 3 follow-up)",
+                });
+            }
+        };
+
+        let limit = args.limit.unwrap_or(1000) as usize;
+        let index_key = workers_index_key_ns(ns);
+
+        let mut instance_ids: Vec<String> = self
+            .client
+            .cmd("SMEMBERS")
+            .arg(index_key.as_str())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "list_workers: SMEMBERS index",
+            ))?;
+        instance_ids.sort();
+
+        if let Some(after) = args.after.as_ref() {
+            let cutoff = after.as_str();
+            instance_ids.retain(|id| id.as_str() > cutoff);
+        }
+
+        let page_full = instance_ids.len() > limit;
+        instance_ids.truncate(limit);
+
+        let mut out: Vec<WorkerInfo> = Vec::with_capacity(instance_ids.len());
+        for id_str in &instance_ids {
+            let wid = WorkerInstanceId::new(id_str.clone());
+            let caps_key = worker_caps_key_ns(ns, &wid);
+            let fields: HashMap<String, String> = self
+                .client
+                .cmd("HGETALL")
+                .arg(caps_key.as_str())
+                .execute()
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "list_workers: HGETALL caps",
+                ))?;
+            if fields.is_empty() {
+                // Index entry outlived the caps hash — TTL race on
+                // evict. Log so operators can distinguish this from a
+                // dropped worker without digging through keyspace.
+                tracing::debug!(
+                    instance_id = %id_str,
+                    caps_key = %caps_key,
+                    "list_workers: caps hash missing for indexed instance (TTL race); skipping"
+                );
+                continue;
+            }
+            let worker_id_str = fields.get("worker_id").cloned().unwrap_or_default();
+            let lanes_csv = fields.get("lanes_csv").cloned().unwrap_or_default();
+            let caps_csv = fields.get("caps_csv").cloned().unwrap_or_default();
+            let ttl_ms: u64 = fields
+                .get("ttl_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let registered_at_ms: i64 = fields
+                .get("registered_at_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let lanes: std::collections::BTreeSet<LaneId> = if lanes_csv.is_empty() {
+                Default::default()
+            } else {
+                lanes_csv
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(LaneId::new)
+                    .collect()
+            };
+            let capabilities: std::collections::BTreeSet<String> = if caps_csv.is_empty() {
+                Default::default()
+            } else {
+                caps_csv
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+
+            out.push(WorkerInfo::new(
+                WorkerId::new(worker_id_str),
+                wid,
+                ns.clone(),
+                lanes,
+                capabilities,
+                TimestampMs::from_millis(registered_at_ms),
+                ttl_ms,
+                TimestampMs::from_millis(registered_at_ms),
+            ));
+        }
+
+        let cursor = if page_full {
+            out.last().map(|w| w.worker_instance_id.clone())
+        } else {
+            None
+        };
+        Ok(ListWorkersResult::new(out, cursor))
     }
 }
 
