@@ -122,7 +122,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             postgresql-client \
-            redis-tools
+            redis-tools \
+            jq
 
       - name: Run harness
         run: ./scripts/run-all-examples.sh
