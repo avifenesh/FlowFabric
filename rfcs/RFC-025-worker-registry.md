@@ -207,7 +207,7 @@ async fn list_expired_leases(
 }
 ```
 
-**Default impls return `EngineError::Unavailable`** so out-of-tree backends keep compiling. Every in-tree backend overrides. Paired with four RFC-018 `Supports.*` flags: `register_worker`, `heartbeat_worker`, `mark_worker_dead`, `list_expired_leases` — all `true` on every in-tree impl at RFC completion.
+**Default impls return `EngineError::Unavailable`** so out-of-tree backends keep compiling. Every in-tree backend overrides. Paired with five RFC-018 `Supports.*` flags: `register_worker`, `heartbeat_worker`, `mark_worker_dead`, `list_expired_leases`, `list_workers` (Phase 6 add, §9.4) — all `true` on every in-tree impl at RFC completion.
 
 ## 5. Per-backend delivery
 
@@ -217,10 +217,12 @@ async fn list_expired_leases(
 
 | Method | Impl |
 |---|---|
-| `register_worker` | New FCALL `ff_register_worker`, KEYS=3 (`alive`, `caps_hash`, `idx_workers`), ARGV=(worker_id, lanes_csv, caps_csv, ttl_ms, now). Body: SET NX PX alive + HSET caps_hash {worker_id, lanes_csv, caps_csv, ttl_ms} + SADD idx_workers. Atomic; concurrent mark_worker_dead can't interleave. Returns `"registered"` or `"refreshed"`. |
-| `heartbeat_worker` | HGET `ff:worker:{inst}:caps` ttl_ms (single round-trip) → PEXPIRE `ff:worker:{inst}:alive <ttl>`. `0` reply → `NotRegistered`. Refreshed branch computes `next_expiry_ms = now + ttl`. |
-| `mark_worker_dead` | MULTI/EXEC: DEL alive + DEL caps + SREM idx_workers. Atomic via MULTI. reason-string validation at trait ingress. |
-| `list_expired_leases` | `ZRANGEBYSCORE ff:idx:{p}:lease_expiry -inf <as_of> WITHSCORES LIMIT 0 <limit>` fanned across `max_partitions_per_call` partitions starting from cursor's partition offset; merged + sorted by `(expires_at_ms, execution_id)`. Cursor is `ExpiredLeasesCursor`. |
+All keys are namespace-prefixed (locked §9.1): `ff:worker:{ns}:{inst}:alive`, `ff:worker:{ns}:{inst}:caps`, `ff:idx:{ns}:workers`. Two namespaces reusing the same `worker_instance_id` can no longer collide at the key layer.
+
+| `register_worker` | New FCALL `ff_register_worker`, KEYS=3 (`alive`, `caps_hash`, `idx_workers`), ARGV=(worker_id, lanes_csv, caps_csv, ttl_ms, now). Body: SET PX alive (no NX — idempotent overwrite per §9.3) + HSET caps_hash {worker_id, lanes_csv, caps_csv, ttl_ms} + SADD idx_workers. Atomic; concurrent mark_worker_dead can't interleave. Returns `"registered"` (prior alive missing) or `"refreshed"` (prior alive present; caps/lanes/TTL all overwritten). |
+| `heartbeat_worker` | HGET `ff:worker:{ns}:{inst}:caps` ttl_ms (single round-trip) → PEXPIRE `ff:worker:{ns}:{inst}:alive <ttl>`. `0` reply → `NotRegistered`. Refreshed branch computes `next_expiry_ms = now + ttl`. |
+| `mark_worker_dead` | MULTI/EXEC: DEL alive + DEL caps + SREM `ff:idx:{ns}:workers`. Atomic via MULTI. reason-string validation at trait ingress. |
+| `list_expired_leases` | `ZRANGEBYSCORE ff:idx:{p}:lease_expiry -inf <as_of> WITHSCORES LIMIT 0 <limit>` fanned across `max_partitions_per_call` partitions (default 32 per §9.2) starting from cursor's partition offset; merged + sorted by `(expires_at_ms, execution_id)`. Cursor is `ExpiredLeasesCursor`. |
 
 **Effort:** ~200 LOC net — `ff_register_worker` Lua (~15 lines) + 4 Rust bodies + SDK preamble compat test.
 
@@ -301,14 +303,14 @@ Each eviction appends a `'ttl_swept'` event to `ff_worker_registry_event`. Witho
 - Phase 3: PG bodies + migration 0021.
 - Phase 4: SQLite bodies.
 - Phase 5: cairn migration (consumer-side swap of their bespoke Valkey impl for the trait).
-- Phase 6: capability-matrix / docs + release gate.
+- Phase 6: `list_workers` trait method (§9.4) + capability-matrix / docs + release gate.
 
 ~5 sessions per phase cadence of 453/454 — **estimate ~8-10 sessions total**.
 
 ## 6. Non-goals
 
 1. **Worker fencing at the SQL layer.** Concurrent register of the same `worker_instance_id` is rejected at FF trait ingress via `Validation(InvalidInput)`. On Valkey, `ff_register_worker`'s FCALL atomicity covers the SET+HSET+SADD race. On PG/SQLite, the `(partition_key, namespace, worker_instance_id)` PK + `ON CONFLICT DO UPDATE` path handles concurrent register idempotently.
-2. **Worker discovery / listing live workers.** Cairn asked for register/heartbeat/mark_dead/list_expired_leases; a generic `list_workers` is a known future addition rather than principled deferral — operator-tooling for "who's running right now" is obvious follow-on work. Not in this RFC.
+2. ~~**Worker discovery / listing live workers.**~~ **PROMOTED** — `list_workers` folded into Phase 6 per §9.4. No longer a non-goal.
 3. **Lease reclaim dispatch.** `list_expired_leases` returns data; the *decision* to reclaim (via `reclaim_execution`, RFC-024) stays with the caller. FF doesn't auto-reclaim behind the scenes.
 4. **Cross-partition global worker identity.** `worker_instance_id` is unique within `(namespace, partition)`; two namespaces can reuse the same string. Matches current Valkey shape.
 5. **Worker-to-lane fencing at the storage layer.** Nothing in this RFC prevents two workers advertising the same lane + same caps; scheduler-side admission (RFC-012 claim_for_worker) already handles that contention fairly. Adding fencing would duplicate existing logic.
@@ -384,19 +386,21 @@ Eight changes on top of rev-3:
 7. **§Non-goals sweep.** Six additions: `list_workers` (see §F1 — acknowledged as known future addition, not principled deferral), `worker-to-lane fencing at the storage layer`, `per-worker backpressure signals`, `worker restart-crash-loop detection`, `cross-worker leader election`, `worker-stats aggregation` (future operator event stream). Each one-line with a pointer at what might motivate adding it later.
 8. **§Risks expanded.** Three new entries: (a) ff-backend-postgres version pin during cairn rollout (schema drift hazard); (b) `list_expired_leases` performance under >10k live leases — explain-analyze required in the PR's §9 release gate; (c) TTL sweep scanner correctness — test-fixture pinned to fire the TTL-driven deletion AND the `mark_worker_dead` deletion, assert idempotency + ordering.
 
-## 9. Open questions (adjudicate before accept)
+## 9. Open questions — RESOLVED 2026-05-02
 
-Items locked in through rev-2/3/4 (not open):
+All prior open items adjudicated by owner. No remaining blockers for accept.
+
+Locked through rev-2/3/4:
 - Expired-lease cursor type → `(expires_at_ms, ExecutionId)` tuple (rev-2).
 - `list_expired_leases` cross-namespace → `namespace: Option<Namespace>` variant (rev-3).
-- Operator-event payload → deferred entirely to a future operator-event RFC (rev-3).
+- Operator-event payload → deferred to a future operator-event RFC (rev-3).
 
-Still open for owner adjudication:
+Locked 2026-05-02:
 
-1. **Namespace granularity of `worker_instance_id` uniqueness.** Current Valkey key is `ff:worker:{id}:alive` — global (no namespace prefix). PG schema PK includes `namespace`. Should Valkey also namespace-prefix (`ff:worker:{namespace}:{id}:alive`)? Requires schema bump but aligns with PG. Alternative: keep Valkey global and document namespace as logical-only.
-2. **`max_partitions_per_call` default.** 32 (matches unblock scanner) or smaller (16) for tighter latency at cost of more round trips? Depends on cairn's reclaim-scanner tick cadence.
-3. **Whether `ff_register_worker` Lua should be idempotent on caps/lanes change.** If caller re-registers with DIFFERENT caps or lanes under the same `worker_instance_id` — Refreshed (overwrite) or Rejected (Validation)? Leaning Refreshed for operational ergonomics; argument for Rejected is caught-early drift detection.
-4. **Operator-tooling `list_workers` follow-on.** Land in this RFC's Phase 6 as an add-on (cheap given the state table exists), or defer to a separate RFC as originally planned? 5-minute decision with no delivery impact either way.
+1. **Valkey worker-key namespace granularity** → **namespace-prefixed**. Keys shift to `ff:worker:{namespace}:{id}:alive` / `ff:worker:{namespace}:{id}:caps` / `ff:idx:{namespace}:workers`. Aligns with the PG PK which already includes `namespace`; makes multi-tenant instance_id collisions impossible. SDK preamble key-shape changes in Phase 2 (compat-test bytes verify FF trait writes equal preamble writes under the new shape).
+2. **`ListExpiredLeasesArgs.max_partitions_per_call` default** → **32** (matches unblock-scanner convention, one round trip covers most sweeps).
+3. **`ff_register_worker` on caps/lanes change under same `worker_instance_id`** → **Refreshed** (overwrite caps + lanes + TTL). Matches today's SDK preamble behaviour; supports hot-reloading workers with updated caps without an explicit mark_dead intermediate.
+4. **`list_workers` operator-tooling** → **fold into RFC-025 Phase 6**. State table exists anyway; adding the read method is ~50 LOC + matrix row. Shape: `ListWorkersArgs { namespace: Option<Namespace>, after: Option<WorkerInstanceId>, limit: Option<u32> } -> ListWorkersResult { entries: Vec<WorkerInfo>, cursor: Option<WorkerInstanceId> }`. Pairs with a 5th RFC-018 `Supports.list_workers` flag.
 
 ## 10. Release gate / acceptance
 
