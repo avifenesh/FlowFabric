@@ -45,6 +45,51 @@ else
     TIMEOUT=""
 fi
 
+# ── fixture preflights ────────────────────────────────────────────────
+#
+# Each per-example case can flag `requires_<X>`. The preflight runs
+# once per unique requirement, caches the result, and examples whose
+# fixture is unreachable SKIP with an actionable "bring it up" message
+# instead of failing cryptically inside the example.
+VALKEY_READY=""         # "1" ready, "0" down, "" unchecked
+VALKEY_HOST="${FF_HOST:-localhost}"
+VALKEY_PORT="${FF_PORT:-6379}"
+
+check_valkey() {
+    [ -n "$VALKEY_READY" ] && return 0
+    local probe
+    if command -v valkey-cli >/dev/null 2>&1; then
+        probe="valkey-cli"
+    elif command -v redis-cli >/dev/null 2>&1; then
+        probe="redis-cli"
+    else
+        # No CLI tool — use a RESP-level probe over bash's /dev/tcp.
+        # Sends the inline `PING\r\n` command and checks for `+PONG`
+        # in the reply, so an unrelated process listening on the port
+        # is correctly reported as not-Valkey rather than a false
+        # ready. All inside a subshell so the FD is released on exit.
+        if (
+            exec 3<>"/dev/tcp/$VALKEY_HOST/$VALKEY_PORT" 2>/dev/null || exit 1
+            printf 'PING\r\n' >&3
+            # Short read with a timeout so we don't hang on a silent
+            # listener. `read -t` wants fractional seconds on Bash 4+;
+            # pass an integer for 3.2 compat.
+            IFS= read -r -t 2 reply <&3 || exit 2
+            case "$reply" in *PONG*) exit 0 ;; *) exit 3 ;; esac
+        ); then
+            VALKEY_READY=1
+        else
+            VALKEY_READY=0
+        fi
+        return 0
+    fi
+    if "$probe" -h "$VALKEY_HOST" -p "$VALKEY_PORT" PING 2>/dev/null | grep -q PONG; then
+        VALKEY_READY=1
+    else
+        VALKEY_READY=0
+    fi
+}
+
 # Per-session opt-in filter. Empty = run everything.
 ONLY="${FF_EXAMPLES_ONLY:-}"
 MODE="both"   # both | build | run
@@ -68,9 +113,18 @@ skip_reason() {
     esac
 }
 
+# `requires` names the fixtures an example's live-run needs. Empty =
+# no external fixture (SQLite-only / FF_DEV_MODE). Values checked by
+# the dispatcher below: "valkey", "postgres", "ff-server" (future).
+requires() {
+    case "$1" in
+        v013-cairn-454-budget-ledger) echo "valkey" ;;
+        *) echo "" ;;
+    esac
+}
+
 # `run_cmd` emits the command-line for the example's live-run, or an
-# empty string for examples not yet covered in phase 3b (3c+ lands the
-# HITL orchestration + ff-server-dependent ones).
+# empty string for examples not yet covered.
 run_cmd() {
     local t="${TIMEOUT:+$TIMEOUT 60 }"
     case "$1" in
@@ -78,6 +132,19 @@ run_cmd() {
             echo "FF_DEV_MODE=1 ${t}cargo run --locked --release --bin ff-dev" ;;
         external-callback)
             echo "FF_DEV_MODE=1 ${t}cargo run --locked --release -- --backend sqlite" ;;
+        incident-remediation)
+            # Runs against the SQLite embedded path — Valkey path
+            # requires a full scheduler+scanner deployment and bails
+            # out with a loud error referring the operator to the
+            # sqlite flag. Stay on the sqlite path for CI.
+            echo "FF_DEV_MODE=1 ${t}cargo run --locked --release -- --backend sqlite" ;;
+        v013-cairn-454-budget-ledger)
+            # Pipe VALKEY_HOST/PORT through the example's own
+            # `FF_DEMO_VALKEY_HOST/PORT` knobs so a caller overriding
+            # FF_HOST/FF_PORT sees preflight and run hit the *same*
+            # socket. Without this, `FF_HOST=remote` would preflight
+            # against remote but run against localhost.
+            echo "FF_DEMO_VALKEY_HOST='$VALKEY_HOST' FF_DEMO_VALKEY_PORT='$VALKEY_PORT' ${t}cargo run --locked --release --bin budget-ledger" ;;
         *)
             echo "" ;;
     esac
@@ -91,12 +158,10 @@ run_reason() {
         llm-race) echo "phase 3d — LLM-dependent, pre-release-local only" ;;
         deploy-approval) echo "phase 3c — HITL multi-bin orchestration pending" ;;
         media-pipeline) echo "phase 3c — HITL multi-bin orchestration pending" ;;
-        incident-remediation) echo "phase 3c — requires ff-server choreography" ;;
         retry-and-cancel) echo "phase 3c — requires ff-server" ;;
         token-budget) echo "phase 3c — requires ff-server" ;;
         v010-read-side-ergonomics) echo "phase 3c — requires ff-server" ;;
-        v011-wave9-postgres) echo "phase 3c — requires ff-server + Postgres choreography" ;;
-        v013-cairn-454-budget-ledger) echo "phase 3c — requires Valkey (trait-direct, no ff-server)" ;;
+        v011-wave9-postgres) echo "phase 3c — requires Postgres (FF_PG_TEST_URL)" ;;
         *) echo "phase 3b does not cover this example yet" ;;
     esac
 }
@@ -177,13 +242,36 @@ for dir in "$EXAMPLES_DIR"/*/; do
         fi
     fi
 
-    # ── run (phase 3b) ──
+    # ── run (phase 3b/3c) ──
     cmd="$(run_cmd "$name")"
     if [ -z "$cmd" ]; then
         record_skip "$name" "$(run_reason "$name")"
         echo
         continue
     fi
+
+    # Fixture preflight — skip-not-fail when the required service
+    # isn't reachable so operators running without (e.g.) Valkey get
+    # a clear "bring it up" signal instead of a cryptic example
+    # failure deep inside the ferriskey handshake.
+    req="$(requires "$name")"
+    for dep in $req; do
+        case "$dep" in
+            valkey)
+                check_valkey
+                if [ "$VALKEY_READY" != "1" ]; then
+                    record_skip "$name" "valkey unreachable at $VALKEY_HOST:$VALKEY_PORT — start valkey-server and re-run"
+                    echo
+                    continue 2
+                fi
+                ;;
+            *)
+                record_skip "$name" "unknown requires: $dep"
+                echo
+                continue 2
+                ;;
+        esac
+    done
 
     echo "[run] $name …"
     echo "      $cmd"
