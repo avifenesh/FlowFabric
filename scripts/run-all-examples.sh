@@ -55,6 +55,13 @@ VALKEY_READY=""         # "1" ready, "0" down, "" unchecked
 VALKEY_HOST="${FF_HOST:-localhost}"
 VALKEY_PORT="${FF_PORT:-6379}"
 
+# Postgres. The harness default matches examples/v011-wave9-postgres's
+# README snippet so `just connect via default` works out of the box
+# when a local pg is up; callers point elsewhere via FF_PG_TEST_URL.
+POSTGRES_READY=""       # "1" ready, "0" down, "" unchecked
+POSTGRES_URL_DEFAULT="postgres://postgres:postgres@localhost:5432/ff_v011_demo"
+POSTGRES_URL="${FF_PG_TEST_URL:-$POSTGRES_URL_DEFAULT}"
+
 check_valkey() {
     [ -n "$VALKEY_READY" ] && return 0
     local probe
@@ -90,6 +97,56 @@ check_valkey() {
     fi
 }
 
+# Parse host + port out of `postgres://user:pass@host:port/db` — enough
+# for the /dev/tcp fallback; sqlx itself handles the full parse when
+# the example runs.
+_pg_url_host_port() {
+    local url="$1" rest host port
+    rest="${url#postgres://}"   # strip scheme
+    rest="${rest#postgresql://}"
+    rest="${rest#*@}"           # strip creds if present
+    host="${rest%%/*}"          # up to first /
+    host="${host%%\?*}"         # strip query string
+    case "$host" in
+        *:*) port="${host##*:}"; host="${host%%:*}" ;;
+        *)   port="5432" ;;
+    esac
+    echo "$host $port"
+}
+
+check_postgres() {
+    [ -n "$POSTGRES_READY" ] && return 0
+    # Prefer pg_isready (libpq-based, full connection verification).
+    if command -v pg_isready >/dev/null 2>&1; then
+        if pg_isready -d "$POSTGRES_URL" -q >/dev/null 2>&1; then
+            POSTGRES_READY=1
+        else
+            POSTGRES_READY=0
+        fi
+        return 0
+    fi
+    # Fall back to psql -c "SELECT 1" if present.
+    if command -v psql >/dev/null 2>&1; then
+        if psql "$POSTGRES_URL" -tAc "SELECT 1" >/dev/null 2>&1; then
+            POSTGRES_READY=1
+        else
+            POSTGRES_READY=0
+        fi
+        return 0
+    fi
+    # Neither available — fall back to a raw TCP probe. Imperfect
+    # (can't distinguish pg from any tcp listener) but better than
+    # nothing for a skip-vs-run decision.
+    local hp host port
+    hp="$(_pg_url_host_port "$POSTGRES_URL")"
+    host="${hp% *}"; port="${hp#* }"
+    if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+        POSTGRES_READY=1
+    else
+        POSTGRES_READY=0
+    fi
+}
+
 # Per-session opt-in filter. Empty = run everything.
 ONLY="${FF_EXAMPLES_ONLY:-}"
 MODE="both"   # both | build | run
@@ -119,6 +176,7 @@ skip_reason() {
 requires() {
     case "$1" in
         v013-cairn-454-budget-ledger) echo "valkey" ;;
+        v011-wave9-postgres) echo "postgres" ;;
         *) echo "" ;;
     esac
 }
@@ -145,6 +203,12 @@ run_cmd() {
             # socket. Without this, `FF_HOST=remote` would preflight
             # against remote but run against localhost.
             echo "FF_DEMO_VALKEY_HOST='$VALKEY_HOST' FF_DEMO_VALKEY_PORT='$VALKEY_PORT' ${t}cargo run --locked --release --bin budget-ledger" ;;
+        v011-wave9-postgres)
+            # Same preflight/run URL so a caller-overridden
+            # FF_PG_TEST_URL targets the same endpoint the preflight
+            # checked. The example runs `apply_migrations` at boot so
+            # any Postgres 16+ db works out of the box.
+            echo "FF_PG_TEST_URL='$POSTGRES_URL' ${t}cargo run --locked --release" ;;
         *)
             echo "" ;;
     esac
@@ -161,7 +225,6 @@ run_reason() {
         retry-and-cancel) echo "phase 3c — requires ff-server" ;;
         token-budget) echo "phase 3c — requires ff-server" ;;
         v010-read-side-ergonomics) echo "phase 3c — requires ff-server" ;;
-        v011-wave9-postgres) echo "phase 3c — requires Postgres (FF_PG_TEST_URL)" ;;
         *) echo "phase 3b does not cover this example yet" ;;
     esac
 }
@@ -261,6 +324,14 @@ for dir in "$EXAMPLES_DIR"/*/; do
                 check_valkey
                 if [ "$VALKEY_READY" != "1" ]; then
                     record_skip "$name" "valkey unreachable at $VALKEY_HOST:$VALKEY_PORT — start valkey-server and re-run"
+                    echo
+                    continue 2
+                fi
+                ;;
+            postgres)
+                check_postgres
+                if [ "$POSTGRES_READY" != "1" ]; then
+                    record_skip "$name" "postgres unreachable at $POSTGRES_URL — start postgres + create db (or set FF_PG_TEST_URL)"
                     echo
                     continue 2
                 fi
