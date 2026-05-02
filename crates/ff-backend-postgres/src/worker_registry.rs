@@ -312,9 +312,14 @@ pub async fn list_expired_leases(
     // migration 0001) keys the scan on `(partition_key,
     // lease_expires_at_ms)`. Cross-partition order is enforced at
     // the `ORDER BY` level.
+    // `ff_exec_core` has no `namespace` column — namespace lives in
+    // `raw_fields jsonb` (see migrations/0001_initial.sql:98-122).
+    // Phase 3 referenced `c.namespace` directly which would crash at
+    // runtime; `raw_fields->>'namespace'` is the authoritative read
+    // path.
     let rows = sqlx::query(
         "SELECT a.partition_key, a.execution_id, a.attempt_index, a.lease_epoch, \
-                a.worker_instance_id, a.lease_expires_at_ms, c.namespace \
+                a.worker_instance_id, a.lease_expires_at_ms \
            FROM ff_attempt a \
            JOIN ff_exec_core c \
              ON c.partition_key = a.partition_key AND c.execution_id = a.execution_id \
@@ -322,7 +327,7 @@ pub async fn list_expired_leases(
             AND a.lease_expires_at_ms <= $1 \
             AND a.worker_instance_id IS NOT NULL \
             AND c.public_state IN ('claimed', 'running') \
-            AND ($2::text IS NULL OR c.namespace = $2) \
+            AND ($2::text IS NULL OR c.raw_fields->>'namespace' = $2) \
             AND ($3::bigint IS NULL \
                  OR (a.lease_expires_at_ms, a.execution_id::text) > ($3, $4)) \
           ORDER BY a.lease_expires_at_ms ASC, a.execution_id ASC \
