@@ -97,7 +97,8 @@ use ff_script::functions::budget::{BudgetOpKeys, ff_create_budget, ff_record_spe
 use ff_script::functions::quota::{QuotaOpKeys, ff_create_quota_policy};
 use ff_script::functions::signal::{SignalOpKeys, ff_claim_resumed_execution, ff_deliver_signal};
 use ff_script::functions::worker_registry::{
-    RegisterWorkerArgv, RegisterWorkerKeys, ff_register_worker,
+    HeartbeatWorkerKeys, RegisterWorkerArgv, RegisterWorkerKeys, ff_heartbeat_worker,
+    ff_register_worker,
 };
 use ff_script::result::{FcallResult, FromFcallResult};
 
@@ -9057,91 +9058,19 @@ impl EngineBackend for ValkeyBackend {
         let alive_key = worker_alive_key_ns(&args.namespace, &args.worker_instance_id);
         let caps_key = worker_caps_key_ns(&args.namespace, &args.worker_instance_id);
 
-        // Single-round-trip TTL lookup. Absent hash == no prior
-        // registration; callers re-register instead of heartbeating.
-        let stored_ttl: Option<String> = self
-            .client
-            .cmd("HGET")
-            .arg(caps_key.as_str())
-            .arg("ttl_ms")
-            .execute()
-            .await
-            .map_err(|e| ff_core::engine_error::backend_context(
-                transport_fk(e),
-                "heartbeat_worker: HGET ttl_ms",
-            ))?;
-
-        let ttl_ms: u64 = match stored_ttl.as_deref() {
-            Some(s) if !s.is_empty() => s.parse().map_err(|e| EngineError::Validation {
-                kind: ValidationKind::Corruption,
-                detail: format!("heartbeat_worker: stored ttl_ms not a u64: {e}"),
-            })?,
-            _ => return Ok(HeartbeatWorkerOutcome::NotRegistered),
+        // Single FCALL collapsing HGET ttl_ms + PEXPIRE alive + PEXPIRE
+        // caps + HSET last_heartbeat_ms. Issue #502 closed the
+        // 4-round-trip pre-FCALL path.
+        let keys = HeartbeatWorkerKeys {
+            alive_key: alive_key.as_str(),
+            caps_key: caps_key.as_str(),
         };
-
-        // PEXPIRE returns 1 when the TTL was applied, 0 when the key
-        // is absent (TTL elapsed between HGET and PEXPIRE, or
-        // operator-initiated mark_worker_dead raced us). ferriskey
-        // decodes this as a boolean, not an integer.
-        let pexpire_applied: bool = self
-            .client
-            .cmd("PEXPIRE")
-            .arg(alive_key.as_str())
-            .arg(ttl_ms.to_string().as_str())
-            .execute()
+        ff_heartbeat_worker(&self.client, keys, args.now.0)
             .await
             .map_err(|e| ff_core::engine_error::backend_context(
-                transport_fk(e),
-                "heartbeat_worker: PEXPIRE alive",
-            ))?;
-
-        if !pexpire_applied {
-            return Ok(HeartbeatWorkerOutcome::NotRegistered);
-        }
-
-        // Refresh the caps hash TTL too — `ff_register_worker`
-        // PEXPIREs both, heartbeat must as well, else caps expire
-        // ahead of alive and `list_workers` / unblock-scanner
-        // `HGET caps_csv` start seeing partial state on long-lived
-        // workers. Reply is ignored: 0 means the caps hash was
-        // reaped between the HGET ttl_ms above and this call; the
-        // worker will re-register on its next heartbeat via the
-        // NotRegistered path once alive also expires.
-        let _: bool = self
-            .client
-            .cmd("PEXPIRE")
-            .arg(caps_key.as_str())
-            .arg(ttl_ms.to_string().as_str())
-            .execute()
-            .await
-            .map_err(|e| ff_core::engine_error::backend_context(
-                transport_fk(e),
-                "heartbeat_worker: PEXPIRE caps",
-            ))?;
-
-        // Stamp the observed heartbeat time into the caps hash so
-        // `list_workers` returns a meaningful `last_heartbeat_ms`
-        // (pre-fix it was returning `registered_at_ms` — PR #494
-        // review). Best-effort: a failed HSET here is benign;
-        // list_workers' field-missing fallback will read
-        // `registered_at_ms`.
-        let _: i64 = self
-            .client
-            .cmd("HSET")
-            .arg(caps_key.as_str())
-            .arg("last_heartbeat_ms")
-            .arg(args.now.0.to_string().as_str())
-            .execute()
-            .await
-            .map_err(|e| ff_core::engine_error::backend_context(
-                transport_fk(e),
-                "heartbeat_worker: HSET last_heartbeat_ms",
-            ))?;
-
-        let next_expiry_ms = TimestampMs::from_millis(
-            args.now.0.saturating_add(ttl_ms as i64),
-        );
-        Ok(HeartbeatWorkerOutcome::Refreshed { next_expiry_ms })
+                transport_script(e),
+                "heartbeat_worker: FCALL ff_heartbeat_worker",
+            ))
     }
 
     async fn mark_worker_dead(
@@ -9266,48 +9195,70 @@ impl EngineBackend for ValkeyBackend {
         // merged fan-out. Collect (score, eid, partition) so the
         // exec_core HMGET can re-use the partition index without a
         // second routing pass.
-        let mut merged: Vec<(i64, String, Partition)> = Vec::new();
+        //
+        // #502 perf: ZRANGEBYSCORE across N partitions is fanned out
+        // concurrently with a bounded `FuturesUnordered` window.
+        // Matches the admin_rotate_fanout_concurrency convention used
+        // by rotate_waitpoint_hmac_secret_all. Output ordering is
+        // restored by the sort below, so unordered completion is safe.
+        use futures::stream::{FuturesUnordered, StreamExt};
 
         let fan = max_partitions.min(num_partitions as u32) as u16;
-        for offset in 0..fan {
-            let idx_u16 = (start_partition + offset) % num_partitions;
-            let partition = Partition {
-                family: PartitionFamily::Execution,
-                index: idx_u16,
-            };
-            let idx = IndexKeys::new(&partition);
-            let key = idx.lease_expiry();
+        let mut merged: Vec<(i64, String, Partition)> = Vec::new();
+        let zrange_concurrency = self.admin_rotate_fanout_concurrency as usize;
+        let as_of_str = args.as_of.0.to_string();
+        let limit_str = limit.to_string();
 
-            // Fetch up to `limit` per partition; merge reduces to
-            // `limit` across partitions below.
-            let entries: Vec<String> = self
-                .client
-                .cmd("ZRANGEBYSCORE")
-                .arg(key.as_str())
-                .arg("-inf")
-                .arg(args.as_of.0.to_string().as_str())
-                .arg("WITHSCORES")
-                .arg("LIMIT")
-                .arg("0")
-                .arg(limit.to_string().as_str())
-                .execute()
-                .await
-                .map_err(|e| ff_core::engine_error::backend_context(
-                    transport_fk(e),
-                    "list_expired_leases: ZRANGEBYSCORE lease_expiry",
-                ))?;
-
-            // ZRANGEBYSCORE ... WITHSCORES returns flat [member,
-            // score, member, score, ...]; pair them up.
-            let mut it = entries.into_iter();
-            while let (Some(member), Some(score_str)) = (it.next(), it.next()) {
-                let score: i64 = score_str
-                    .parse()
-                    .map_err(|e| EngineError::Validation {
-                        kind: ValidationKind::Corruption,
-                        detail: format!("lease_expiry.score: bad score {score_str:?}: {e}"),
-                    })?;
-                merged.push((score, member, partition));
+        let mut pending_zrange: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut offset: u16 = 0;
+        loop {
+            while pending_zrange.len() < zrange_concurrency && offset < fan {
+                let idx_u16 = (start_partition + offset) % num_partitions;
+                let partition = Partition {
+                    family: PartitionFamily::Execution,
+                    index: idx_u16,
+                };
+                let idx = IndexKeys::new(&partition);
+                let key = idx.lease_expiry();
+                let client = &self.client;
+                let as_of = as_of_str.clone();
+                let lim = limit_str.clone();
+                pending_zrange.push(async move {
+                    let entries: Result<Vec<String>, _> = client
+                        .cmd("ZRANGEBYSCORE")
+                        .arg(key.as_str())
+                        .arg("-inf")
+                        .arg(as_of.as_str())
+                        .arg("WITHSCORES")
+                        .arg("LIMIT")
+                        .arg("0")
+                        .arg(lim.as_str())
+                        .execute()
+                        .await;
+                    (partition, entries)
+                });
+                offset += 1;
+            }
+            match pending_zrange.next().await {
+                Some((partition, res)) => {
+                    let entries = res.map_err(|e| ff_core::engine_error::backend_context(
+                        transport_fk(e),
+                        "list_expired_leases: ZRANGEBYSCORE lease_expiry",
+                    ))?;
+                    // ZRANGEBYSCORE ... WITHSCORES returns flat [member,
+                    // score, member, score, ...]; pair them up.
+                    let mut it = entries.into_iter();
+                    while let (Some(member), Some(score_str)) = (it.next(), it.next()) {
+                        let score: i64 = score_str
+                            .parse()
+                            .map_err(|e| EngineError::Validation {
+                                kind: ValidationKind::Corruption,
+                                detail: format!("lease_expiry.score: bad score {score_str:?}: {e}"),
+                            })?;
+                        merged.push((score, member, partition));
+                    }
+                }
+                None => break,
             }
         }
 
@@ -9323,58 +9274,84 @@ impl EngineBackend for ValkeyBackend {
         let page_full = merged.len() > limit;
         merged.truncate(limit);
 
-        // HGET exec_core for each candidate to materialise
-        // ExpiredLeaseInfo. Pipelined via ferriskey's sequential
-        // futures — the page cap (≤10_000) bounds cost.
-        let mut out: Vec<ExpiredLeaseInfo> = Vec::with_capacity(merged.len());
-        for (score, eid_str, partition) in &merged {
-            let execution_id = ExecutionId::parse(eid_str).map_err(|e| EngineError::Validation {
-                kind: ValidationKind::Corruption,
-                detail: format!("lease_expiry.member: bad execution_id: {e}"),
-            })?;
-            let ctx = ExecKeyContext::new(partition, &execution_id);
-            let raw: Vec<Option<String>> = self
-                .client
-                .cmd("HMGET")
-                .arg(ctx.core().as_str())
-                .arg("current_lease_id")
-                .arg("current_lease_epoch")
-                .arg("current_attempt_index")
-                .arg("current_worker_instance_id")
-                .execute()
-                .await
-                .map_err(|e| ff_core::engine_error::backend_context(
-                    transport_fk(e),
-                    "list_expired_leases: HMGET exec_core",
-                ))?;
-            let lease_id_str = raw.first().and_then(|v| v.clone()).unwrap_or_default();
-            let lease_epoch_str = raw.get(1).and_then(|v| v.clone()).unwrap_or_default();
-            let attempt_idx_str = raw.get(2).and_then(|v| v.clone()).unwrap_or_default();
-            let worker_inst_str = raw.get(3).and_then(|v| v.clone()).unwrap_or_default();
+        // HMGET exec_core for each candidate to materialise
+        // ExpiredLeaseInfo. #502 perf: bounded-concurrent fan-out via
+        // FuturesUnordered. `merged` is sorted; we preserve output
+        // order by indexing completions back into a Vec<Option<_>>.
+        const HMGET_CONCURRENCY: usize = 32;
+        let mut slots: Vec<Option<ExpiredLeaseInfo>> = (0..merged.len()).map(|_| None).collect();
+        let mut pending_hmget: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut next_idx: usize = 0;
+        let merged_len = merged.len();
+        loop {
+            while pending_hmget.len() < HMGET_CONCURRENCY && next_idx < merged_len {
+                let (score, eid_str, partition) = merged[next_idx].clone();
+                let client = &self.client;
+                let i = next_idx;
+                pending_hmget.push(async move {
+                    let execution_id = match ExecutionId::parse(&eid_str) {
+                        Ok(e) => e,
+                        Err(e) => return (i, Err(EngineError::Validation {
+                            kind: ValidationKind::Corruption,
+                            detail: format!("lease_expiry.member: bad execution_id: {e}"),
+                        })),
+                    };
+                    let ctx = ExecKeyContext::new(&partition, &execution_id);
+                    let raw_res: Result<Vec<Option<String>>, _> = client
+                        .cmd("HMGET")
+                        .arg(ctx.core().as_str())
+                        .arg("current_lease_id")
+                        .arg("current_lease_epoch")
+                        .arg("current_attempt_index")
+                        .arg("current_worker_instance_id")
+                        .execute()
+                        .await;
+                    let raw = match raw_res {
+                        Ok(r) => r,
+                        Err(e) => return (i, Err(ff_core::engine_error::backend_context(
+                            transport_fk(e),
+                            "list_expired_leases: HMGET exec_core",
+                        ))),
+                    };
+                    let lease_id_str = raw.first().and_then(|v| v.clone()).unwrap_or_default();
+                    let lease_epoch_str = raw.get(1).and_then(|v| v.clone()).unwrap_or_default();
+                    let attempt_idx_str = raw.get(2).and_then(|v| v.clone()).unwrap_or_default();
+                    let worker_inst_str = raw.get(3).and_then(|v| v.clone()).unwrap_or_default();
 
-            // Stale zset entry with an already-cleared lease — skip
-            // rather than fail. Lua-side lease expiry / revocation
-            // cleans the zset atomically, so this is only reached if
-            // a crash interleaved.
-            if lease_id_str.is_empty() || worker_inst_str.is_empty() {
-                continue;
+                    // Stale zset entry with an already-cleared lease —
+                    // skip rather than fail.
+                    if lease_id_str.is_empty() || worker_inst_str.is_empty() {
+                        return (i, Ok(None));
+                    }
+                    let lease_id = match LeaseId::parse(&lease_id_str) {
+                        Ok(l) => l,
+                        Err(e) => return (i, Err(EngineError::Validation {
+                            kind: ValidationKind::Corruption,
+                            detail: format!("current_lease_id: bad lease_id: {e}"),
+                        })),
+                    };
+                    let lease_epoch: u64 = lease_epoch_str.parse().unwrap_or(0);
+                    let attempt_index: u32 = attempt_idx_str.parse().unwrap_or(0);
+                    (i, Ok(Some(ExpiredLeaseInfo::new(
+                        execution_id,
+                        lease_id,
+                        LeaseEpoch::new(lease_epoch),
+                        WorkerInstanceId::new(worker_inst_str),
+                        TimestampMs::from_millis(score),
+                        AttemptIndex::new(attempt_index),
+                    ))))
+                });
+                next_idx += 1;
             }
-            let lease_id = LeaseId::parse(&lease_id_str).map_err(|e| EngineError::Validation {
-                kind: ValidationKind::Corruption,
-                detail: format!("current_lease_id: bad lease_id: {e}"),
-            })?;
-            let lease_epoch: u64 = lease_epoch_str.parse().unwrap_or(0);
-            let attempt_index: u32 = attempt_idx_str.parse().unwrap_or(0);
-
-            out.push(ExpiredLeaseInfo::new(
-                execution_id,
-                lease_id,
-                LeaseEpoch::new(lease_epoch),
-                WorkerInstanceId::new(worker_inst_str),
-                TimestampMs::from_millis(*score),
-                AttemptIndex::new(attempt_index),
-            ));
+            match pending_hmget.next().await {
+                Some((i, Ok(maybe))) => {
+                    slots[i] = maybe;
+                }
+                Some((_, Err(e))) => return Err(e),
+                None => break,
+            }
         }
+        let out: Vec<ExpiredLeaseInfo> = slots.into_iter().flatten().collect();
 
         let cursor = if page_full {
             out.last().map(|e| ExpiredLeasesCursor::new(e.expires_at_ms, e.execution_id.clone()))
@@ -9411,17 +9388,36 @@ impl EngineBackend for ValkeyBackend {
         let limit = args.limit.unwrap_or(1000) as usize;
         let index_key = workers_index_key_ns(ns);
 
-        let mut instance_ids: Vec<String> = self
-            .client
-            .cmd("SMEMBERS")
-            .arg(index_key.as_str())
-            .execute()
-            .await
-            .map_err(|e| ff_core::engine_error::backend_context(
-                transport_fk(e),
-                "list_workers: SMEMBERS index",
-            ))?;
+        // #502 perf: SMEMBERS → SSCAN loop. For a namespace with
+        // thousands of workers, SMEMBERS round-trips the entire member
+        // list in one reply; SSCAN bounds per-reply size to COUNT.
+        // Pagination-friendly and matches the unblock scanner's
+        // `load_worker_caps_union` convention.
+        const WORKERS_SSCAN_COUNT: usize = 100;
+        let mut instance_ids: Vec<String> = Vec::new();
+        let mut cursor: String = "0".to_owned();
+        loop {
+            let reply: (String, Vec<String>) = self
+                .client
+                .cmd("SSCAN")
+                .arg(index_key.as_str())
+                .arg(cursor.as_str())
+                .arg("COUNT")
+                .arg(WORKERS_SSCAN_COUNT.to_string().as_str())
+                .execute()
+                .await
+                .map_err(|e| ff_core::engine_error::backend_context(
+                    transport_fk(e),
+                    "list_workers: SSCAN index",
+                ))?;
+            cursor = reply.0;
+            instance_ids.extend(reply.1);
+            if cursor == "0" {
+                break;
+            }
+        }
         instance_ids.sort();
+        instance_ids.dedup();
 
         if let Some(after) = args.after.as_ref() {
             let cutoff = after.as_str();
@@ -9431,20 +9427,51 @@ impl EngineBackend for ValkeyBackend {
         let page_full = instance_ids.len() > limit;
         instance_ids.truncate(limit);
 
+        // #502 perf: per-worker HGETALL fan-out via FuturesUnordered.
+        // Bounded concurrency mirrors the unblock scanner's caps-GET
+        // fan-out. Output order is preserved by indexing into
+        // `slots` — the sort on `instance_ids` above already put the
+        // pagination order in place.
+        use futures::stream::{FuturesUnordered, StreamExt};
+        const HGETALL_CONCURRENCY: usize = 16;
+        let mut slots: Vec<Option<HashMap<String, String>>> =
+            (0..instance_ids.len()).map(|_| None).collect();
+        let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut next_idx: usize = 0;
+        loop {
+            while pending.len() < HGETALL_CONCURRENCY && next_idx < instance_ids.len() {
+                let id_str = instance_ids[next_idx].clone();
+                let wid = WorkerInstanceId::new(id_str);
+                let caps_key = worker_caps_key_ns(ns, &wid);
+                let client = &self.client;
+                let i = next_idx;
+                pending.push(async move {
+                    let res: Result<HashMap<String, String>, _> = client
+                        .cmd("HGETALL")
+                        .arg(caps_key.as_str())
+                        .execute()
+                        .await;
+                    (i, res)
+                });
+                next_idx += 1;
+            }
+            match pending.next().await {
+                Some((i, Ok(fields))) => slots[i] = Some(fields),
+                Some((_, Err(e))) => {
+                    return Err(ff_core::engine_error::backend_context(
+                        transport_fk(e),
+                        "list_workers: HGETALL caps",
+                    ));
+                }
+                None => break,
+            }
+        }
+
         let mut out: Vec<WorkerInfo> = Vec::with_capacity(instance_ids.len());
-        for id_str in &instance_ids {
+        for (i, id_str) in instance_ids.iter().enumerate() {
             let wid = WorkerInstanceId::new(id_str.clone());
             let caps_key = worker_caps_key_ns(ns, &wid);
-            let fields: HashMap<String, String> = self
-                .client
-                .cmd("HGETALL")
-                .arg(caps_key.as_str())
-                .execute()
-                .await
-                .map_err(|e| ff_core::engine_error::backend_context(
-                    transport_fk(e),
-                    "list_workers: HGETALL caps",
-                ))?;
+            let fields = slots[i].take().unwrap_or_default();
             if fields.is_empty() {
                 // Index entry outlived the caps hash — TTL race on
                 // evict. Log so operators can distinguish this from a

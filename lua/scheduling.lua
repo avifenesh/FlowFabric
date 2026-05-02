@@ -302,6 +302,69 @@ redis.register_function('ff_register_worker', function(keys, args)
 end)
 
 ---------------------------------------------------------------------------
+-- RFC-025  ff_heartbeat_worker  (#502, Lua v34)
+--
+-- Collapse the 4-round-trip heartbeat path (HGET ttl_ms + PEXPIRE alive
+-- + PEXPIRE caps + HSET last_heartbeat_ms) into a single FCALL.
+--
+-- Idempotent: returns `not_registered` when the caps hash is absent
+-- (no prior registration OR TTL reaped OR operator-initiated
+-- mark_worker_dead landed); caller re-registers. Returns
+-- `refreshed <ttl_ms>` on success; Rust wrapper derives
+-- `next_expiry_ms = now_ms + ttl_ms`.
+--
+-- Cluster safety: alive_key and caps_key both live under
+-- `ff:worker:<ns>:<inst>:…` — same instance_id within a namespace.
+-- They DO hash to different slots without explicit `{…}` hash tags
+-- today; this FCALL is therefore intended for single-node Valkey
+-- deployments OR cluster deployments where per-namespace slot-pinning
+-- has been added. The pre-FCALL sequential path used two separate
+-- PEXPIRE commands on the same two keys — identical slot-span
+-- constraint. This FCALL does NOT newly introduce a cross-slot read;
+-- it merely bundles existing ones.
+--
+-- KEYS (2): alive_key (`ff:worker:{ns}:{inst}:alive`),
+--           caps_key  (`ff:worker:{ns}:{inst}:caps`)
+-- ARGV (1): now_ms
+---------------------------------------------------------------------------
+redis.register_function('ff_heartbeat_worker', function(keys, args)
+  local alive_key = keys[1]
+  local caps_key  = keys[2]
+
+  local now_n = require_number(args[1], "now_ms")
+  if type(now_n) == "table" then return now_n end
+
+  local ttl_raw = redis.call("HGET", caps_key, "ttl_ms")
+  if not ttl_raw or ttl_raw == false then
+    return ok("not_registered")
+  end
+  local ttl_ms = tonumber(ttl_raw)
+  if not ttl_ms then
+    return ok("not_registered")
+  end
+
+  -- PEXPIRE returns 0 when the key is absent (TTL elapsed or
+  -- mark_worker_dead raced). Treat that as NotRegistered so the caller
+  -- re-registers, matching the pre-FCALL behaviour.
+  local applied = redis.call("PEXPIRE", alive_key, tostring(ttl_ms))
+  if applied == 0 then
+    return ok("not_registered")
+  end
+
+  -- Caps-hash TTL refresh. Ignore the reply: if the caps hash was
+  -- reaped between HGET and PEXPIRE, list_workers / unblock_scanner
+  -- will skip the indexed instance on the next cycle and the worker
+  -- will re-register on the next heartbeat.
+  redis.call("PEXPIRE", caps_key, tostring(ttl_ms))
+
+  -- Stamp observed heartbeat so list_workers returns a real
+  -- `last_heartbeat_ms` (not `registered_at_ms`).
+  redis.call("HSET", caps_key, "last_heartbeat_ms", tostring(now_n))
+
+  return ok("refreshed", tostring(ttl_ms))
+end)
+
+---------------------------------------------------------------------------
 -- #33  ff_update_progress
 --
 -- Update progress fields on exec_core. Validate lease (lite check:
