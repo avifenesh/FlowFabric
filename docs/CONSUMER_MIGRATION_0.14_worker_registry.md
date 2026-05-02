@@ -84,10 +84,16 @@ And a PG sibling that returned `EngineError::Unavailable` via the
 
 ```rust
 use ff_core::contracts::{
-    RegisterWorkerArgs, HeartbeatWorkerArgs, MarkWorkerDeadArgs,
+    RegisterWorkerArgs, RegisterWorkerOutcome,
+    HeartbeatWorkerArgs, HeartbeatWorkerOutcome,
+    MarkWorkerDeadArgs,
     ListExpiredLeasesArgs, ListWorkersArgs,
 };
 use ff_core::engine_backend::EngineBackend;
+use ff_core::types::{
+    LaneId, Namespace, TimestampMs, WorkerId, WorkerInstanceId,
+};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub struct CairnEngine {

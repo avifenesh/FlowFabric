@@ -9096,13 +9096,52 @@ impl EngineBackend for ValkeyBackend {
             ))?;
 
         if !pexpire_applied {
-            Ok(HeartbeatWorkerOutcome::NotRegistered)
-        } else {
-            let next_expiry_ms = TimestampMs::from_millis(
-                args.now.0.saturating_add(ttl_ms as i64),
-            );
-            Ok(HeartbeatWorkerOutcome::Refreshed { next_expiry_ms })
+            return Ok(HeartbeatWorkerOutcome::NotRegistered);
         }
+
+        // Refresh the caps hash TTL too — `ff_register_worker`
+        // PEXPIREs both, heartbeat must as well, else caps expire
+        // ahead of alive and `list_workers` / unblock-scanner
+        // `HGET caps_csv` start seeing partial state on long-lived
+        // workers. Reply is ignored: 0 means the caps hash was
+        // reaped between the HGET ttl_ms above and this call; the
+        // worker will re-register on its next heartbeat via the
+        // NotRegistered path once alive also expires.
+        let _: bool = self
+            .client
+            .cmd("PEXPIRE")
+            .arg(caps_key.as_str())
+            .arg(ttl_ms.to_string().as_str())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "heartbeat_worker: PEXPIRE caps",
+            ))?;
+
+        // Stamp the observed heartbeat time into the caps hash so
+        // `list_workers` returns a meaningful `last_heartbeat_ms`
+        // (pre-fix it was returning `registered_at_ms` — PR #494
+        // review). Best-effort: a failed HSET here is benign;
+        // list_workers' field-missing fallback will read
+        // `registered_at_ms`.
+        let _: i64 = self
+            .client
+            .cmd("HSET")
+            .arg(caps_key.as_str())
+            .arg("last_heartbeat_ms")
+            .arg(args.now.0.to_string().as_str())
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "heartbeat_worker: HSET last_heartbeat_ms",
+            ))?;
+
+        let next_expiry_ms = TimestampMs::from_millis(
+            args.now.0.saturating_add(ttl_ms as i64),
+        );
+        Ok(HeartbeatWorkerOutcome::Refreshed { next_expiry_ms })
     }
 
     async fn mark_worker_dead(
@@ -9428,6 +9467,12 @@ impl EngineBackend for ValkeyBackend {
                 .get("registered_at_ms")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            // Fallback to registered_at_ms for pre-v33 caps hashes
+            // that don't carry the field yet.
+            let last_heartbeat_ms: i64 = fields
+                .get("last_heartbeat_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(registered_at_ms);
 
             let lanes: std::collections::BTreeSet<LaneId> = if lanes_csv.is_empty() {
                 Default::default()
@@ -9454,7 +9499,7 @@ impl EngineBackend for ValkeyBackend {
                 ns.clone(),
                 lanes,
                 capabilities,
-                TimestampMs::from_millis(registered_at_ms),
+                TimestampMs::from_millis(last_heartbeat_ms),
                 ttl_ms,
                 TimestampMs::from_millis(registered_at_ms),
             ));
