@@ -3368,6 +3368,344 @@ pub struct StateSummary {
     pub current_attempt_index: AttemptIndex,
 }
 
+// ─── RFC-025 worker registry ───
+
+/// Inputs to [`crate::engine_backend::EngineBackend::register_worker`]
+/// (RFC-025). Feature gate: `core`.
+///
+/// `worker_instance_id` is process identity (unique per-boot);
+/// `worker_id` is pool / logical identity (stable across restarts).
+/// See RFC-025 §7 terminology glossary.
+///
+/// `liveness_ttl_ms` is stored alongside the registration so
+/// `heartbeat_worker` refreshes to the same value without the caller
+/// re-supplying it.
+///
+/// Re-registering with the same `worker_instance_id` is
+/// **idempotent** (RFC-025 §9.3): caps/lanes/TTL overwritten,
+/// `Refreshed` returned. Re-registering with the same
+/// `worker_instance_id` under a DIFFERENT `worker_id` is rejected
+/// with `Validation(InvalidInput, "instance_id reassigned")`.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisterWorkerArgs {
+    pub worker_id: WorkerId,
+    pub worker_instance_id: WorkerInstanceId,
+    /// Workers serve one-or-more lanes. `BTreeSet` for stable
+    /// iteration + dedup.
+    pub lanes: BTreeSet<LaneId>,
+    pub capabilities: BTreeSet<String>,
+    /// Stored for subsequent `heartbeat_worker` TTL refresh.
+    pub liveness_ttl_ms: u64,
+    pub namespace: Namespace,
+    pub now: TimestampMs,
+}
+
+impl RegisterWorkerArgs {
+    pub fn new(
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        lanes: BTreeSet<LaneId>,
+        capabilities: BTreeSet<String>,
+        liveness_ttl_ms: u64,
+        namespace: Namespace,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            worker_id,
+            worker_instance_id,
+            lanes,
+            capabilities,
+            liveness_ttl_ms,
+            namespace,
+            now,
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterWorkerOutcome {
+    /// No prior live key for this `worker_instance_id` (fresh boot
+    /// or post-TTL-expiry).
+    Registered,
+    /// Existing live key was found; TTL reset + caps/lanes
+    /// overwritten (in-process hot-restart, RFC-025 §9.3).
+    Refreshed,
+}
+
+/// Inputs to [`crate::engine_backend::EngineBackend::heartbeat_worker`]
+/// (RFC-025). Feature gate: `core`.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeartbeatWorkerArgs {
+    pub worker_instance_id: WorkerInstanceId,
+    pub namespace: Namespace,
+    pub now: TimestampMs,
+}
+
+impl HeartbeatWorkerArgs {
+    pub fn new(
+        worker_instance_id: WorkerInstanceId,
+        namespace: Namespace,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            worker_instance_id,
+            namespace,
+            now,
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatWorkerOutcome {
+    /// TTL refreshed. `next_expiry_ms = now + stored-ttl`; callers
+    /// schedule the next heartbeat from this value.
+    Refreshed { next_expiry_ms: TimestampMs },
+    /// Liveness key was absent — TTL ran out or `mark_worker_dead`
+    /// landed earlier. Caller re-registers, not re-heartbeats.
+    NotRegistered,
+}
+
+/// Inputs to [`crate::engine_backend::EngineBackend::mark_worker_dead`]
+/// (RFC-025). Feature gate: `core`.
+///
+/// `reason` is capped at 256 bytes and must not contain control
+/// characters; oversize / invalid reject with
+/// `Validation(InvalidInput, "reason: …")`. Mirrors
+/// `fail_execution`'s `failure_reason` discipline.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkWorkerDeadArgs {
+    pub worker_instance_id: WorkerInstanceId,
+    pub namespace: Namespace,
+    pub reason: String,
+    pub now: TimestampMs,
+}
+
+impl MarkWorkerDeadArgs {
+    pub fn new(
+        worker_instance_id: WorkerInstanceId,
+        namespace: Namespace,
+        reason: String,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            worker_instance_id,
+            namespace,
+            reason,
+            now,
+        }
+    }
+}
+
+/// Max bytes for `MarkWorkerDeadArgs.reason`. Mirrors
+/// `FailExecutionArgs::failure_reason` ceiling.
+pub const MARK_WORKER_DEAD_REASON_MAX_BYTES: usize = 256;
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkWorkerDeadOutcome {
+    Marked,
+    /// Liveness key already absent — no-op, idempotent. Unified
+    /// variant name with `HeartbeatWorkerOutcome::NotRegistered`.
+    NotRegistered,
+}
+
+/// Cursor for [`crate::engine_backend::EngineBackend::list_expired_leases`]
+/// (RFC-025 §9-locked). Tuple (not bare `ExecutionId`) so pagination
+/// is stable under equal-expiry: `ZRANGEBYSCORE` with `LIMIT` keyed
+/// on score alone duplicates or skips when two leases share a
+/// millisecond.
+///
+/// Backends order strictly by
+/// `(expires_at_ms ASC, execution_id ASC)`.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredLeasesCursor {
+    pub expires_at_ms: TimestampMs,
+    pub execution_id: ExecutionId,
+}
+
+impl ExpiredLeasesCursor {
+    pub fn new(expires_at_ms: TimestampMs, execution_id: ExecutionId) -> Self {
+        Self {
+            expires_at_ms,
+            execution_id,
+        }
+    }
+}
+
+/// Default fan-out for `list_expired_leases` when
+/// `max_partitions_per_call` is `None` (RFC-025 §9.2).
+pub const LIST_EXPIRED_LEASES_DEFAULT_MAX_PARTITIONS: u32 = 32;
+
+/// Default page size when `limit` is `None`.
+pub const LIST_EXPIRED_LEASES_DEFAULT_LIMIT: u32 = 1_000;
+
+/// Backend cap for `limit`.
+pub const LIST_EXPIRED_LEASES_MAX_LIMIT: u32 = 10_000;
+
+/// Inputs to [`crate::engine_backend::EngineBackend::list_expired_leases`]
+/// (RFC-025). Feature gate: `suspension`.
+///
+/// `namespace = None` = cross-namespace sweep for operator tooling
+/// (auth enforced at the ff-server admin route, NOT the trait
+/// boundary). `Some(ns)` = per-tenant scope.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListExpiredLeasesArgs {
+    /// Every returned lease has `expires_at_ms <= as_of`.
+    pub as_of: TimestampMs,
+    /// Exclusive pagination cursor. `None` = scan from earliest.
+    pub after: Option<ExpiredLeasesCursor>,
+    /// Default [`LIST_EXPIRED_LEASES_DEFAULT_LIMIT`] when `None`;
+    /// backend cap [`LIST_EXPIRED_LEASES_MAX_LIMIT`].
+    pub limit: Option<u32>,
+    /// Default [`LIST_EXPIRED_LEASES_DEFAULT_MAX_PARTITIONS`] when
+    /// `None`.
+    pub max_partitions_per_call: Option<u32>,
+    pub namespace: Option<Namespace>,
+}
+
+impl ListExpiredLeasesArgs {
+    pub fn new(as_of: TimestampMs) -> Self {
+        Self {
+            as_of,
+            after: None,
+            limit: None,
+            max_partitions_per_call: None,
+            namespace: None,
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredLeaseInfo {
+    pub execution_id: ExecutionId,
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
+    pub worker_instance_id: WorkerInstanceId,
+    pub expires_at_ms: TimestampMs,
+    pub attempt_index: AttemptIndex,
+}
+
+impl ExpiredLeaseInfo {
+    pub fn new(
+        execution_id: ExecutionId,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
+        worker_instance_id: WorkerInstanceId,
+        expires_at_ms: TimestampMs,
+        attempt_index: AttemptIndex,
+    ) -> Self {
+        Self {
+            execution_id,
+            lease_id,
+            lease_epoch,
+            worker_instance_id,
+            expires_at_ms,
+            attempt_index,
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListExpiredLeasesResult {
+    pub entries: Vec<ExpiredLeaseInfo>,
+    pub cursor: Option<ExpiredLeasesCursor>,
+}
+
+impl ListExpiredLeasesResult {
+    pub fn new(entries: Vec<ExpiredLeaseInfo>, cursor: Option<ExpiredLeasesCursor>) -> Self {
+        Self { entries, cursor }
+    }
+}
+
+/// Inputs to [`crate::engine_backend::EngineBackend::list_workers`]
+/// (RFC-025 Phase 6, §9.4).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListWorkersArgs {
+    /// `None` = cross-namespace sweep for operator tooling.
+    pub namespace: Option<Namespace>,
+    /// Exclusive pagination cursor.
+    pub after: Option<WorkerInstanceId>,
+    /// Default 1000 when `None`.
+    pub limit: Option<u32>,
+}
+
+impl ListWorkersArgs {
+    pub fn new() -> Self {
+        Self {
+            namespace: None,
+            after: None,
+            limit: None,
+        }
+    }
+}
+
+impl Default for ListWorkersArgs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerInfo {
+    pub worker_id: WorkerId,
+    pub worker_instance_id: WorkerInstanceId,
+    pub namespace: Namespace,
+    pub lanes: BTreeSet<LaneId>,
+    pub capabilities: BTreeSet<String>,
+    pub last_heartbeat_ms: TimestampMs,
+    pub liveness_ttl_ms: u64,
+    pub registered_at_ms: TimestampMs,
+}
+
+impl WorkerInfo {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        namespace: Namespace,
+        lanes: BTreeSet<LaneId>,
+        capabilities: BTreeSet<String>,
+        last_heartbeat_ms: TimestampMs,
+        liveness_ttl_ms: u64,
+        registered_at_ms: TimestampMs,
+    ) -> Self {
+        Self {
+            worker_id,
+            worker_instance_id,
+            namespace,
+            lanes,
+            capabilities,
+            last_heartbeat_ms,
+            liveness_ttl_ms,
+            registered_at_ms,
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListWorkersResult {
+    pub entries: Vec<WorkerInfo>,
+    pub cursor: Option<WorkerInstanceId>,
+}
+
+impl ListWorkersResult {
+    pub fn new(entries: Vec<WorkerInfo>, cursor: Option<WorkerInstanceId>) -> Self {
+        Self { entries, cursor }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
