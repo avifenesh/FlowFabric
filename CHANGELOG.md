@@ -7,6 +7,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`.github/workflows/examples.yml`** (phase 3e) — CI wiring for the
+  run-all-examples harness. Single job on ubuntu-latest with Valkey 8
+  (alpine) + Postgres 16 (alpine) services; triggers on PRs + pushes
+  to main that touch `examples/**`, `crates/ff-*/**`,
+  `scripts/run-all-examples.sh`, or the workflow itself. Installs
+  `postgresql-client` + `redis-tools` so the harness's preflight probes
+  (psql SELECT 1 / redis-cli PING) light up instead of falling back to
+  /dev/tcp. `valkey-tools` isn't packaged for Ubuntu 24.04 yet; the
+  harness's CLI-preference chain falls back to `redis-cli` which still
+  speaks the Valkey wire protocol. `FF_HOST`/`FF_PORT`/`FF_PG_TEST_URL`
+  env vars steer preflight + run at the same services. LLM-dependent
+  examples stay pre-release-local per the scope decision (the harness
+  SKIPs them with a clean rationale). Branch protection not added yet —
+  gate on a few green runs first.
 - **`scripts/run-all-examples.sh` phase 3c.v** — `deploy-approval`
   HITL orchestration. New `run_deploy_approval()` function spawns
   the 6-worker choreography (build + 3× test kinds + deploy +
