@@ -47,6 +47,12 @@ pub mod retry;
 mod suspend_ops;
 mod tx_util;
 mod typed_ops;
+// RFC-025 Phase 4: worker-registry bodies. Gated on `core` so a
+// `--features suspension`-only slice doesn't drag in a module whose
+// `register_worker` / `heartbeat_worker` / `mark_worker_dead` /
+// `list_workers` trait methods live under `core`.
+#[cfg(feature = "core")]
+mod worker_registry;
 
 pub use backend::SqliteBackend;
 pub use errors::{MAX_ATTEMPTS, is_retryable_sqlite_busy};
