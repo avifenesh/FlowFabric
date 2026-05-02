@@ -1,30 +1,29 @@
 #!/usr/bin/env bash
-# run-all-examples.sh — phase 3a: build-clean gate.
+# run-all-examples.sh — mechanical harness for the CLAUDE.md §5 item 3
+# pre-tag release check.
 #
-# Walks every subdirectory of `examples/` that has a Cargo.toml and runs
-# `cargo build --bins` in its own workspace. Reports PASS/FAIL per
-# example and exits non-zero if any example failed to build.
-#
-# Live-run coverage (end-to-end scenarios, multi-bin HITL orchestration,
-# LLM-dependent flows) lands in phases 3b–3d. LLM-dependent examples
-# (coding-agent, llm-race) are intentionally out of CI scope — they're
-# pre-release-local runs, since CI has no API keys and the point is
-# real-provider smoke, not mocked fidelity.
+# Phases:
+#   3a: build-clean gate (cargo build --locked --bins per example)
+#   3b: single-command live-runs for SQLite-only / FF_DEV_MODE examples
+#   3c: HITL / multi-bin orchestration (deploy-approval, media-pipeline, ...)
+#   3d: LLM-dependent examples (pre-release-local only — out of CI scope,
+#       CI has no provider keys and mocking defeats real-fidelity)
+#   3e: CI integration
+#   3f: grafana dashboard JSON validation
 #
 # Usage:
-#   scripts/run-all-examples.sh            # build all
+#   scripts/run-all-examples.sh                    # build + run everything reachable
+#   scripts/run-all-examples.sh --build-only       # phase 3a only
+#   scripts/run-all-examples.sh --run-only         # phase 3b only (assumes a prior build)
 #   FF_EXAMPLES_ONLY=ff-dev,token-budget scripts/run-all-examples.sh
 #
 # Exit codes:
-#   0 — all selected examples built clean (or SKIPped with rationale)
-#   1 — one or more examples failed to build
+#   0 — all selected examples passed (or SKIPped with rationale)
+#   1 — one or more examples failed
+#   2 — environment / preflight fault
 
 set -u
 set -o pipefail
-# `nullglob` so the loop iterates zero times when `examples/` is empty
-# or missing, instead of iterating once with the literal glob pattern
-# (which would feed `Cargo.toml check` a non-existent directory and
-# emit a confusing [FAIL] line). Combined with the preflight below.
 shopt -s nullglob
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,13 +36,57 @@ fi
 
 # Per-session opt-in filter. Empty = run everything.
 ONLY="${FF_EXAMPLES_ONLY:-}"
+MODE="both"   # both | build | run
 
-# Skip rationale — case statement keeps the script portable to Bash 3.2
-# (macOS default). Prints empty string for non-matches.
+for arg in "$@"; do
+    case "$arg" in
+        --build-only) MODE="build" ;;
+        --run-only) MODE="run" ;;
+        *) echo "unknown arg: $arg" >&2; exit 2 ;;
+    esac
+done
+
+# ── per-example metadata ───────────────────────────────────────────────
+#
+# `skip_reason` short-circuits the build+run pair with a stable
+# rationale (grafana has no Cargo workspace).
 skip_reason() {
     case "$1" in
         grafana) echo "dashboard JSON only — no Cargo workspace" ;;
         *) echo "" ;;
+    esac
+}
+
+# `run_cmd` emits the command-line for the example's live-run, or an
+# empty string for examples not yet covered in phase 3b (3c+ lands the
+# HITL orchestration + ff-server-dependent ones).
+run_cmd() {
+    case "$1" in
+        ff-dev)
+            echo "FF_DEV_MODE=1 timeout 60 cargo run --locked --release --bin ff-dev" ;;
+        v013-cairn-454-budget-ledger)
+            echo "timeout 60 cargo run --locked --release --bin budget-ledger" ;;
+        external-callback)
+            echo "FF_DEV_MODE=1 timeout 60 cargo run --locked --release -- --backend sqlite" ;;
+        *)
+            echo "" ;;
+    esac
+}
+
+# `run_reason` explains the SKIP for examples that don't have a run_cmd
+# yet. Operators should see why, not just "skipped".
+run_reason() {
+    case "$1" in
+        coding-agent) echo "phase 3d — LLM-dependent, pre-release-local only" ;;
+        llm-race) echo "phase 3d — LLM-dependent, pre-release-local only" ;;
+        deploy-approval) echo "phase 3c — HITL multi-bin orchestration pending" ;;
+        media-pipeline) echo "phase 3c — HITL multi-bin orchestration pending" ;;
+        incident-remediation) echo "phase 3c — requires ff-server choreography" ;;
+        retry-and-cancel) echo "phase 3c — requires ff-server" ;;
+        token-budget) echo "phase 3c — requires ff-server" ;;
+        v010-read-side-ergonomics) echo "phase 3c — requires ff-server" ;;
+        v011-wave9-postgres) echo "phase 3c — requires ff-server + Postgres choreography" ;;
+        *) echo "phase 3b does not cover this example yet" ;;
     esac
 }
 
@@ -61,16 +104,25 @@ in_only() {
     return 1
 }
 
-echo "[run-all-examples] phase 3a — build-clean gate"
+echo "[run-all-examples] mode=$MODE"
 echo "[run-all-examples] root=$ROOT"
 [ -n "$ONLY" ] && echo "[run-all-examples] FF_EXAMPLES_ONLY=$ONLY"
 echo
 
 # Single tempfile reused per iteration. `trap` ensures cleanup even on
-# SIGINT/SIGTERM so we don't leave orphans in /tmp. The template
-# argument is required on macOS/BSD mktemp.
+# SIGINT/SIGTERM. The template argument is required on macOS/BSD mktemp.
 LOG_TMP="$(mktemp "${TMPDIR:-/tmp}/ff-run-all-examples.XXXXXX")"
 trap 'rm -f "$LOG_TMP"' EXIT
+
+record_pass() { echo "[PASS] $1"; PASS+=("$1"); }
+record_fail() {
+    echo "[FAIL] $1 — $2"
+    echo "─── last 30 lines of output ───"
+    tail -n 30 "$LOG_TMP"
+    echo "─── end ───"
+    FAIL+=("$1")
+}
+record_skip() { echo "[SKIP] $1 — $2"; SKIP+=("$1"); }
 
 for dir in "$EXAMPLES_DIR"/*/; do
     name="$(basename "$dir")"
@@ -78,37 +130,57 @@ for dir in "$EXAMPLES_DIR"/*/; do
 
     reason="$(skip_reason "$name")"
     if [ -n "$reason" ]; then
-        echo "[SKIP] $name — $reason"
-        SKIP+=("$name")
+        record_skip "$name" "$reason"
         continue
     fi
 
     if [ ! -f "$dir/Cargo.toml" ]; then
-        echo "[SKIP] $name — no Cargo.toml"
-        SKIP+=("$name")
+        record_skip "$name" "no Cargo.toml"
         continue
     fi
 
-    echo "[build] $name …"
-    # `--locked` so an out-of-date Cargo.lock FAILs rather than silently
-    # rewrites the lockfile and leaves the working tree dirty — keeps
-    # the gate deterministic across CI + local.
-    if (cd "$dir" && cargo build --locked --bins) >"$LOG_TMP" 2>&1; then
-        echo "[PASS] $name"
-        PASS+=("$name")
+    # ── build (phase 3a) ──
+    if [ "$MODE" = "both" ] || [ "$MODE" = "build" ]; then
+        echo "[build] $name …"
+        if ! (cd "$dir" && cargo build --locked --bins) >"$LOG_TMP" 2>&1; then
+            record_fail "$name" "cargo build failed"
+            echo
+            continue
+        fi
+        # If build-only, succeed here.
+        if [ "$MODE" = "build" ]; then
+            record_pass "$name"
+            echo
+            continue
+        fi
+    fi
+
+    # ── run (phase 3b) ──
+    cmd="$(run_cmd "$name")"
+    if [ -z "$cmd" ]; then
+        record_skip "$name" "$(run_reason "$name")"
+        echo
+        continue
+    fi
+
+    echo "[run] $name …"
+    echo "      $cmd"
+    # Run inside the example's Cargo workspace.
+    if (cd "$dir" && bash -c "$cmd") >"$LOG_TMP" 2>&1; then
+        record_pass "$name"
     else
-        echo "[FAIL] $name"
-        # Surface the last 30 lines of cargo output so CI logs carry the
-        # actual error without dumping the whole compile.
-        echo "─── last 30 lines of cargo output ───"
-        tail -n 30 "$LOG_TMP"
-        echo "─── end ───"
-        FAIL+=("$name")
+        rc=$?
+        if [ "$rc" = "124" ]; then
+            record_fail "$name" "timed out"
+        else
+            record_fail "$name" "exit $rc"
+        fi
     fi
     echo
 done
 
 echo "═══ summary ═══"
+echo "mode=$MODE"
 echo "PASS: ${#PASS[@]}  (${PASS[*]:-none})"
 echo "SKIP: ${#SKIP[@]}  (${SKIP[*]:-none})"
 echo "FAIL: ${#FAIL[@]}  (${FAIL[*]:-none})"
