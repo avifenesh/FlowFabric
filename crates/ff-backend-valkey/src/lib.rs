@@ -9405,7 +9405,14 @@ impl EngineBackend for ValkeyBackend {
                     "list_workers: HGETALL caps",
                 ))?;
             if fields.is_empty() {
-                // Index entry outlived the caps hash — TTL race. Skip.
+                // Index entry outlived the caps hash — TTL race on
+                // evict. Log so operators can distinguish this from a
+                // dropped worker without digging through keyspace.
+                tracing::debug!(
+                    instance_id = %instance_id,
+                    caps_key = %caps_key,
+                    "list_workers: caps hash missing for indexed instance (TTL race); skipping"
+                );
                 continue;
             }
             let worker_id_str = fields.get("worker_id").cloned().unwrap_or_default();
