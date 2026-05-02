@@ -322,7 +322,7 @@ async fn scan_blocked_set(
             errors += 1;
             continue;
         }
-        let reason = fields[0].clone().unwrap_or_default();
+        let reason = fields[0].as_deref().unwrap_or("");
         let namespace = match fields[1].as_deref().filter(|s| !s.is_empty()) {
             Some(ns_str) => Namespace::new(ns_str),
             None => {
@@ -724,16 +724,20 @@ async fn check_route_cleared(
         _ => return true, // no required caps → anyone can claim
     };
 
-    // Acquire the cache, return a cheap clone of the snapshot so the
-    // subset check runs OUTSIDE the mutex (BTreeSet clone is O(n) but
-    // n is bounded by total caps across the fleet — typically tens).
-    // Holding the mutex across the subset loop would serialize every
-    // partition's capability-block decision behind this one mutex.
+    // Two-phase cache access: NEVER hold the mutex across the
+    // network refresh. Holding `AsyncMutex` across
+    // `load_worker_caps_union`'s SSCAN + HGET fan-out would serialize
+    // every tenant's cap-block decision behind one slow namespace's
+    // Valkey round trip — see PR #500 review.
     //
-    // Per-namespace entries: cache refresh decision keys off the
-    // execution's namespace, so tenants with very different update
-    // cadences don't invalidate each other.
-    let snapshot: BTreeSet<String> = {
+    // Phase 1: under the lock, decide if a refresh is needed and
+    // grab a current-or-empty snapshot for the fallback path.
+    //
+    // Phase 2: if stale, refresh off-lock, then re-acquire briefly
+    // to write the result. Racing refreshes for the same namespace
+    // resolve to "last writer wins" — acceptable because all fetches
+    // observe the same authoritative index at roughly the same time.
+    let (stale, cached_snapshot): (bool, BTreeSet<String>) = {
         let mut guard = caps_cache.lock().await;
         let ttl = guard.ttl;
         let entry = guard
@@ -747,24 +751,32 @@ async fn check_route_cleared(
             .fetched_at
             .map(|t| t.elapsed() >= ttl)
             .unwrap_or(true);
-        if stale {
-            match load_worker_caps_union(client, namespace).await {
-                Ok(union) => {
-                    entry.snapshot = Some(union);
+        (stale, entry.snapshot.clone().unwrap_or_default())
+    };
+
+    let snapshot: BTreeSet<String> = if stale {
+        match load_worker_caps_union(client, namespace).await {
+            Ok(union) => {
+                let refreshed = union.clone();
+                let mut guard = caps_cache.lock().await;
+                if let Some(entry) = guard.entries.get_mut(namespace) {
+                    entry.snapshot = Some(refreshed);
                     entry.fetched_at = Some(Instant::now());
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        namespace = %namespace,
-                        "unblock_scanner: failed to read worker caps union — \
-                         assuming match possible (fail-open to preserve liveness)"
-                    );
-                    return true;
-                }
+                union
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    namespace = %namespace,
+                    "unblock_scanner: failed to read worker caps union — \
+                     assuming match possible (fail-open to preserve liveness)"
+                );
+                return true;
             }
         }
-        entry.snapshot.clone().unwrap_or_default()
+    } else {
+        cached_snapshot
     };
 
     // Subset check: every non-empty token in required_csv present in union.

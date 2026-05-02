@@ -304,7 +304,12 @@ pub async fn list_expired_leases(
             AND (?3 IS NULL \
                  OR (a.lease_expires_at_ms > ?3) \
                  OR (a.lease_expires_at_ms = ?3 \
-                     AND ('{fp:' || a.partition_key || '}:' || lower(hex(a.execution_id))) > ?4)) \
+                     AND ('{fp:' || a.partition_key || '}:' || \
+                          substr(lower(hex(a.execution_id)), 1, 8) || '-' || \
+                          substr(lower(hex(a.execution_id)), 9, 4) || '-' || \
+                          substr(lower(hex(a.execution_id)), 13, 4) || '-' || \
+                          substr(lower(hex(a.execution_id)), 17, 4) || '-' || \
+                          substr(lower(hex(a.execution_id)), 21, 12)) > ?4)) \
           ORDER BY a.lease_expires_at_ms ASC, a.partition_key ASC, a.execution_id ASC \
           LIMIT ?5",
     )

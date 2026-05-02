@@ -282,7 +282,8 @@ redis.register_function('ff_register_worker', function(keys, args)
     "lanes_csv", A.lanes_csv,
     "caps_csv", A.caps_csv,
     "ttl_ms", tostring(A.ttl_ms),
-    "registered_at_ms", tostring(A.now_ms))
+    "registered_at_ms", tostring(A.now_ms),
+    "last_heartbeat_ms", tostring(A.now_ms))
 
   -- Match the alive-key TTL on the caps hash so both age out together
   -- when the worker goes silent. Prevents a stale caps hash from
