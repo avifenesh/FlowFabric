@@ -1,7 +1,7 @@
 use crate::partition::Partition;
 use crate::types::{
-    AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, QuotaPolicyId, SignalId,
-    WaitpointId, WaitpointKey, WorkerInstanceId,
+    AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, Namespace, QuotaPolicyId,
+    SignalId, WaitpointId, WaitpointKey, WorkerInstanceId,
 };
 
 // ─── Execution Partition Keys ({fp:N} post-RFC-011) ───
@@ -663,6 +663,13 @@ pub fn worker_key(wid: &WorkerInstanceId) -> String {
 /// whatever slot CRC16 hashes to — enumeration goes through
 /// `workers_index_key()` rather than a keyspace SCAN, which would only
 /// hit one shard in cluster mode.
+///
+/// **Deprecation note (RFC-025 Phase 2):** this global helper builds a
+/// pre-namespace key shape. New worker-registry code paths use
+/// [`worker_caps_key_ns`] which includes the tenant namespace. The
+/// legacy helper stays for the SDK preamble and cairn's Valkey
+/// fast-path during the Phase 2→5 rollout; remove once cairn migrates
+/// in Phase 5.
 pub fn worker_caps_key(wid: &WorkerInstanceId) -> String {
     format!("ff:worker:{}:caps", wid)
 }
@@ -673,8 +680,40 @@ pub fn worker_caps_key(wid: &WorkerInstanceId) -> String {
 /// universe the unblock scanner walks. Separate from `ff:worker:{id}`
 /// registration keys to keep the index membership cheap to read and
 /// independent of per-worker hash details.
+///
+/// **Deprecation note (RFC-025 Phase 2):** see [`worker_caps_key`].
+/// New code uses [`workers_index_key_ns`].
 pub fn workers_index_key() -> String {
     "ff:idx:workers".to_owned()
+}
+
+// ─── RFC-025 namespace-scoped worker registry keys ───
+//
+// Locked in §9.1: all worker-registry writes live under a namespace
+// prefix so multi-tenant deployments can reuse the same
+// `worker_instance_id` without cross-tenant key collisions. These
+// helpers underpin the FCALL `ff_register_worker` and the
+// `heartbeat_worker` / `mark_worker_dead` / `list_workers` trait
+// bodies on Valkey.
+
+/// `ff:worker:{namespace}:{instance_id}:alive` — liveness key for the
+/// worker. TTL'd via `PEXPIRE`; presence == registered.
+pub fn worker_alive_key_ns(ns: &Namespace, wid: &WorkerInstanceId) -> String {
+    format!("ff:worker:{}:{}:alive", ns, wid)
+}
+
+/// `ff:worker:{namespace}:{instance_id}:caps` — HASH of
+/// `worker_id`, `lanes_csv`, `caps_csv`, `ttl_ms`, `registered_at_ms`
+/// for the registered worker.
+pub fn worker_caps_key_ns(ns: &Namespace, wid: &WorkerInstanceId) -> String {
+    format!("ff:worker:{}:{}:caps", ns, wid)
+}
+
+/// `ff:idx:{namespace}:workers` — SET index of live
+/// `worker_instance_id`s for the namespace. `list_workers` enumerates
+/// this.
+pub fn workers_index_key_ns(ns: &Namespace) -> String {
+    format!("ff:idx:{}:workers", ns)
 }
 
 /// Worker capability index.
