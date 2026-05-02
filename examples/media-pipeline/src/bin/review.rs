@@ -62,8 +62,15 @@ struct Args {
     /// Waitpoint id printed by the summarize worker on suspend (look for
     /// `REVIEW_NEEDED eid=... wp=...`). The raw HMAC `waitpoint_token`
     /// is resolved through the admin client at runtime (v0.14).
+    ///
+    /// Optional so an already-completed execution (a peer reviewer
+    /// beat us to the approval — or `FF_SKIP_APPROVAL=1`) exits
+    /// cleanly without requiring the operator to supply a waitpoint
+    /// id they'd never use. Required only on the Suspended branch
+    /// below; absence there surfaces as a typed bail with a pointer
+    /// at the summarize worker's log line.
     #[arg(long)]
-    waitpoint_id: String,
+    waitpoint_id: Option<String>,
 
     /// Non-interactive: skip the prompt and approve immediately.
     #[arg(long)]
@@ -175,16 +182,27 @@ async fn main() -> Result<()> {
     }
 
     // v0.14: fetch the HMAC waitpoint_token through the admin client.
-    // Only reached on the Suspended branch, so a missing token here is
-    // a legitimate error (race: peer reviewer consumed it between our
-    // state poll and this fetch — the state recheck paths below catch
-    // the concrete outcome).
+    // Only reached on the Suspended branch, so --waitpoint-id is
+    // actually required here. The arg is Option<String> at the CLI
+    // boundary so the AlreadyCompleted early-exit above doesn't
+    // demand a value the operator never uses; enforce presence here.
+    let waitpoint_id_str = args.waitpoint_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "execution {} suspended — --waitpoint-id is required on this path. \
+             Look for `REVIEW_NEEDED eid=... wp=...` in the summarize worker's log.",
+            args.execution_id,
+        )
+    })?;
+
+    // A missing token on the fetch is a legitimate error (race: peer
+    // reviewer consumed it between our state poll and this fetch —
+    // the state recheck paths below catch the concrete outcome).
     let admin = match args.api_token.as_deref() {
         Some(t) => FlowFabricAdminClient::with_token(&args.server, t)?,
         None => FlowFabricAdminClient::new(&args.server)?,
     };
     let execution_id_parsed = ExecutionId::parse(&args.execution_id)?;
-    let waitpoint_id_parsed = WaitpointId::parse(&args.waitpoint_id)?;
+    let waitpoint_id_parsed = WaitpointId::parse(waitpoint_id_str)?;
     let fetched_waitpoint_token = match admin
         .read_waitpoint_token(&execution_id_parsed, &waitpoint_id_parsed)
         .await?
@@ -202,7 +220,7 @@ async fn main() -> Result<()> {
                     "waitpoint token fetch returned None for execution_id={}, \
                      waitpoint_id={}; state recheck also failed, cannot \
                      distinguish peer-won from waitpoint drift",
-                    args.execution_id, args.waitpoint_id,
+                    args.execution_id, waitpoint_id_str,
                 )
             })?;
             if recheck == "completed" || recheck == "failed" || recheck == "cancelled" {
@@ -218,7 +236,7 @@ async fn main() -> Result<()> {
                  waitpoint id drift or an expired waitpoint — re-check \
                  the `REVIEW_NEEDED eid=... wp=...` line from the summarize worker",
                 args.execution_id,
-                args.waitpoint_id,
+                waitpoint_id_str,
             );
         }
     };
@@ -244,12 +262,12 @@ async fn main() -> Result<()> {
             // with other signal kinds we might add later.
             let idempotency_key = format!(
                 "review-approve/{}/{}",
-                args.execution_id, args.waitpoint_id
+                args.execution_id, waitpoint_id_str
             );
 
             let body = serde_json::json!({
                 "execution_id": args.execution_id,
-                "waitpoint_id": args.waitpoint_id,
+                "waitpoint_id": waitpoint_id_str,
                 "signal_id": uuid::Uuid::new_v4().to_string(),
                 "signal_name": SIGNAL_NAME_APPROVAL,
                 "signal_category": "human_review",
@@ -355,12 +373,12 @@ async fn main() -> Result<()> {
 
             let idempotency_key = format!(
                 "review-reject/{}/{}",
-                args.execution_id, args.waitpoint_id
+                args.execution_id, waitpoint_id_str
             );
 
             let body = serde_json::json!({
                 "execution_id": args.execution_id,
-                "waitpoint_id": args.waitpoint_id,
+                "waitpoint_id": waitpoint_id_str,
                 "signal_id": uuid::Uuid::new_v4().to_string(),
                 "signal_name": SIGNAL_NAME_APPROVAL,
                 "signal_category": "human_review",

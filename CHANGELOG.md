@@ -7,6 +7,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+### Changed
+
+- **`examples/media-pipeline/review`**: `--waitpoint-id` is now
+  `Option<String>`. Required only on the Suspended path (where it's
+  load-bearing); on the `AlreadyCompleted` early-exit (peer reviewer
+  beat us, or `FF_SKIP_APPROVAL=1` at the worker) the flag can be
+  omitted. Missing on the Suspended branch surfaces as a typed
+  `anyhow::bail!` that points operators at the summarize worker's
+  `REVIEW_NEEDED eid=... wp=...` log line. Deferred from the v0.13
+  release gate.
+
+### Added
+
 - **`scripts/lint-grafana-dashboard.sh`** (phase 3f) — jq-based
   validation of `examples/grafana/flowfabric-ops.json`. Checks valid
   JSON, required top-level keys (`title`, `panels`, `schemaVersion`,
