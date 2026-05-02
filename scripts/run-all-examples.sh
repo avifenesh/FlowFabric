@@ -262,8 +262,23 @@ start_ff_server() {
     # `default` (most), plus `build,test,deploy,verify` for
     # deploy-approval. Including unused lanes is harmless — the
     # scheduler just ranges zero-length ZSETs.
+    #
+    # FF_WAITPOINT_HMAC_SECRET — random 32-byte hex per run. Fresh
+    # material keeps generic entropy-based secret scanners quiet on
+    # the repo (GitGuardian flagged the previous all-zeros sentinel
+    # once the workflow landed) and costs nothing at run time. Caller
+    # can override with an explicit value via env.
+    local hmac_secret="${FF_WAITPOINT_HMAC_SECRET:-}"
+    if [ -z "$hmac_secret" ]; then
+        if command -v openssl >/dev/null 2>&1; then
+            hmac_secret="$(openssl rand -hex 32)"
+        else
+            # /dev/urandom fallback; 32 bytes → 64 hex chars via xxd.
+            hmac_secret="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        fi
+    fi
     FF_LISTEN_ADDR="127.0.0.1:$FF_SERVER_PORT" \
-    FF_WAITPOINT_HMAC_SECRET="0000000000000000000000000000000000000000000000000000000000000000" \
+    FF_WAITPOINT_HMAC_SECRET="$hmac_secret" \
     FF_LANES="default,build,test,deploy,verify" \
     FF_HOST="$VALKEY_HOST" \
     FF_PORT="$VALKEY_PORT" \
