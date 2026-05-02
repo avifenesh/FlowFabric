@@ -258,31 +258,37 @@ async fn drive_one_flow(
     // execution core via GET /v1/executions/<eid>. That's one round
     // trip per node; 10 nodes × 100 flows = 1000 calls, trivial
     // compared to the drain wall.
-    // Soft-skip stage_latency for any node whose timestamps aren't
-    // visible yet (#476). Collect Option<(s,e)>; if any are None
-    // we emit an empty stage_latencies_ms vector and let the outer
-    // percentile math treat the flow as a reporting miss rather
-    // than aborting the scenario.
-    let mut timestamps: Vec<Option<(i64, i64)>> = Vec::with_capacity(nodes);
-    let mut any_missing = false;
+    // Soft-skip stage_latency for any flow whose timestamps aren't
+    // visible yet (#476). If ANY node is missing a timestamp the
+    // whole flow's stage_latency samples are dropped — partial
+    // samples would under-report the tail. Short-circuit on first
+    // miss so we don't waste HTTP round trips for a flow we're
+    // already discarding.
+    let mut timestamps: Vec<(i64, i64)> = Vec::with_capacity(nodes);
+    let mut any_missing_eid: Option<&String> = None;
     for eid in &eids {
-        let ts = fetch_exec_timestamps(client, env, eid).await?;
-        if ts.is_none() {
-            any_missing = true;
-            tracing::warn!(
-                execution_id = %eid,
-                "started_at/completed_at not visible after retries — stage_latency skipped for this flow"
-            );
+        match fetch_exec_timestamps(client, env, eid).await? {
+            Some(pair) => timestamps.push(pair),
+            None => {
+                any_missing_eid = Some(eid);
+                break;
+            }
         }
-        timestamps.push(ts);
     }
 
     let mut stage_latencies_ms: Vec<f64> = Vec::with_capacity(nodes - 1);
-    if !any_missing {
-        // Safe to unwrap — all slots populated.
+    if let Some(eid) = any_missing_eid {
+        // debug-level: this is an expected race-window log, not an
+        // operator-actionable warning. The scenario-level percentile
+        // math treats the flow's stage_latency as a reporting miss.
+        tracing::debug!(
+            execution_id = %eid,
+            "started_at/completed_at not visible after retries — stage_latency skipped for this flow"
+        );
+    } else {
         for i in 0..nodes - 1 {
-            let (_, end_i) = timestamps[i].unwrap();
-            let (start_next, _) = timestamps[i + 1].unwrap();
+            let (_, end_i) = timestamps[i];
+            let (start_next, _) = timestamps[i + 1];
             // Negative values can happen if clocks skew or the
             // reconciler fired between HSETs; clamp to 0 rather than
             // emit nonsense.
@@ -290,8 +296,6 @@ async fn drive_one_flow(
             stage_latencies_ms.push(gap as f64);
         }
     }
-    // If any_missing, stage_latencies_ms stays empty and the scenario
-    // report's stage_latency percentiles ignore this flow.
 
     Ok(FlowSample {
         flow_setup_ms,
@@ -488,7 +492,9 @@ async fn fetch_exec_timestamps(
         let v: JsonValue = resp.json().await?;
 
         let parse_ts = |field: &str| -> Option<i64> {
-            v.pointer(&format!("/{field}"))
+            // `v.get(field)` keeps top-level lookups allocation-free
+            // vs the pointer + format! round trip.
+            v.get(field)
                 .and_then(|n| n.as_str())
                 .and_then(|s| s.parse::<i64>().ok())
         };
