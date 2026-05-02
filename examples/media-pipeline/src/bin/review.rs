@@ -189,7 +189,9 @@ async fn main() -> Result<()> {
     let waitpoint_id_str = args.waitpoint_id.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "execution {} suspended — --waitpoint-id is required on this path. \
-             Look for `REVIEW_NEEDED eid=... wp=...` in the summarize worker's log.",
+             Look for a line like `REVIEW_NEEDED eid={} wp=<uuid>` in the \
+             summarize worker's log and pass that uuid as --waitpoint-id.",
+            args.execution_id,
             args.execution_id,
         )
     })?;

@@ -14,9 +14,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   load-bearing); on the `AlreadyCompleted` early-exit (peer reviewer
   beat us, or `FF_SKIP_APPROVAL=1` at the worker) the flag can be
   omitted. Missing on the Suspended branch surfaces as a typed
-  `anyhow::bail!` that points operators at the summarize worker's
-  `REVIEW_NEEDED eid=... wp=...` log line. Deferred from the v0.13
-  release gate.
+  `anyhow::bail!` that cites a concrete log line the operator can
+  grep for (e.g. `REVIEW_NEEDED eid=<uuid> wp=<uuid>`). Deferred
+  from the v0.13 release gate.
 
 ### Added
 
