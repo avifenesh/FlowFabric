@@ -509,10 +509,15 @@ done
 # ── per-example metadata ───────────────────────────────────────────────
 #
 # `skip_reason` short-circuits the build+run pair with a stable
-# rationale (grafana has no Cargo workspace).
+# rationale. Empty string = proceed normally. Populated = skip both
+# build and run.
 skip_reason() {
     case "$1" in
-        grafana) echo "dashboard JSON only — no Cargo workspace" ;;
+        # grafana has no Cargo workspace but is NOT skipped anymore —
+        # its run_cmd invokes scripts/lint-grafana-dashboard.sh which
+        # validates JSON shape. Left here (empty) so the dispatcher
+        # doesn't try to `cargo build` it.
+        grafana) echo "" ;;
         *) echo "" ;;
     esac
 }
@@ -588,6 +593,10 @@ run_cmd() {
             # All three call the harness-spawned ff-server via HTTP
             # and talk to Valkey directly for worker-side ops.
             echo "${t}cargo run --locked --release" ;;
+        grafana)
+            # Dashboard JSON only — lints the shape with jq. Runs at
+            # repo root (the lint script resolves its own path).
+            echo "$ROOT/scripts/lint-grafana-dashboard.sh" ;;
         *)
             echo "" ;;
     esac
@@ -698,13 +707,26 @@ for dir in "$EXAMPLES_DIR"/*/; do
         continue
     fi
 
-    if [ ! -f "$dir/Cargo.toml" ]; then
+    # grafana has no Cargo workspace — its run_cmd invokes the
+    # dashboard lint directly. Other no-Cargo dirs still SKIP with a
+    # "no Cargo.toml" reason.
+    if [ "$name" != "grafana" ] && [ ! -f "$dir/Cargo.toml" ]; then
         record_skip "$name" "no Cargo.toml"
         continue
     fi
 
+    # Build-only mode: grafana has no cargo artifact to produce —
+    # the run phase is its only real work. Record PASS and continue.
+    if [ "$MODE" = "build" ] && [ "$name" = "grafana" ]; then
+        record_pass "$name"
+        echo
+        continue
+    fi
+
     # ── build (phase 3a) ──
-    if [ "$MODE" = "both" ] || [ "$MODE" = "build" ]; then
+    # grafana has no Cargo workspace, so the build phase is a no-op
+    # for it; drop straight into the run phase (which lints its JSON).
+    if { [ "$MODE" = "both" ] || [ "$MODE" = "build" ]; } && [ "$name" != "grafana" ]; then
         echo "[build] $name …"
         # --release matches what the phase-3b run commands use below, so
         # the default `both` mode compiles each example exactly once
