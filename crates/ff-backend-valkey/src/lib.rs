@@ -9352,9 +9352,10 @@ impl EngineBackend for ValkeyBackend {
         // Phase 2 scope: per-namespace listing only. Cross-namespace
         // enumeration (`args.namespace = None`) would need a
         // persistent namespace-registry on Valkey that doesn't exist
-        // today; the unblock scanner's `ff:idx:workers` global set
-        // predates RFC-025's namespace split and still mingles
-        // namespaces. Phase 3 (PG) lands the authoritative
+        // today; the unblock scanner's namespace-scoped
+        // `ff:idx:{ns}:workers` set (RFC-025 Phase 5 cutover) is the
+        // per-namespace enumerable, but there is no parent index of
+        // namespaces themselves. Phase 3 (PG) lands the authoritative
         // cross-namespace index via `ff_worker_registry` scan; until
         // then operators that need a cross-ns view iterate
         // namespaces out-of-band. Surfacing as `Unavailable` (not
