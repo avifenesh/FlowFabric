@@ -258,22 +258,43 @@ async fn drive_one_flow(
     // execution core via GET /v1/executions/<eid>. That's one round
     // trip per node; 10 nodes × 100 flows = 1000 calls, trivial
     // compared to the drain wall.
-    let mut started_at: Vec<i64> = Vec::with_capacity(nodes);
-    let mut ended_at: Vec<i64> = Vec::with_capacity(nodes);
+    // Soft-skip stage_latency for any flow whose timestamps aren't
+    // visible yet (#476). If ANY node is missing a timestamp the
+    // whole flow's stage_latency samples are dropped — partial
+    // samples would under-report the tail. Short-circuit on first
+    // miss so we don't waste HTTP round trips for a flow we're
+    // already discarding.
+    let mut timestamps: Vec<(i64, i64)> = Vec::with_capacity(nodes);
+    let mut any_missing_eid: Option<&String> = None;
     for eid in &eids {
-        let (s, e) = fetch_exec_timestamps(client, env, eid).await?;
-        started_at.push(s);
-        ended_at.push(e);
+        match fetch_exec_timestamps(client, env, eid).await? {
+            Some(pair) => timestamps.push(pair),
+            None => {
+                any_missing_eid = Some(eid);
+                break;
+            }
+        }
     }
 
     let mut stage_latencies_ms: Vec<f64> = Vec::with_capacity(nodes - 1);
-    for i in 0..nodes - 1 {
-        // node i+1's started_at minus node i's ended_at. Negative
-        // values can happen if clocks skew or the reconciler fired
-        // between the HSET calls; clamp to 0 rather than emit
-        // nonsense.
-        let gap = (started_at[i + 1] - ended_at[i]).max(0);
-        stage_latencies_ms.push(gap as f64);
+    if let Some(eid) = any_missing_eid {
+        // debug-level: this is an expected race-window log, not an
+        // operator-actionable warning. The scenario-level percentile
+        // math treats the flow's stage_latency as a reporting miss.
+        tracing::debug!(
+            execution_id = %eid,
+            "started_at/completed_at not visible after retries — stage_latency skipped for this flow"
+        );
+    } else {
+        for i in 0..nodes - 1 {
+            let (_, end_i) = timestamps[i];
+            let (start_next, _) = timestamps[i + 1];
+            // Negative values can happen if clocks skew or the
+            // reconciler fired between HSETs; clamp to 0 rather than
+            // emit nonsense.
+            let gap = (start_next - end_i).max(0);
+            stage_latencies_ms.push(gap as f64);
+        }
     }
 
     Ok(FlowSample {
@@ -437,41 +458,59 @@ async fn wait_state(
 }
 
 /// Fetch started_at + completed_at timestamps (ms since epoch) for an
-/// execution we've already observed in terminal state. Bails loudly on
-/// missing/unparseable fields: at call time the caller has confirmed
-/// `state == "completed"` via `wait_state`, so both timestamps must be
-/// populated. Silently returning 0 (the prior behavior) zeroed every
-/// stage_latency sample in the scenario 4 report — R1 HIGH finding F1.
+/// execution we've already observed in terminal state.
 ///
-/// ExecutionInfo now serialises these as `Option<String>` (matching
-/// the existing `created_at: String` pattern); both are elided when
+/// Returns `Ok(Some((started, completed)))` on the hot path. Returns
+/// `Ok(None)` when `started_at` or `completed_at` is absent even after
+/// a short retry window — issue #476. `state == "completed"` can land
+/// on the wire microseconds before `started_at` becomes visible on the
+/// `/executions/{id}` read path, so the prior hard-error was
+/// aggressive. Retry up to a few rounds with a small backoff before
+/// giving up; the caller then soft-skips stage_latency for that flow
+/// rather than aborting the whole scenario.
+///
+/// `ExecutionInfo` serialises both timestamps as `Option<String>`
+/// (matching the existing `created_at: String` pattern); elided when
 /// empty on the wire, populated once Lua's HSET writes them to
 /// exec_core.
 async fn fetch_exec_timestamps(
     client: &Client,
     env: &BenchEnv,
     eid: &str,
-) -> Result<(i64, i64)> {
+) -> Result<Option<(i64, i64)>> {
     let url = format!("{}/v1/executions/{eid}", env.server);
-    let resp = client.get(&url).send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("get_execution({eid}) failed ({status}): {text}");
-    }
-    let v: JsonValue = resp.json().await?;
+    // Retry budget — 5 rounds × 50ms = 250ms total. Enough to cover
+    // the observed race (sub-ms in the #476 re-measure) with a safety
+    // margin; short enough that a stuck execution surfaces quickly.
+    for attempt in 0..5 {
+        let resp = client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get_execution({eid}) failed ({status}): {text}");
+        }
+        let v: JsonValue = resp.json().await?;
 
-    let parse_ts = |field: &str| -> Result<i64> {
-        let raw = v
-            .pointer(&format!("/{field}"))
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| anyhow::anyhow!("exec {eid} missing field {field} post-completion"))?;
-        raw.parse::<i64>()
-            .map_err(|e| anyhow::anyhow!("exec {eid} field {field}={raw:?}: {e}"))
-    };
-    let started = parse_ts("started_at")?;
-    let completed = parse_ts("completed_at")?;
-    Ok((started, completed))
+        let parse_ts = |field: &str| -> Option<i64> {
+            // `v.get(field)` keeps top-level lookups allocation-free
+            // vs the pointer + format! round trip.
+            v.get(field)
+                .and_then(|n| n.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+        };
+        let started = parse_ts("started_at");
+        let completed = parse_ts("completed_at");
+        if let (Some(s), Some(c)) = (started, completed) {
+            return Ok(Some((s, c)));
+        }
+        // Short backoff. First attempt covers the common case where
+        // the read raced the Lua HSET by microseconds; subsequent
+        // attempts handle the tail.
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    Ok(None)
 }
 
 // ── Echo worker pool ────────────────────────────────────────────────
