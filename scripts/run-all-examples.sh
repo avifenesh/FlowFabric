@@ -429,9 +429,12 @@ run_deploy_approval() {
     pids+=($!)
 
     # Parse deploy_eid + flow_id + waitpoint_id from the logs as they
-    # become available.
+    # become available. 300s budget rather than 120: CI runners see
+    # slower scheduler reconciler ticks under cold caches + shared
+    # containers, and we'd rather wait than false-fail when the flow
+    # is healthy but the unblock scanner hasn't promoted yet.
     local deploy_eid="" flow_id="" wp_id=""
-    local t_end=$((started + 120))
+    local t_end=$((started + 300))
     while [ "$(date +%s)" -lt "$t_end" ]; do
         if [ -z "$flow_id" ]; then
             flow_id="$(grep -oE 'flow_created flow_id=[^ ]+' "$logdir/submit.log" 2>/dev/null | head -1 | sed 's/^.*=//')"

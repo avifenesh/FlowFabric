@@ -49,10 +49,13 @@ jobs:
   examples-harness:
     name: examples-harness (ubuntu-latest · valkey 8 · postgres 16)
     runs-on: ubuntu-latest
-    # 13 examples × ~1-2min each + ff-server boot + deploy-approval's
-    # 10min budget → ~30min upper bound. 45 keeps headroom for cache
-    # misses on cold runners.
-    timeout-minutes: 45
+    # First-run budget:
+    #   * 13 examples × cold-cache build (~3min each)  → ~35min
+    #   * + ff-server release build                    → ~5min
+    #   * + live-runs (SQLite ~30s, ff-server ~1-3min, HITL ~3-5min)
+    # Total upper bound observed on GH hosted runners: ~70min on the
+    # first run. Cached subsequent runs drop to ~15-25min.
+    timeout-minutes: 90
     services:
       # Valkey — reference deployment per matrix.yml's primary cell.
       valkey:
