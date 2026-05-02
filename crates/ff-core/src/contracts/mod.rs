@@ -3593,6 +3593,26 @@ pub struct ExpiredLeaseInfo {
     pub lane_id: LaneId,
 }
 
+impl ExpiredLeaseInfo {
+    pub fn new(
+        execution_id: ExecutionId,
+        worker_instance_id: WorkerInstanceId,
+        expires_at_ms: TimestampMs,
+        lease_epoch: LeaseEpoch,
+        namespace: Namespace,
+        lane_id: LaneId,
+    ) -> Self {
+        Self {
+            execution_id,
+            worker_instance_id,
+            expires_at_ms,
+            lease_epoch,
+            namespace,
+            lane_id,
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListExpiredLeasesResult {
@@ -3646,6 +3666,31 @@ pub struct WorkerInfo {
     pub last_heartbeat_ms: TimestampMs,
     pub liveness_ttl_ms: u64,
     pub registered_at_ms: TimestampMs,
+}
+
+impl WorkerInfo {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        worker_id: WorkerId,
+        worker_instance_id: WorkerInstanceId,
+        namespace: Namespace,
+        lanes: BTreeSet<LaneId>,
+        capabilities: BTreeSet<String>,
+        last_heartbeat_ms: TimestampMs,
+        liveness_ttl_ms: u64,
+        registered_at_ms: TimestampMs,
+    ) -> Self {
+        Self {
+            worker_id,
+            worker_instance_id,
+            namespace,
+            lanes,
+            capabilities,
+            last_heartbeat_ms,
+            liveness_ttl_ms,
+            registered_at_ms,
+        }
+    }
 }
 
 #[non_exhaustive]
