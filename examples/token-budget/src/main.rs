@@ -47,8 +47,8 @@ use flowfabric::sdk::{
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 const NAMESPACE: &str = "demo";
@@ -158,15 +158,19 @@ async fn main() -> Result<()> {
 
     // Worker loop drains claims in the background; submit polls the
     // budget and owns the cancel decision.
-    let done = Arc::new(Notify::new());
+    //
+    // Uses tokio-util CancellationToken (level-triggered) rather
+    // than tokio::sync::Notify (edge-triggered, loses cancels fired
+    // while the worker is between polls — #483).
+    let shutdown = CancellationToken::new();
     let worker_handle = {
-        let done = Arc::clone(&done);
+        let shutdown = shutdown.clone();
         let admin = Arc::clone(&admin);
         let budget_id = budget_id.clone();
         let worker = Arc::new(worker);
         let worker_for_task = Arc::clone(&worker);
         tokio::spawn(async move {
-            if let Err(e) = run_worker_loop(worker_for_task, admin, budget_id, done).await {
+            if let Err(e) = run_worker_loop(worker_for_task, admin, budget_id, shutdown).await {
                 tracing::error!(error = %e, "worker loop failed");
             }
         })
@@ -180,13 +184,13 @@ async fn main() -> Result<()> {
 
     // Give in-flight reports time to drain, then stop the worker.
     sleep(Duration::from_millis(500)).await;
-    done.notify_waiters();
+    shutdown.cancel();
     // Bound the worker-shutdown wait so the example can't hang past
-    // the demo budget. `claim_via_server` blocks up to its block_ms,
-    // and `notify_waiters` only wakes current waiters, so a freshly-
-    // spawned claim round has to return naturally before select! can
-    // re-poll `done`. 5s covers that worst case comfortably.
-    let _ = timeout(Duration::from_secs(5), worker_handle).await;
+    // the demo budget. `claim_via_server` blocks up to its block_ms;
+    // since CancellationToken is level-triggered the in-flight claim
+    // will exit promptly once its block finishes, but we still cap
+    // the join at a generous ceiling to guard against a wedged call.
+    let _ = timeout(Duration::from_secs(15), worker_handle).await;
 
     // ── Post-mortem: per-child LeaseSummary (v0.9 #278). Even a
     // terminal exec carries its last-seen lease fields in the snapshot,
@@ -420,13 +424,19 @@ async fn run_worker_loop(
     worker: Arc<FlowFabricWorker>,
     admin: Arc<FlowFabricAdminClient>,
     budget_id: BudgetId,
-    done: Arc<Notify>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let lane = LaneId::new(LANE);
     info!("worker loop started");
     loop {
+        // Level-triggered short-circuit — catches cancels fired
+        // between iterations when no `.cancelled()` waiter was armed.
+        if shutdown.is_cancelled() {
+            info!("worker shutdown requested");
+            return Ok(());
+        }
         tokio::select! {
-            _ = done.notified() => {
+            _ = shutdown.cancelled() => {
                 info!("worker shutdown requested");
                 return Ok(());
             }

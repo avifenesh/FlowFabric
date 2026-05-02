@@ -543,20 +543,16 @@ requires() {
 # logic itself completed and the marker proves it.
 success_marker() {
     # Marker substrings emitted AFTER the scenario body completes but
-    # BEFORE the example's shutdown path (which can hang on a
-    # notify_waiters race between `main` and a background worker —
-    # filed as a follow-up example bug). Matching the body-complete
-    # marker lets the harness record PASS even if the process then
-    # needs a SIGTERM to actually exit.
+    # BEFORE the example's shutdown path. Kept as defensive
+    # infrastructure — retry-and-cancel + token-budget used to rely
+    # on this because of a `Notify::notify_waiters` race on shutdown
+    # (#483, fixed via CancellationToken) — so both exit cleanly now.
+    # Left empty by default; any future example that hits a similar
+    # cleanup-path quirk can opt in via a new case arm without
+    # having to rebuild the mechanism.
     case "$1" in
-        # Last log line scene 2 emits before returning Ok(()). Scenes
-        # are sequential so reaching this proves scene 1 also
-        # completed.
-        retry-and-cancel) echo "member cancelled" ;;
         # Emitted just before main's scene_result match arm runs.
         v010-read-side-ergonomics) echo "demo complete — capabilities() read" ;;
-        # Emitted at the last info! in main's happy path.
-        token-budget) echo "demo complete" ;;
         *) echo "" ;;
     esac
 }
