@@ -1883,7 +1883,11 @@ impl EngineBackend for PostgresBackend {
         worker_registry::mark_worker_dead(&self.pool, args).await
     }
 
-    #[cfg(feature = "suspension")]
+    // List-expired-leases joins ff_attempt+ff_exec_core, which live in
+    // the `worker_registry` module (gated on `core`). Require both
+    // features to keep the body's dep chain intact; a standalone
+    // suspension-only build has no lease-bearing tables to scan.
+    #[cfg(all(feature = "core", feature = "suspension"))]
     #[tracing::instrument(name = "pg.list_expired_leases", skip_all)]
     async fn list_expired_leases(
         &self,
