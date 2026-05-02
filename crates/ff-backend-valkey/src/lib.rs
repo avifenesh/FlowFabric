@@ -9433,7 +9433,7 @@ impl EngineBackend for ValkeyBackend {
                 lanes_csv
                     .split(',')
                     .filter(|s| !s.is_empty())
-                    .map(|s| LaneId::new(s))
+                    .map(LaneId::new)
                     .collect()
             };
             let capabilities: std::collections::BTreeSet<String> = if caps_csv.is_empty() {
