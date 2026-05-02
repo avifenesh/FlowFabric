@@ -204,8 +204,24 @@ _free_port() {
 # same sweep are no-ops. Requires the release binary at
 # target/release/ff-server (cargo-built in phase 3a for the ff-server
 # crate, or pre-built by the operator).
+#
+# Preflight dependencies (python3 for the free-port pick, curl for
+# the /healthz readiness probe) are checked up front so a missing
+# tool emits a clean SKIP/warning rather than a cryptic boot failure.
 start_ff_server() {
     [ -n "$FF_SERVER_READY" ] && return 0
+
+    # Tool preflights first.
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "[ff-server] FATAL: python3 not found — required for free-port selection" >&2
+        FF_SERVER_READY=0
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "[ff-server] FATAL: curl not found — required for /healthz readiness probe" >&2
+        FF_SERVER_READY=0
+        return 0
+    fi
 
     # Valkey is a hard pre-req; ff-server dials it at boot.
     check_valkey
@@ -216,17 +232,27 @@ start_ff_server() {
 
     local bin="$ROOT/target/release/ff-server"
     if [ ! -x "$bin" ]; then
-        echo "[ff-server] building release binary (one-time) …"
-        if ! (cd "$ROOT" && cargo build --locked --release -p ff-server) >>"$LOG_TMP" 2>&1; then
-            echo "[ff-server] FATAL: cargo build -p ff-server failed — see $LOG_TMP" >&2
+        # Dedicated build-log tempfile so the per-example LOG_TMP
+        # isn't appended-to (ambiguous pointer when a run FAILs
+        # right after a build event).
+        local build_log
+        build_log="$(mktemp "${TMPDIR:-/tmp}/ff-server-build.XXXXXX.log")"
+        echo "[ff-server] building release binary (one-time) — log: $build_log"
+        if ! (cd "$ROOT" && cargo build --locked --release -p ff-server) >"$build_log" 2>&1; then
+            echo "[ff-server] FATAL: cargo build -p ff-server failed — see $build_log" >&2
             FF_SERVER_READY=0
             return 0
         fi
+        # Build succeeded — clean up the log immediately; the binary
+        # is the durable artifact.
+        rm -f "$build_log"
     fi
 
     FF_SERVER_PORT="$(_free_port)"
     FF_SERVER_URL="http://127.0.0.1:$FF_SERVER_PORT"
     FF_SERVER_LOG="$(mktemp "${TMPDIR:-/tmp}/ff-server-harness.XXXXXX.log")"
+    # EXIT trap below cleans this up along with stop_ff_server; no
+    # per-function trap here because bash doesn't stack traps.
 
     echo "[ff-server] starting on $FF_SERVER_URL (log: $FF_SERVER_LOG)"
     # Foreground env so the child inherits only what we intend. Minimum
@@ -254,8 +280,8 @@ start_ff_server() {
         if ! kill -0 "$FF_SERVER_PID" 2>/dev/null; then
             echo "[ff-server] FATAL: child exited before ready — last log lines:" >&2
             tail -n 20 "$FF_SERVER_LOG" >&2
+            stop_ff_server
             FF_SERVER_READY=0
-            FF_SERVER_PID=""
             return 0
         fi
         sleep 0.5
@@ -267,20 +293,27 @@ start_ff_server() {
     FF_SERVER_READY=0
 }
 
-# Stop the harness-spawned ff-server. Safe to call if nothing was
-# started (idempotent via PID check). Registered on EXIT below so
-# operators ^C'ing mid-sweep still leave no orphan servers.
+# Stop the harness-spawned ff-server and remove its log file. Safe to
+# call when nothing was started (idempotent). Registered on EXIT below
+# so ctrl-C mid-sweep still leaves no orphan servers or tempfiles.
 stop_ff_server() {
-    [ -z "$FF_SERVER_PID" ] && return 0
-    if kill -0 "$FF_SERVER_PID" 2>/dev/null; then
+    if [ -n "$FF_SERVER_PID" ] && kill -0 "$FF_SERVER_PID" 2>/dev/null; then
         kill "$FF_SERVER_PID" 2>/dev/null
-        # Wait up to 5s for clean shutdown; SIGKILL as a fallback.
+        # Wait up to 5s for clean shutdown; SIGKILL only if still
+        # alive — avoid signalling an unrelated process after fast
+        # PID reuse.
         local tries=0
         while [ $tries -lt 10 ] && kill -0 "$FF_SERVER_PID" 2>/dev/null; do
             sleep 0.5
             tries=$((tries + 1))
         done
-        kill -9 "$FF_SERVER_PID" 2>/dev/null
+        if kill -0 "$FF_SERVER_PID" 2>/dev/null; then
+            kill -9 "$FF_SERVER_PID" 2>/dev/null
+        fi
+    fi
+    if [ -n "$FF_SERVER_LOG" ]; then
+        rm -f "$FF_SERVER_LOG"
+        FF_SERVER_LOG=""
     fi
     FF_SERVER_PID=""
     FF_SERVER_READY=""
@@ -576,15 +609,17 @@ for dir in "$EXAMPLES_DIR"/*/; do
     fi
     # Export env in a subshell (never interpolated into the cargo
     # command string, so URLs with spaces/`$`/quotes are safe) and
-    # run inside the example's Cargo workspace.
-    set +e
+    # run inside the example's Cargo workspace. `|| rc=$?` captures
+    # a non-zero exit without globally changing shell errexit mode —
+    # `set -e` is never enabled in this script, but `|| rc=$?` keeps
+    # the exit-code path consistent for operators who `source` parts
+    # of this harness under their own -e shells.
+    rc=0
     (
         cd "$dir"
         apply_env "$name"
         eval "$cmd"
-    ) >"$LOG_TMP" 2>&1
-    rc=$?
-    set -e 2>/dev/null || true
+    ) >"$LOG_TMP" 2>&1 || rc=$?
 
     marker="$(success_marker "$name")"
     if [ "$rc" = "0" ]; then
