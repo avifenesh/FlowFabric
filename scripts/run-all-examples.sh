@@ -97,9 +97,10 @@ check_valkey() {
     fi
 }
 
-# Parse host + port out of `postgres://user:pass@host:port/db` — enough
-# for the /dev/tcp fallback; sqlx itself handles the full parse when
-# the example runs.
+# Parse host + port out of a Postgres URL. Handles bracketed IPv6
+# literals (`[::1]:5432`) in addition to plain host:port — plain
+# ${host##:*} splits break on raw IPv6 because every hextet is `:`-
+# delimited. Output on stdout as `<host> <port>`.
 _pg_url_host_port() {
     local url="$1" rest host port
     rest="${url#postgres://}"   # strip scheme
@@ -108,24 +109,45 @@ _pg_url_host_port() {
     host="${rest%%/*}"          # up to first /
     host="${host%%\?*}"         # strip query string
     case "$host" in
-        *:*) port="${host##*:}"; host="${host%%:*}" ;;
-        *)   port="5432" ;;
+        \[*\]:*)   # [::1]:5432 — IPv6 literal with explicit port
+            port="${host##*:}"
+            host="${host%%\]:*}"
+            host="${host#\[}"
+            ;;
+        \[*\])      # [::1] — IPv6 literal, default port
+            port="5432"
+            host="${host#\[}"
+            host="${host%\]}"
+            ;;
+        *:*)        # v4/hostname with explicit port
+            port="${host##*:}"
+            host="${host%%:*}"
+            ;;
+        *)          # v4/hostname, default port
+            port="5432"
+            ;;
     esac
     echo "$host $port"
 }
 
+# Redact user:pass@ from a Postgres URL for log surfaces. Leaves host +
+# db intact so the operator can still see WHERE it tried to connect.
+_pg_url_redact() {
+    local url="$1"
+    case "$url" in
+        postgres://*@*)  echo "postgres://****@${url#*@}" ;;
+        postgresql://*@*) echo "postgresql://****@${url#*@}" ;;
+        *) echo "$url" ;;
+    esac
+}
+
 check_postgres() {
     [ -n "$POSTGRES_READY" ] && return 0
-    # Prefer pg_isready (libpq-based, full connection verification).
-    if command -v pg_isready >/dev/null 2>&1; then
-        if pg_isready -d "$POSTGRES_URL" -q >/dev/null 2>&1; then
-            POSTGRES_READY=1
-        else
-            POSTGRES_READY=0
-        fi
-        return 0
-    fi
-    # Fall back to psql -c "SELECT 1" if present.
+    # Prefer a real round-trip (`psql SELECT 1`) over `pg_isready` —
+    # pg_isready only tells you the server is accepting connections; a
+    # wrong db name or bad creds still pass. The round-trip catches
+    # those, so the harness SKIPs instead of letting sqlx fail cryptically
+    # inside the example.
     if command -v psql >/dev/null 2>&1; then
         if psql "$POSTGRES_URL" -tAc "SELECT 1" >/dev/null 2>&1; then
             POSTGRES_READY=1
@@ -134,9 +156,22 @@ check_postgres() {
         fi
         return 0
     fi
-    # Neither available — fall back to a raw TCP probe. Imperfect
-    # (can't distinguish pg from any tcp listener) but better than
-    # nothing for a skip-vs-run decision.
+    # pg_isready as the next-best: verifies the server responds but
+    # nothing about db/creds. Rarely the only option — most systems
+    # with libpq ship psql too — but keep the fallback for bare
+    # pg-client installs.
+    if command -v pg_isready >/dev/null 2>&1; then
+        if pg_isready -d "$POSTGRES_URL" -q >/dev/null 2>&1; then
+            POSTGRES_READY=1
+        else
+            POSTGRES_READY=0
+        fi
+        return 0
+    fi
+    # Last resort — a raw TCP probe. Can't distinguish pg from any tcp
+    # listener or validate the specific db/creds. SKIP decisions built
+    # on this will be noisier than psql/pg_isready, but at least
+    # actionable.
     local hp host port
     hp="$(_pg_url_host_port "$POSTGRES_URL")"
     host="${hp% *}"; port="${hp#* }"
@@ -181,34 +216,62 @@ requires() {
     esac
 }
 
-# `run_cmd` emits the command-line for the example's live-run, or an
-# empty string for examples not yet covered.
+# `run_cmd` emits the cargo invocation for the example's live-run.
+# Env vars live in `run_env` so caller-supplied values (e.g. Postgres
+# URLs with embedded creds) never get interpolated into a shell string
+# — we export them into the subshell the run is dispatched through.
 run_cmd() {
     local t="${TIMEOUT:+$TIMEOUT 60 }"
     case "$1" in
         ff-dev)
-            echo "FF_DEV_MODE=1 ${t}cargo run --locked --release --bin ff-dev" ;;
+            echo "${t}cargo run --locked --release --bin ff-dev" ;;
         external-callback)
-            echo "FF_DEV_MODE=1 ${t}cargo run --locked --release -- --backend sqlite" ;;
+            echo "${t}cargo run --locked --release -- --backend sqlite" ;;
         incident-remediation)
             # Runs against the SQLite embedded path — Valkey path
             # requires a full scheduler+scanner deployment and bails
             # out with a loud error referring the operator to the
             # sqlite flag. Stay on the sqlite path for CI.
-            echo "FF_DEV_MODE=1 ${t}cargo run --locked --release -- --backend sqlite" ;;
+            echo "${t}cargo run --locked --release -- --backend sqlite" ;;
+        v013-cairn-454-budget-ledger)
+            echo "${t}cargo run --locked --release --bin budget-ledger" ;;
+        v011-wave9-postgres)
+            echo "${t}cargo run --locked --release" ;;
+        *)
+            echo "" ;;
+    esac
+}
+
+# `apply_env` exports the example's env pairs into the *current*
+# (sub)shell. Name/value pairs aren't echoed or interpolated into any
+# command string, so Postgres URLs with quotes/`$`/spaces/etc. stay
+# intact end-to-end.
+apply_env() {
+    case "$1" in
+        ff-dev|external-callback|incident-remediation)
+            export FF_DEV_MODE=1 ;;
         v013-cairn-454-budget-ledger)
             # Pipe VALKEY_HOST/PORT through the example's own
-            # `FF_DEMO_VALKEY_HOST/PORT` knobs so a caller overriding
-            # FF_HOST/FF_PORT sees preflight and run hit the *same*
-            # socket. Without this, `FF_HOST=remote` would preflight
-            # against remote but run against localhost.
-            echo "FF_DEMO_VALKEY_HOST='$VALKEY_HOST' FF_DEMO_VALKEY_PORT='$VALKEY_PORT' ${t}cargo run --locked --release --bin budget-ledger" ;;
+            # FF_DEMO_VALKEY_HOST/PORT knobs so a caller overriding
+            # FF_HOST/FF_PORT sees preflight + run hit the same socket.
+            export FF_DEMO_VALKEY_HOST="$VALKEY_HOST"
+            export FF_DEMO_VALKEY_PORT="$VALKEY_PORT" ;;
         v011-wave9-postgres)
-            # Same preflight/run URL so a caller-overridden
-            # FF_PG_TEST_URL targets the same endpoint the preflight
-            # checked. The example runs `apply_migrations` at boot so
-            # any Postgres 16+ db works out of the box.
-            echo "FF_PG_TEST_URL='$POSTGRES_URL' ${t}cargo run --locked --release" ;;
+            # Route the URL the preflight verified to the example.
+            export FF_PG_TEST_URL="$POSTGRES_URL" ;;
+    esac
+}
+
+# Public-facing preview of the env the run uses, for the [run] log.
+# Credentials in Postgres URLs are replaced with `****`.
+run_env_preview() {
+    case "$1" in
+        ff-dev|external-callback|incident-remediation)
+            echo "FF_DEV_MODE=1" ;;
+        v013-cairn-454-budget-ledger)
+            echo "FF_DEMO_VALKEY_HOST=$VALKEY_HOST FF_DEMO_VALKEY_PORT=$VALKEY_PORT" ;;
+        v011-wave9-postgres)
+            echo "FF_PG_TEST_URL=$(_pg_url_redact "$POSTGRES_URL")" ;;
         *)
             echo "" ;;
     esac
@@ -331,7 +394,9 @@ for dir in "$EXAMPLES_DIR"/*/; do
             postgres)
                 check_postgres
                 if [ "$POSTGRES_READY" != "1" ]; then
-                    record_skip "$name" "postgres unreachable at $POSTGRES_URL — start postgres + create db (or set FF_PG_TEST_URL)"
+                    # Redact creds before logging — FF_PG_TEST_URL may
+                    # carry user:pass@host from the caller's env.
+                    record_skip "$name" "postgres unreachable at $(_pg_url_redact "$POSTGRES_URL") — start postgres + create db (or set FF_PG_TEST_URL)"
                     echo
                     continue 2
                 fi
@@ -345,9 +410,20 @@ for dir in "$EXAMPLES_DIR"/*/; do
     done
 
     echo "[run] $name …"
-    echo "      $cmd"
-    # Run inside the example's Cargo workspace.
-    if (cd "$dir" && bash -c "$cmd") >"$LOG_TMP" 2>&1; then
+    env_preview="$(run_env_preview "$name")"
+    if [ -n "$env_preview" ]; then
+        echo "      $env_preview $cmd"
+    else
+        echo "      $cmd"
+    fi
+    # Export env in a subshell (never interpolated into the cargo
+    # command string, so URLs with spaces/`$`/quotes are safe) and
+    # run inside the example's Cargo workspace.
+    if (
+        cd "$dir"
+        apply_env "$name"
+        eval "$cmd"
+    ) >"$LOG_TMP" 2>&1; then
         record_pass "$name"
     else
         rc=$?
