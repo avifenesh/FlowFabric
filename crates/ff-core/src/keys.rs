@@ -651,43 +651,12 @@ pub fn lane_counts_key(lane_id: &LaneId) -> String {
     format!("ff:lane:{}:counts", lane_id)
 }
 
-/// Worker registration key.
-pub fn worker_key(wid: &WorkerInstanceId) -> String {
-    format!("ff:worker:{}", wid)
-}
-
-/// Non-authoritative capability advertisement STRING for a worker
-/// (sorted CSV). Written by `ff-sdk::FlowFabricWorker::connect`, read by
-/// the engine's unblock scanner to decide whether a `blocked_by_route`
-/// execution has a matching worker. Cluster mode: the key lands on
-/// whatever slot CRC16 hashes to — enumeration goes through
-/// `workers_index_key()` rather than a keyspace SCAN, which would only
-/// hit one shard in cluster mode.
-///
-/// **Deprecation note (RFC-025 Phase 2):** this global helper builds a
-/// pre-namespace key shape. New worker-registry code paths use
-/// [`worker_caps_key_ns`] which includes the tenant namespace. The
-/// legacy helper stays for the SDK preamble and cairn's Valkey
-/// fast-path during the Phase 2→5 rollout; remove once cairn migrates
-/// in Phase 5.
-pub fn worker_caps_key(wid: &WorkerInstanceId) -> String {
-    format!("ff:worker:{}:caps", wid)
-}
-
-/// Global worker index — SET of connected worker_instance_ids. Single
-/// slot in cluster mode (no hash tag; CRC16 of the literal key). SADD on
-/// connect, SREM on empty-caps restart; SMEMBERS gives the enumerable
-/// universe the unblock scanner walks. Separate from `ff:worker:{id}`
-/// registration keys to keep the index membership cheap to read and
-/// independent of per-worker hash details.
-///
-/// **Deprecation note (RFC-025 Phase 2):** see [`worker_caps_key`].
-/// New code uses [`workers_index_key_ns`].
-pub fn workers_index_key() -> String {
-    "ff:idx:workers".to_owned()
-}
-
 // ─── RFC-025 namespace-scoped worker registry keys ───
+//
+// The pre-Phase-5 global helpers (`worker_key`, `worker_caps_key`,
+// `workers_index_key`) were removed with the SDK preamble + unblock
+// scanner cutover — every caller now threads a `Namespace` and uses
+// the `_ns`-suffixed helpers below.
 //
 // Locked in §9.1: all worker-registry writes live under a namespace
 // prefix so multi-tenant deployments can reuse the same
