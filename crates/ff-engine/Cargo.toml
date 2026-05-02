@@ -25,7 +25,7 @@ observability = ["ff-observability/enabled"]
 postgres = ["dep:ff-backend-postgres", "dep:sqlx"]
 
 [dependencies]
-ff-core = { version = "0.13.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.14.0", path = "../ff-core", default-features = false, features = ["core"] }
 ff-observability = { workspace = true }
 # v0.12 PR-7a transitional: `Engine::start_*` accepts
 # `Arc<dyn EngineBackend>` on the boundary but scanners still speak
@@ -38,7 +38,7 @@ ff-observability = { workspace = true }
 # silently defeat the explicit `ff-core` anchor on line 26
 # (`default-features = false, features = ["core"]`) and re-expose
 # streaming-gated trait methods on `ff-engine`.
-ff-backend-valkey = { version = "0.13.0", path = "../ff-backend-valkey", default-features = false }
+ff-backend-valkey = { version = "0.14.0", path = "../ff-backend-valkey", default-features = false }
 ferriskey = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
