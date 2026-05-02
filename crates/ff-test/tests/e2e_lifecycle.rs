@@ -8632,27 +8632,31 @@ async fn test_capable_worker_unblocks_route_blocked() {
         .await
         .expect("scheduler claim should not error");
 
-    // 2. Simulate a capable worker registering by writing the SAME two
-    //    cluster-safe entries the SDK writes on connect: the per-worker
-    //    caps STRING at ff:worker:<id>:caps, AND a SADD into the global
-    //    workers-index SET `ff:idx:workers`. The scanner enumerates
-    //    through the index in cluster mode (a keyspace SCAN would miss
-    //    workers whose caps key hashes to other shards).
-    let instance_id = "capable-gpu-worker";
-    let caps_key = format!("ff:worker:{instance_id}:caps");
-    let _: Option<String> = tc
+    // 2. Simulate a capable worker registering with the same HASH +
+    //    index shape the SDK preamble + `ff_register_worker` FCALL
+    //    write post-RFC-025 cutover: namespace-prefixed caps HASH at
+    //    `ff:worker:{ns}:{inst}:caps` (with `caps_csv` field) + SADD
+    //    into `ff:idx:{ns}:workers`. The scanner HMGETs
+    //    `[blocking_reason, namespace]` off the execution's core hash
+    //    and looks up the per-namespace index.
+    let instance_id = ff_core::types::WorkerInstanceId::new("capable-gpu-worker");
+    let ns = ff_core::types::Namespace::new(NS);
+    let caps_key = ff_core::keys::worker_caps_key_ns(&ns, &instance_id);
+    let index_key = ff_core::keys::workers_index_key_ns(&ns);
+    let _: Option<i64> = tc
         .client()
-        .cmd("SET")
+        .cmd("HSET")
         .arg(caps_key.as_str())
+        .arg("caps_csv")
         .arg("cuda,gpu")
         .execute()
         .await
-        .expect("SET worker caps");
+        .expect("HSET worker caps_csv");
     let _: Option<i64> = tc
         .client()
         .cmd("SADD")
-        .arg("ff:idx:workers")
-        .arg(instance_id)
+        .arg(index_key.as_str())
+        .arg(instance_id.as_str())
         .execute()
         .await
         .expect("SADD workers-index");
@@ -8776,26 +8780,28 @@ async fn test_capable_worker_unblocks_on_get_error_failopen() {
         .await
         .expect("scheduler claim should not error");
 
-    // 2. Register a worker in the index but corrupt its caps key with a
-    //    HSET instead of SET. A subsequent GET on that key returns
-    //    WRONGTYPE — the concrete shape of "per-worker GET error" this
-    //    test is guarding against.
-    let instance_id = "wrongtype-gpu-worker";
-    let caps_key = format!("ff:worker:{instance_id}:caps");
-    let _: i64 = tc
+    // 2. Register a worker in the index but corrupt its caps key with
+    //    a STRING instead of a HASH. Post-RFC-025 the scanner's
+    //    per-worker read is `HGET caps_key caps_csv`; against a STRING
+    //    key that returns WRONGTYPE — the concrete shape of
+    //    "per-worker read error" this test is guarding against.
+    let instance_id = ff_core::types::WorkerInstanceId::new("wrongtype-gpu-worker");
+    let ns = ff_core::types::Namespace::new(NS);
+    let caps_key = ff_core::keys::worker_caps_key_ns(&ns, &instance_id);
+    let index_key = ff_core::keys::workers_index_key_ns(&ns);
+    let _: Option<String> = tc
         .client()
-        .cmd("HSET")
+        .cmd("SET")
         .arg(caps_key.as_str())
-        .arg("corrupted")
-        .arg("by-test")
+        .arg("not-a-hash")
         .execute()
         .await
-        .expect("HSET plant WRONGTYPE");
+        .expect("SET plant WRONGTYPE");
     let _: Option<i64> = tc
         .client()
         .cmd("SADD")
-        .arg("ff:idx:workers")
-        .arg(instance_id)
+        .arg(index_key.as_str())
+        .arg(instance_id.as_str())
         .execute()
         .await
         .expect("SADD workers-index");
