@@ -8,18 +8,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **`scripts/run-all-examples.sh` phase 3b** — live-run coverage for
-  SQLite-only / `FF_DEV_MODE=1` examples that have no external
-  dependencies: `ff-dev`, `v013-cairn-454-budget-ledger`, and
-  `external-callback --backend sqlite`. Runs after the 3a build pass;
-  each run is wrapped in `timeout 60` so a hung example can't hang
-  the gate. New `--build-only` / `--run-only` flags for iteration.
-  Examples needing `ff-server` choreography (retry-and-cancel,
-  token-budget, v010-read-side, v011-wave9-pg, incident-remediation)
-  and HITL flows (deploy-approval, media-pipeline) SKIP with a
-  stable rationale pointing at phase 3c; LLM-dependent examples
-  (coding-agent, llm-race) SKIP pointing at phase 3d (pre-release-
-  local only, out of CI scope). Sweep today: 3 PASS / 10 SKIP / 0
-  FAIL.
+  the two examples that have no external dependency beyond the
+  bundled SQLite: `ff-dev` (`FF_DEV_MODE=1`) and `external-callback
+  --backend sqlite`. Runs after the 3a build pass; each run is
+  wrapped in `timeout 60` (or `gtimeout` on macOS) so a hung example
+  can't hang the gate. New `--build-only` / `--run-only` flags for
+  iteration. Examples needing Valkey (`v013-cairn-454-budget-ledger`)
+  or `ff-server` choreography (retry-and-cancel, token-budget,
+  v010-read-side, v011-wave9-pg, incident-remediation) and HITL
+  flows (deploy-approval, media-pipeline) SKIP with stable rationale
+  pointing at phase 3c; LLM-dependent examples (coding-agent,
+  llm-race) SKIP pointing at phase 3d (pre-release-local only, out
+  of CI scope). Sweep today: 2 PASS / 11 SKIP / 0 FAIL.
 - **`scripts/run-all-examples.sh`** (phase 3a) — build-clean gate
   that runs `cargo build --bins` across every `examples/*` Cargo
   workspace and reports PASS/FAIL/SKIP per example. Exits non-zero

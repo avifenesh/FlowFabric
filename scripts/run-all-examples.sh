@@ -34,6 +34,17 @@ if [ ! -d "$EXAMPLES_DIR" ]; then
     exit 2
 fi
 
+# Resolve `timeout` portably — macOS/BSD ships `gtimeout` from
+# coreutils. If neither is available, emit FATAL rather than letting
+# the run phase fail cryptically with exit 127.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT=gtimeout
+else
+    TIMEOUT=""
+fi
+
 # Per-session opt-in filter. Empty = run everything.
 ONLY="${FF_EXAMPLES_ONLY:-}"
 MODE="both"   # both | build | run
@@ -61,13 +72,12 @@ skip_reason() {
 # empty string for examples not yet covered in phase 3b (3c+ lands the
 # HITL orchestration + ff-server-dependent ones).
 run_cmd() {
+    local t="${TIMEOUT:+$TIMEOUT 60 }"
     case "$1" in
         ff-dev)
-            echo "FF_DEV_MODE=1 timeout 60 cargo run --locked --release --bin ff-dev" ;;
-        v013-cairn-454-budget-ledger)
-            echo "timeout 60 cargo run --locked --release --bin budget-ledger" ;;
+            echo "FF_DEV_MODE=1 ${t}cargo run --locked --release --bin ff-dev" ;;
         external-callback)
-            echo "FF_DEV_MODE=1 timeout 60 cargo run --locked --release -- --backend sqlite" ;;
+            echo "FF_DEV_MODE=1 ${t}cargo run --locked --release -- --backend sqlite" ;;
         *)
             echo "" ;;
     esac
@@ -86,6 +96,7 @@ run_reason() {
         token-budget) echo "phase 3c — requires ff-server" ;;
         v010-read-side-ergonomics) echo "phase 3c — requires ff-server" ;;
         v011-wave9-postgres) echo "phase 3c — requires ff-server + Postgres choreography" ;;
+        v013-cairn-454-budget-ledger) echo "phase 3c — requires Valkey (trait-direct, no ff-server)" ;;
         *) echo "phase 3b does not cover this example yet" ;;
     esac
 }
@@ -107,6 +118,11 @@ in_only() {
 echo "[run-all-examples] mode=$MODE"
 echo "[run-all-examples] root=$ROOT"
 [ -n "$ONLY" ] && echo "[run-all-examples] FF_EXAMPLES_ONLY=$ONLY"
+if [ -z "$TIMEOUT" ] && { [ "$MODE" = "both" ] || [ "$MODE" = "run" ]; }; then
+    echo "[run-all-examples] WARN: neither 'timeout' nor 'gtimeout' found; \
+live-runs will not be time-bounded. On macOS install coreutils \
+(brew install coreutils) to get gtimeout." >&2
+fi
 echo
 
 # Single tempfile reused per iteration. `trap` ensures cleanup even on
