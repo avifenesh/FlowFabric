@@ -7,27 +7,6 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-### Changed
-
-- **`examples/{retry-and-cancel,token-budget}`**: swap the
-  `tokio::sync::Notify`-based worker-shutdown path for
-  `tokio_util::sync::CancellationToken` (level-triggered). Fixes
-  #483 — the notify-waiters shape was edge-triggered and dropped a
-  cancel fired while the worker was `tokio::time::sleep`-ing between
-  polls, leaving `worker_handle.await` hung after the scenes
-  completed. Both examples now exit cleanly (rc=0) instead of
-  needing the harness's success-marker escape hatch.
-- **`examples/media-pipeline/review`**: `--waitpoint-id` is now
-  `Option<String>`. Required only on the Suspended path (where it's
-  load-bearing); on the `AlreadyCompleted` early-exit (peer reviewer
-  beat us, or `FF_SKIP_APPROVAL=1` at the worker) the flag can be
-  omitted. Missing on the Suspended branch surfaces as a typed
-  `anyhow::bail!` that cites a concrete log line the operator can
-  grep for (e.g. `REVIEW_NEEDED eid=<uuid> wp=<uuid>`). Deferred
-  from the v0.13 release gate.
-
-### Added
-
 - **`scripts/lint-grafana-dashboard.sh`** (phase 3f) — jq-based
   validation of `examples/grafana/flowfabric-ops.json`. Checks valid
   JSON, required top-level keys (`title`, `panels`, `schemaVersion`,
@@ -165,6 +144,35 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The `deploy-approval/approve`, `media-pipeline/review`, and
   `llm-race/approve` example CLIs drop their `--waitpoint-token` flag
   and fetch through the admin client instead.
+
+### Changed
+
+- **`examples/{retry-and-cancel,token-budget}`**: swap the
+  `tokio::sync::Notify`-based worker-shutdown path for
+  `tokio_util::sync::CancellationToken` (level-triggered). Fixes
+  #483 — the notify-waiters shape was edge-triggered and dropped a
+  cancel fired while the worker was `tokio::time::sleep`-ing between
+  polls, leaving `worker_handle.await` hung after the scenes
+  completed. Both examples now exit cleanly (rc=0) instead of
+  needing the harness's success-marker escape hatch.
+- **`examples/media-pipeline/review`**: `--waitpoint-id` is now
+  `Option<String>`. Required only on the Suspended path (where it's
+  load-bearing); on the `AlreadyCompleted` early-exit (peer reviewer
+  beat us, or `FF_SKIP_APPROVAL=1` at the worker) the flag can be
+  omitted. Missing on the Suspended branch surfaces as a typed
+  `anyhow::bail!` that cites a concrete log line the operator can
+  grep for (e.g. `REVIEW_NEEDED eid=<uuid> wp=<uuid>`). Deferred
+  from the v0.13 release gate.
+
+### Fixed
+
+- **`benches/harness/src/runners/flowfabric.rs::fetch_exec_timestamps`**:
+  retry + soft-skip on the `started_at` visibility race (#476). Was
+  hard-erroring the whole scenario when any flow hit the microsecond
+  race between `state=completed` wire-visibility and the Lua HSET of
+  `started_at`. Now retries up to 5 × 50ms and soft-skips
+  `stage_latency_ms` for the flow on exhaustion; scenario-level
+  percentiles compute from the remaining samples.
 
 ## [0.13.0] - 2026-05-01
 
