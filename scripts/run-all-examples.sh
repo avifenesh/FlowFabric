@@ -258,9 +258,13 @@ start_ff_server() {
     # Foreground env so the child inherits only what we intend. Minimum
     # secret / lanes so validation passes; bind-only-loopback so we
     # don't expose the harness-spawned server outside the box.
+    # FF_LANES is the union of every lane any example ever uses:
+    # `default` (most), plus `build,test,deploy,verify` for
+    # deploy-approval. Including unused lanes is harmless — the
+    # scheduler just ranges zero-length ZSETs.
     FF_LISTEN_ADDR="127.0.0.1:$FF_SERVER_PORT" \
     FF_WAITPOINT_HMAC_SECRET="0000000000000000000000000000000000000000000000000000000000000000" \
-    FF_LANES="default" \
+    FF_LANES="default,build,test,deploy,verify" \
     FF_HOST="$VALKEY_HOST" \
     FF_PORT="$VALKEY_PORT" \
         "$bin" >"$FF_SERVER_LOG" 2>&1 &
@@ -319,6 +323,159 @@ stop_ff_server() {
     FF_SERVER_READY=""
 }
 
+# ── deploy-approval HITL orchestrator ────────────────────────────────
+#
+# Runs the 6-worker + submit + 2-approver choreography from the example
+# README. Spawns workers in background, runs submit bg, polls its log
+# for `deploy_created` + `deploy_suspended`, fires two approve calls
+# (alice + bob), waits for the deploy worker to print
+# `deploy_full_rollout_completed` AND the verify worker to print
+# `verify_completed`. Kills all its children on exit and returns 0 on
+# both markers seen, 1 otherwise. Writes a consolidated log to stdout
+# via tee-equivalent redirects so the outer harness's LOG_TMP carries
+# enough detail for a FAIL postmortem.
+run_deploy_approval() {
+    local dir="$1"
+    local budget="${2:-600}"   # wall-time cap in seconds
+    local started
+    started="$(date +%s)"
+
+    # This function runs inside the dispatcher's subshell, so globals
+    # here don't bleed into the outer script. Using globals (not
+    # `local`) keeps `pids` / `logdir` reachable from the `trap`
+    # handler, which executes after the function returns.
+    logdir="$(mktemp -d "${TMPDIR:-/tmp}/ff-deploy-approval.XXXXXX")" || {
+        echo "[deploy-approval] FATAL: mktemp -d failed"
+        return 1
+    }
+    pids=()
+
+    _cleanup() {
+        # Disable the trap first so a re-entry (e.g. SIGINT during
+        # cleanup) doesn't recurse.
+        trap - EXIT INT TERM
+        # Portable array expansion — ${arr[@]+"${arr[@]}"} avoids the
+        # `unbound variable` error on Bash 3.2 / `set -u` that
+        # `"${arr[@]:-}"` triggers.
+        local pid
+        for pid in ${pids[@]+"${pids[@]}"}; do
+            [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        done
+        sleep 1
+        for pid in ${pids[@]+"${pids[@]}"}; do
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        done
+        # Emit per-process logs for postmortem via the harness's
+        # LOG_TMP capture (this function's stdout).
+        if [ -n "$logdir" ] && [ -d "$logdir" ]; then
+            local f
+            for f in "$logdir"/*.log; do
+                [ -f "$f" ] || continue
+                echo "─── $(basename "$f") (last 15 lines) ───"
+                tail -n 15 "$f"
+            done
+            rm -rf "$logdir"
+        fi
+    }
+    # Register cleanup on every exit path (return, SIGINT, SIGTERM).
+    # With this in place, the per-branch manual `_cleanup` calls in
+    # the bail-out paths below are no longer needed.
+    trap _cleanup EXIT INT TERM
+
+    local bin="$dir/target/release"
+    local url="$FF_SERVER_URL"
+
+    echo "[deploy-approval] starting 6 bg workers + submit (log dir: $logdir)"
+
+    # Workers. Each inherits FF_SERVER_URL + FF_HOST + FF_PORT from
+    # the subshell's apply_env call; re-export here for clarity.
+    FF_SERVER_URL="$url" "$bin/build-worker" >"$logdir/build.log" 2>&1 &
+    pids+=($!)
+    FF_SERVER_URL="$url" "$bin/test-worker" --kind unit >"$logdir/test-unit.log" 2>&1 &
+    pids+=($!)
+    FF_SERVER_URL="$url" "$bin/test-worker" --kind integration >"$logdir/test-integ.log" 2>&1 &
+    pids+=($!)
+    FF_SERVER_URL="$url" "$bin/test-worker" --kind e2e >"$logdir/test-e2e.log" 2>&1 &
+    pids+=($!)
+    FF_SERVER_URL="$url" "$bin/deploy" >"$logdir/deploy.log" 2>&1 &
+    pids+=($!)
+    FF_SERVER_URL="$url" "$bin/verify" >"$logdir/verify.log" 2>&1 &
+    pids+=($!)
+
+    # Give workers ~2s to connect to ff-server + Valkey before submit
+    # starts creating flow members (otherwise the first claim round
+    # may see no capable workers).
+    sleep 2
+
+    # Submit (bg — we'll kill it once deploy marker set appears).
+    "$bin/submit" --server "$url" \
+        --artifact "app:v1.2.3" --commit "abc123" --poll-secs 1 \
+        >"$logdir/submit.log" 2>&1 &
+    pids+=($!)
+
+    # Parse deploy_eid + flow_id + waitpoint_id from the logs as they
+    # become available.
+    local deploy_eid="" flow_id="" wp_id=""
+    local t_end=$((started + 120))
+    while [ "$(date +%s)" -lt "$t_end" ]; do
+        if [ -z "$flow_id" ]; then
+            flow_id="$(grep -oE 'flow_created flow_id=[^ ]+' "$logdir/submit.log" 2>/dev/null | head -1 | sed 's/^.*=//')"
+        fi
+        if [ -z "$deploy_eid" ]; then
+            deploy_eid="$(grep -oE 'deploy_created execution_id=[^ ]+' "$logdir/submit.log" 2>/dev/null | head -1 | sed 's/^.*=//')"
+        fi
+        if [ -z "$wp_id" ]; then
+            wp_id="$(grep -oE 'waitpoint_id=[^ ]+' "$logdir/deploy.log" 2>/dev/null | head -1 | sed 's/^waitpoint_id=//')"
+        fi
+        if [ -n "$flow_id" ] && [ -n "$deploy_eid" ] && [ -n "$wp_id" ]; then
+            break
+        fi
+        sleep 2
+    done
+
+    if [ -z "$wp_id" ]; then
+        echo "[deploy-approval] FAIL: deploy never suspended (no waitpoint_id in deploy.log)"
+        return 1
+    fi
+
+    echo "[deploy-approval] deploy suspended — firing approve × 2 (alice, bob)"
+    echo "[deploy-approval] flow_id=$flow_id deploy_eid=$deploy_eid wp_id=$wp_id"
+
+    # Two distinct-source approvals — alice appends, bob resumes.
+    for reviewer in alice bob; do
+        if ! "$bin/approve" --server "$url" \
+            --flow-id "$flow_id" --execution-id "$deploy_eid" \
+            --waitpoint-id "$wp_id" --reviewer "$reviewer" \
+            >"$logdir/approve-$reviewer.log" 2>&1; then
+            echo "[deploy-approval] FAIL: approve --reviewer $reviewer returned non-zero"
+            tail -n 10 "$logdir/approve-$reviewer.log"
+            return 1
+        fi
+    done
+
+    # Wait for deploy + verify terminal markers.
+    echo "[deploy-approval] waiting for deploy_full_rollout_completed + verify_completed …"
+    t_end=$((started + budget))
+    local saw_deploy=0 saw_verify=0
+    while [ "$(date +%s)" -lt "$t_end" ]; do
+        if [ "$saw_deploy" = "0" ] && grep -q "deploy_full_rollout_completed" "$logdir/deploy.log" 2>/dev/null; then
+            echo "[deploy-approval] deploy_full_rollout_completed ✓"
+            saw_deploy=1
+        fi
+        if [ "$saw_verify" = "0" ] && grep -q "verify_completed" "$logdir/verify.log" 2>/dev/null; then
+            echo "[deploy-approval] verify_completed ✓"
+            saw_verify=1
+        fi
+        if [ "$saw_deploy" = "1" ] && [ "$saw_verify" = "1" ]; then
+            return 0
+        fi
+        sleep 3
+    done
+
+    echo "[deploy-approval] FAIL: timed out after ${budget}s — deploy_marker=$saw_deploy verify_marker=$saw_verify"
+    return 1
+}
+
 # Per-session opt-in filter. Empty = run everything.
 ONLY="${FF_EXAMPLES_ONLY:-}"
 MODE="both"   # both | build | run
@@ -349,7 +506,8 @@ requires() {
     case "$1" in
         v013-cairn-454-budget-ledger) echo "valkey" ;;
         v011-wave9-postgres) echo "postgres" ;;
-        retry-and-cancel|v010-read-side-ergonomics|token-budget) echo "ff-server" ;;
+        retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
+            echo "ff-server" ;;
         *) echo "" ;;
     esac
 }
@@ -434,8 +592,8 @@ apply_env() {
         v011-wave9-postgres)
             # Route the URL the preflight verified to the example.
             export FF_PG_TEST_URL="$POSTGRES_URL" ;;
-        retry-and-cancel|v010-read-side-ergonomics|token-budget)
-            # All three examples default to http://localhost:9090 but
+        retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
+            # All four examples default to http://localhost:9090 but
             # the harness picks a random free port to avoid colliding
             # with an operator-run ff-server. Pipe the harness's
             # URL/host/port through so the example talks to our server.
@@ -456,7 +614,7 @@ run_env_preview() {
             echo "FF_DEMO_VALKEY_HOST=$VALKEY_HOST FF_DEMO_VALKEY_PORT=$VALKEY_PORT" ;;
         v011-wave9-postgres)
             echo "FF_PG_TEST_URL=$(_pg_url_redact "$POSTGRES_URL")" ;;
-        retry-and-cancel|v010-read-side-ergonomics|token-budget)
+        retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
             echo "FF_SERVER_URL=$FF_SERVER_URL FF_HOST=$VALKEY_HOST FF_PORT=$VALKEY_PORT" ;;
         *)
             echo "" ;;
@@ -469,8 +627,6 @@ run_reason() {
     case "$1" in
         coding-agent|llm-race|media-pipeline)
             echo "phase 3d — LLM / model-heavy, pre-release-local only" ;;
-        deploy-approval)
-            echo "phase 3c.v — HITL multi-bin orchestration pending" ;;
         *) echo "not covered by the harness yet" ;;
     esac
 }
@@ -552,7 +708,15 @@ for dir in "$EXAMPLES_DIR"/*/; do
     fi
 
     # ── run (phase 3b/3c) ──
-    cmd="$(run_cmd "$name")"
+    # deploy-approval has a bespoke orchestrator (6-worker + submit +
+    # 2-approver HITL); everything else uses the generic run_cmd path.
+    if [ "$name" = "deploy-approval" ]; then
+        # Still runs the normal fixture preflight below, just under
+        # a sentinel cmd that the dispatch path recognises.
+        cmd="ORCHESTRATOR"
+    else
+        cmd="$(run_cmd "$name")"
+    fi
     if [ -z "$cmd" ]; then
         record_skip "$name" "$(run_reason "$name")"
         echo
@@ -602,7 +766,9 @@ for dir in "$EXAMPLES_DIR"/*/; do
 
     echo "[run] $name …"
     env_preview="$(run_env_preview "$name")"
-    if [ -n "$env_preview" ]; then
+    if [ "$cmd" = "ORCHESTRATOR" ]; then
+        echo "      <bespoke orchestrator: run_deploy_approval>"
+    elif [ -n "$env_preview" ]; then
         echo "      $env_preview $cmd"
     else
         echo "      $cmd"
@@ -615,11 +781,21 @@ for dir in "$EXAMPLES_DIR"/*/; do
     # the exit-code path consistent for operators who `source` parts
     # of this harness under their own -e shells.
     rc=0
-    (
-        cd "$dir"
-        apply_env "$name"
-        eval "$cmd"
-    ) >"$LOG_TMP" 2>&1 || rc=$?
+    if [ "$cmd" = "ORCHESTRATOR" ]; then
+        # Orchestrator runs its own child management; needs
+        # FF_SERVER_URL + FF_HOST + FF_PORT in the current shell so
+        # it can re-export into the per-worker env.
+        (
+            apply_env "$name"
+            run_deploy_approval "$dir"
+        ) >"$LOG_TMP" 2>&1 || rc=$?
+    else
+        (
+            cd "$dir"
+            apply_env "$name"
+            eval "$cmd"
+        ) >"$LOG_TMP" 2>&1 || rc=$?
+    fi
 
     marker="$(success_marker "$name")"
     if [ "$rc" = "0" ]; then
