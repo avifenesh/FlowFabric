@@ -9,6 +9,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`examples/{retry-and-cancel,token-budget}`**: swap the
+  `tokio::sync::Notify`-based worker-shutdown path for
+  `tokio_util::sync::CancellationToken` (level-triggered). Fixes
+  #483 — the notify-waiters shape was edge-triggered and dropped a
+  cancel fired while the worker was `tokio::time::sleep`-ing between
+  polls, leaving `worker_handle.await` hung after the scenes
+  completed. Both examples now exit cleanly (rc=0) instead of
+  needing the harness's success-marker escape hatch.
 - **`examples/media-pipeline/review`**: `--waitpoint-id` is now
   `Option<String>`. Required only on the Suspended path (where it's
   load-bearing); on the `AlreadyCompleted` early-exit (peer reviewer

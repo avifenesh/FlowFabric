@@ -41,8 +41,8 @@ use ff_core::policy::{BackoffStrategy, ExecutionPolicy, RetryPolicy};
 use ff_core::types::{ExecutionId, FlowId, LaneId};
 use ff_sdk::{FailOutcome, FlowFabricAdminClient, FlowFabricWorker, WorkerConfig};
 use flaky_api::FlakyPayload;
-use tokio::sync::Notify;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 const NAMESPACE: &str = "demo";
@@ -86,15 +86,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let http = reqwest::Client::new();
 
     // Spawn the worker loop. The orchestrator signals shutdown via
-    // `done` once both scenes finish; the worker then exits its select
-    // loop cleanly.
-    let done = Arc::new(Notify::new());
+    // `shutdown` once both scenes finish; the worker then exits its
+    // select loop cleanly.
+    //
+    // Uses a tokio-util CancellationToken rather than
+    // tokio::sync::Notify: notify_waiters only wakes waiters that
+    // were registered at call time, so a notification fired while
+    // the worker is sleeping between polls gets dropped (#483).
+    // CancellationToken is level-triggered — once cancelled,
+    // subsequent `.cancelled()` futures resolve immediately — so
+    // the worker's next select iteration exits regardless of when
+    // the cancel signal arrived relative to the poll cycle.
+    let shutdown = CancellationToken::new();
     let worker_handle = {
         let admin = Arc::clone(&admin);
-        let done = Arc::clone(&done);
+        let shutdown = shutdown.clone();
         let host = host.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_worker(host, port, admin, done).await {
+            if let Err(e) = run_worker(host, port, admin, shutdown).await {
                 tracing::error!(error = %e, "worker loop failed");
             }
         })
@@ -108,9 +117,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
 
     // Shut the worker down before surfacing any scene error so the
-    // background task doesn't leak past `main`.
-    done.notify_waiters();
-    let _ = worker_handle.await;
+    // background task doesn't leak past `main`. Outer timeout guards
+    // against a wedged `claim_via_server` — the loop's 10s block_ms
+    // + CancellationToken polling means 15s is generous headroom.
+    // JoinError handling:
+    //   * Ok(Ok(()))            — worker exited cleanly
+    //   * Ok(Err(JoinError))    — cancelled (expected on the abort
+    //                             paths we might add later) or panic
+    //                             (re-raise loud)
+    //   * Err(Elapsed)          — outer timeout; the task handle is
+    //                             dropped, which cancels the task
+    shutdown.cancel();
+    match timeout(Duration::from_secs(15), worker_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.is_cancelled() => {}
+        Ok(Err(e)) => panic!("worker task failed unexpectedly: {e:?}"),
+        Err(_) => tracing::warn!("worker shutdown exceeded 15s — dropping handle"),
+    }
 
     match scene_result {
         Ok(Ok(())) => {
@@ -294,7 +317,7 @@ async fn run_worker(
     host: String,
     port: u16,
     admin: Arc<FlowFabricAdminClient>,
-    done: Arc<Notify>,
+    shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = WorkerConfig {
         backend: Some(ff_core::backend::BackendConfig::valkey(host, port)),
@@ -316,8 +339,16 @@ async fn run_worker(
 
     info!("worker loop started");
     loop {
+        // Short-circuit if the shutdown token was already cancelled
+        // between iterations (e.g. while the sleep in the Ok(None)
+        // arm was running). `.cancelled()` is level-triggered so a
+        // cancel fired during the sleep isn't lost.
+        if shutdown.is_cancelled() {
+            info!("worker shutdown requested");
+            return Ok(());
+        }
         tokio::select! {
-            _ = done.notified() => {
+            _ = shutdown.cancelled() => {
                 info!("worker shutdown requested");
                 return Ok(());
             }
@@ -350,11 +381,19 @@ async fn run_worker(
                     Ok(None) => {
                         // Nothing to claim — short sleep keeps the
                         // demo responsive without hammering the server.
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // Race the sleep against shutdown so a cancel
+                        // fired during the wait exits promptly.
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "claim failed");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        }
                     }
                 }
             }
