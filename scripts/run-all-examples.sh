@@ -337,31 +337,50 @@ stop_ff_server() {
 run_deploy_approval() {
     local dir="$1"
     local budget="${2:-600}"   # wall-time cap in seconds
-    local started="$(date +%s)"
+    local started
+    started="$(date +%s)"
 
-    local logdir
-    logdir="$(mktemp -d "${TMPDIR:-/tmp}/ff-deploy-approval.XXXXXX")"
-    local pids=()
-    # Cleanup runs via a local trap that subsumes the outer EXIT trap
-    # for the duration of this function.
+    # This function runs inside the dispatcher's subshell, so globals
+    # here don't bleed into the outer script. Using globals (not
+    # `local`) keeps `pids` / `logdir` reachable from the `trap`
+    # handler, which executes after the function returns.
+    logdir="$(mktemp -d "${TMPDIR:-/tmp}/ff-deploy-approval.XXXXXX")" || {
+        echo "[deploy-approval] FATAL: mktemp -d failed"
+        return 1
+    }
+    pids=()
+
     _cleanup() {
-        for pid in "${pids[@]:-}"; do
+        # Disable the trap first so a re-entry (e.g. SIGINT during
+        # cleanup) doesn't recurse.
+        trap - EXIT INT TERM
+        # Portable array expansion — ${arr[@]+"${arr[@]}"} avoids the
+        # `unbound variable` error on Bash 3.2 / `set -u` that
+        # `"${arr[@]:-}"` triggers.
+        local pid
+        for pid in ${pids[@]+"${pids[@]}"}; do
             [ -n "$pid" ] && kill "$pid" 2>/dev/null
         done
-        # Grace period, then SIGKILL holdouts.
         sleep 1
-        for pid in "${pids[@]:-}"; do
+        for pid in ${pids[@]+"${pids[@]}"}; do
             [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
         done
-        # Emit per-process logs into stdout for postmortem via the
-        # harness's LOG_TMP capture.
-        for f in "$logdir"/*.log; do
-            [ -f "$f" ] || continue
-            echo "─── $(basename "$f") (last 15 lines) ───"
-            tail -n 15 "$f"
-        done
-        rm -rf "$logdir"
+        # Emit per-process logs for postmortem via the harness's
+        # LOG_TMP capture (this function's stdout).
+        if [ -n "$logdir" ] && [ -d "$logdir" ]; then
+            local f
+            for f in "$logdir"/*.log; do
+                [ -f "$f" ] || continue
+                echo "─── $(basename "$f") (last 15 lines) ───"
+                tail -n 15 "$f"
+            done
+            rm -rf "$logdir"
+        fi
     }
+    # Register cleanup on every exit path (return, SIGINT, SIGTERM).
+    # With this in place, the per-branch manual `_cleanup` calls in
+    # the bail-out paths below are no longer needed.
+    trap _cleanup EXIT INT TERM
 
     local bin="$dir/target/release"
     local url="$FF_SERVER_URL"
@@ -392,8 +411,7 @@ run_deploy_approval() {
     "$bin/submit" --server "$url" \
         --artifact "app:v1.2.3" --commit "abc123" --poll-secs 1 \
         >"$logdir/submit.log" 2>&1 &
-    local submit_pid=$!
-    pids+=("$submit_pid")
+    pids+=($!)
 
     # Parse deploy_eid + flow_id + waitpoint_id from the logs as they
     # become available.
@@ -417,7 +435,6 @@ run_deploy_approval() {
 
     if [ -z "$wp_id" ]; then
         echo "[deploy-approval] FAIL: deploy never suspended (no waitpoint_id in deploy.log)"
-        _cleanup
         return 1
     fi
 
@@ -432,7 +449,6 @@ run_deploy_approval() {
             >"$logdir/approve-$reviewer.log" 2>&1; then
             echo "[deploy-approval] FAIL: approve --reviewer $reviewer returned non-zero"
             tail -n 10 "$logdir/approve-$reviewer.log"
-            _cleanup
             return 1
         fi
     done
@@ -451,14 +467,12 @@ run_deploy_approval() {
             saw_verify=1
         fi
         if [ "$saw_deploy" = "1" ] && [ "$saw_verify" = "1" ]; then
-            _cleanup
             return 0
         fi
         sleep 3
     done
 
     echo "[deploy-approval] FAIL: timed out after ${budget}s — deploy_marker=$saw_deploy verify_marker=$saw_verify"
-    _cleanup
     return 1
 }
 
@@ -578,8 +592,8 @@ apply_env() {
         v011-wave9-postgres)
             # Route the URL the preflight verified to the example.
             export FF_PG_TEST_URL="$POSTGRES_URL" ;;
-        retry-and-cancel|v010-read-side-ergonomics|token-budget)
-            # All three examples default to http://localhost:9090 but
+        retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
+            # All four examples default to http://localhost:9090 but
             # the harness picks a random free port to avoid colliding
             # with an operator-run ff-server. Pipe the harness's
             # URL/host/port through so the example talks to our server.
@@ -600,7 +614,7 @@ run_env_preview() {
             echo "FF_DEMO_VALKEY_HOST=$VALKEY_HOST FF_DEMO_VALKEY_PORT=$VALKEY_PORT" ;;
         v011-wave9-postgres)
             echo "FF_PG_TEST_URL=$(_pg_url_redact "$POSTGRES_URL")" ;;
-        retry-and-cancel|v010-read-side-ergonomics|token-budget)
+        retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
             echo "FF_SERVER_URL=$FF_SERVER_URL FF_HOST=$VALKEY_HOST FF_PORT=$VALKEY_PORT" ;;
         *)
             echo "" ;;
