@@ -654,6 +654,10 @@ impl Server {
             edge_cancel_dispatcher_interval: config.engine_config.edge_cancel_dispatcher_interval,
             edge_cancel_reconciler_interval: config.engine_config.edge_cancel_reconciler_interval,
             budget_reset_interval: config.engine_config.budget_reset_interval,
+            // RFC-025 Phase 3 — 30s mirrors budget_reset cadence;
+            // tolerates Valkey's native PEXPIRE latency on the other
+            // backend for operator-tooling comparison.
+            worker_registry_ttl_interval: std::time::Duration::from_secs(30),
             dependency_stale_threshold_ms:
                 ff_backend_postgres::PostgresScannerConfig::DEFAULT_DEP_STALE_MS,
             scanner_filter: config.engine_config.scanner_filter.clone(),

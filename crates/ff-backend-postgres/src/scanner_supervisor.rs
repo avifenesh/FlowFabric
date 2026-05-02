@@ -44,6 +44,11 @@ pub struct PostgresScannerConfig {
     /// `ff-server::config::budget_reset_interval` knob so the same
     /// env value drives both backends.
     pub budget_reset_interval: Duration,
+    /// RFC-025 Phase 3: cadence for the `worker_registry_ttl_sweep`
+    /// reconciler. Mirrors Valkey's native PEXPIRE cleanup for
+    /// worker-liveness keys on PG (Valkey doesn't need a scanner).
+    /// Defaults to 30s, matching `budget_reset_interval` convention.
+    pub worker_registry_ttl_interval: Duration,
     /// Stale-threshold for the dependency reconciler (ms). Matches
     /// the Valkey scanner's `stale_threshold_ms` knob.
     pub dependency_stale_threshold_ms: i64,
@@ -191,6 +196,30 @@ pub fn spawn_scanners(pool: PgPool, cfg: PostgresScannerConfig) -> PostgresScann
         },
     );
 
+    // ── RFC-025 Phase 3 — `worker_registry_ttl_sweep` ──
+    //
+    // Walks the 256-partition worker-registry space (keyed on
+    // `fnv1a_u64(worker_instance_id) % 256`, not the flow/exec
+    // partition family). 30s tick mirrors Valkey's native PEXPIRE
+    // cadence closely enough for operator-tooling latency.
+    spawn_partition_scan(
+        &js,
+        &tx,
+        rx.clone(),
+        pool.clone(),
+        cfg.worker_registry_ttl_interval,
+        256,
+        filter.clone(),
+        "pg.worker_registry_ttl_sweep",
+        |pool, part, _filter| {
+            Box::pin(async move {
+                crate::worker_registry::ttl_sweep_tick(&pool, part)
+                    .await
+                    .map(|_| ())
+            })
+        },
+    );
+
     // ── Global (non-partition-scoped) reconcilers ──
     let dep_stale = cfg.dependency_stale_threshold_ms;
     spawn_global_scan(
@@ -243,10 +272,10 @@ pub fn spawn_scanners(pool: PgPool, cfg: PostgresScannerConfig) -> PostgresScann
     );
 
     tracing::info!(
-        scanners = 7,
+        scanners = 8,
         num_partitions,
         num_budget_partitions,
-        "postgres scanner supervisor spawned (RFC-017 Stage E3 + RFC-020 Wave 9 budget_reset)"
+        "postgres scanner supervisor spawned (RFC-017 Stage E3 + RFC-020 Wave 9 budget_reset + RFC-025 Phase 3 worker_registry_ttl_sweep)"
     );
 
     PostgresScannerHandle {
