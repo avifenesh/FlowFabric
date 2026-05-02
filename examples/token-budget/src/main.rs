@@ -187,10 +187,15 @@ async fn main() -> Result<()> {
     shutdown.cancel();
     // Bound the worker-shutdown wait so the example can't hang past
     // the demo budget. `claim_via_server` blocks up to its block_ms;
-    // since CancellationToken is level-triggered the in-flight claim
-    // will exit promptly once its block finishes, but we still cap
-    // the join at a generous ceiling to guard against a wedged call.
-    let _ = timeout(Duration::from_secs(15), worker_handle).await;
+    // CancellationToken is level-triggered so the in-flight claim
+    // exits promptly once its block finishes, but cap the join at a
+    // generous ceiling to guard against a wedged call.
+    match timeout(Duration::from_secs(15), worker_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.is_cancelled() => {}
+        Ok(Err(e)) => panic!("worker task failed unexpectedly: {e:?}"),
+        Err(_) => warn!("worker shutdown exceeded 15s — dropping handle"),
+    }
 
     // ── Post-mortem: per-child LeaseSummary (v0.9 #278). Even a
     // terminal exec carries its last-seen lease fields in the snapshot,
@@ -527,13 +532,20 @@ async fn run_worker_loop(
                         }
                     }
                     Ok(None) => {
-                        // No claim ready. Short sleep — the poll loop is
-                        // driven by the submitter's deadline, not by us.
-                        sleep(Duration::from_millis(100)).await;
+                        // No claim ready. Short sleep raced against
+                        // shutdown so a cancel fired during the wait
+                        // exits promptly (mirrors retry-and-cancel).
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            _ = sleep(Duration::from_millis(100)) => {}
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "claim_via_server returned error (likely flow cancelled)");
-                        sleep(Duration::from_millis(200)).await;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            _ = sleep(Duration::from_millis(200)) => {}
+                        }
                     }
                 }
             }

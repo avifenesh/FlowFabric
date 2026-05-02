@@ -117,9 +117,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
 
     // Shut the worker down before surfacing any scene error so the
-    // background task doesn't leak past `main`.
+    // background task doesn't leak past `main`. Outer timeout guards
+    // against a wedged `claim_via_server` — the loop's 10s block_ms
+    // + CancellationToken polling means 15s is generous headroom.
+    // JoinError handling:
+    //   * Ok(Ok(()))            — worker exited cleanly
+    //   * Ok(Err(JoinError))    — cancelled (expected on the abort
+    //                             paths we might add later) or panic
+    //                             (re-raise loud)
+    //   * Err(Elapsed)          — outer timeout; the task handle is
+    //                             dropped, which cancels the task
     shutdown.cancel();
-    let _ = worker_handle.await;
+    match timeout(Duration::from_secs(15), worker_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.is_cancelled() => {}
+        Ok(Err(e)) => panic!("worker task failed unexpectedly: {e:?}"),
+        Err(_) => tracing::warn!("worker shutdown exceeded 15s — dropping handle"),
+    }
 
     match scene_result {
         Ok(Ok(())) => {
