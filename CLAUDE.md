@@ -5,6 +5,11 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## 0. Working style
+
+- Never ask whether to take a break, wrap up, sleep on it, or pause. Always describe the next open tasks and be ready to work.
+- Keep messages concise with the exact content needed. No wrapping sentences, no personal opinions unless asked.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
