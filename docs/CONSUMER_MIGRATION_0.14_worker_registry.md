@@ -154,11 +154,39 @@ perform the rename — FF's trait doesn't bend to consumer naming.
 2. **Integration-level:** point cairn at a v0.14 `ff-server`; run
    cairn's worker-lifecycle e2e suite. The one behaviour difference
    from pre-v0.14 is the Valkey key shape — see §9.1 of the RFC.
-3. **Production cutover:** Valkey keys change shape from `ff:worker:{id}:alive`
-   to `ff:worker:{ns}:{id}:alive`. Operators running cairn + FF <0.14 and
-   stepping up to v0.14 will see both shapes briefly during rollout;
-   no data loss, but TTL-expiration of the old-shape keys takes up to
-   `lease_ttl_ms * 2` (default 60 s). Plan a quiet window.
+3. **Production cutover — two Valkey key shapes coexist during Phase
+   5.** The trait bodies (PR #494, landed) write the new namespaced
+   shape:
+   - `ff:worker:{ns}:{inst}:alive`
+   - `ff:worker:{ns}:{inst}:caps`
+   - `ff:idx:{ns}:workers`
+
+   The SDK preamble (`crates/ff-sdk/src/valkey_preamble.rs`) still
+   writes the legacy unprefixed shape:
+   - `ff:worker:{inst}:alive`
+   - `ff:worker:{inst}:caps`
+   - `ff:idx:workers`
+
+   This is **intentional** for Phase 5. The preamble write-path is
+   driven by the worker SDK, the trait write-path is driven by
+   consumers like cairn, and the `ff-engine::scanner::unblock`
+   scanner reads the legacy index shape today. Flipping all three
+   simultaneously would require a coordinated same-PR migration
+   across SDK + scanner + cairn — out of scope for Phase 5.
+
+   **Operational effects during the rollout window:**
+   - No data loss — writers never see each other's keys.
+   - `KEYS ff:worker:*` / `SCAN` tooling will see both shapes; filter
+     on the FF version of the writing process if you need to
+     disambiguate.
+   - Old-shape keys expire via PEXPIRE within `lease_ttl_ms * 2` of
+     a worker going silent (default 60 s); new-shape keys expire the
+     same way.
+   - Cairn consumers that have migrated off bespoke impls will still
+     receive claims correctly because the scheduler reads from the
+     legacy index; per-namespace isolation arrives in the Phase-6
+     follow-up that migrates the SDK preamble + unblock scanner to
+     the namespaced shape in one change.
 
 ## Deferred (future RFCs, not this one)
 
