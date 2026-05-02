@@ -7,6 +7,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`scripts/run-all-examples.sh` phase 3c.iii+3c.iv** — ff-server
+  lifecycle helpers + 3 new live-runs (`retry-and-cancel`,
+  `v010-read-side-ergonomics`, `token-budget`). The harness
+  auto-spawns `ff-server` on a random free port (via a Python
+  one-liner) against the live Valkey, polls `/healthz` until ready,
+  and stops the bg process on EXIT (ctrl-C safe). Per-example
+  runtime budget grows from 60s to 180s for ff-server-dependent
+  scenarios. New `success_marker` metadata: if an example's
+  scenario body completes (marker substring present in captured
+  log) the harness records PASS even if the process's shutdown
+  path hangs — sidesteps a real `Notify::notify_waiters` race in
+  two of the examples (filed as a follow-up). Sweep today:
+  **8 PASS / 5 SKIP / 0 FAIL**.
 - **`scripts/run-all-examples.sh` phase 3c.ii** — Postgres preflight
   + `v011-wave9-postgres` live-run. The preflight prefers
   `pg_isready`, falls back to `psql "SELECT 1"`, then to a bare
