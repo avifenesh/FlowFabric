@@ -3586,29 +3586,29 @@ impl ListExpiredLeasesArgs {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpiredLeaseInfo {
     pub execution_id: ExecutionId,
+    pub lease_id: LeaseId,
+    pub lease_epoch: LeaseEpoch,
     pub worker_instance_id: WorkerInstanceId,
     pub expires_at_ms: TimestampMs,
-    pub lease_epoch: LeaseEpoch,
-    pub namespace: Namespace,
-    pub lane_id: LaneId,
+    pub attempt_index: AttemptIndex,
 }
 
 impl ExpiredLeaseInfo {
     pub fn new(
         execution_id: ExecutionId,
+        lease_id: LeaseId,
+        lease_epoch: LeaseEpoch,
         worker_instance_id: WorkerInstanceId,
         expires_at_ms: TimestampMs,
-        lease_epoch: LeaseEpoch,
-        namespace: Namespace,
-        lane_id: LaneId,
+        attempt_index: AttemptIndex,
     ) -> Self {
         Self {
             execution_id,
+            lease_id,
+            lease_epoch,
             worker_instance_id,
             expires_at_ms,
-            lease_epoch,
-            namespace,
-            lane_id,
+            attempt_index,
         }
     }
 }
