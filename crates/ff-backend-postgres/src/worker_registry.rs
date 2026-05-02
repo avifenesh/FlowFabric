@@ -383,15 +383,27 @@ pub async fn list_workers(
     pool: &PgPool,
     args: ListWorkersArgs,
 ) -> Result<ListWorkersResult, EngineError> {
+    // RFC-025 §9.4: cross-namespace enumeration requires a two-key
+    // cursor (namespace, worker_instance_id) because instance_ids
+    // collide across namespaces. The Phase-1 contract's cursor is
+    // single-key `Option<WorkerInstanceId>`; expanding to a tuple
+    // would reopen Phase 1. Reject cross-ns with `Unavailable` to
+    // match Phase-2 Valkey behaviour; operator tooling can loop per
+    // namespace until the tuple-cursor RFC lands.
+    let Some(ns) = args.namespace.as_ref() else {
+        return Err(EngineError::Unavailable {
+            op: "list_workers (cross-namespace on Postgres — pass namespace explicitly)",
+        });
+    };
     let limit = args.limit.unwrap_or(1000) as i64;
-    let namespace_filter: Option<&str> = args.namespace.as_ref().map(|n| n.as_str());
+    let namespace_filter: &str = ns.as_str();
     let after_cursor: Option<&str> = args.after.as_ref().map(|w| w.as_str());
 
     let rows = sqlx::query(
         "SELECT worker_id, worker_instance_id, namespace, lanes, \
                 capabilities_csv, last_heartbeat_ms, liveness_ttl_ms, registered_at_ms \
            FROM ff_worker_registry \
-          WHERE ($1::text IS NULL OR namespace = $1) \
+          WHERE namespace = $1 \
             AND ($2::text IS NULL OR worker_instance_id > $2) \
           ORDER BY worker_instance_id ASC \
           LIMIT $3",
@@ -415,11 +427,11 @@ pub async fn list_workers(
         let registered_at_ms: i64 = row.try_get("registered_at_ms").map_err(map_sqlx_error)?;
 
         let lanes: BTreeSet<LaneId> = lanes_vec.into_iter().map(LaneId).collect();
-        let capabilities: BTreeSet<String> = if caps_csv.is_empty() {
-            BTreeSet::new()
-        } else {
-            caps_csv.split(',').map(str::to_owned).collect()
-        };
+        let capabilities: BTreeSet<String> = caps_csv
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
 
         entries.push(WorkerInfo::new(
             WorkerId::new(worker_id),
