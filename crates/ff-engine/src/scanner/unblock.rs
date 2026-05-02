@@ -789,6 +789,20 @@ async fn check_route_cleared(
 /// Union of every connected worker's advertised capabilities within
 /// the given namespace.
 ///
+/// #502 note — NOT folded into a single Lua FCALL by design: the
+/// `workers_index_key_ns` (`ff:idx:<ns>:workers`) and the per-worker
+/// `worker_caps_key_ns` (`ff:worker:<ns>:<inst>:caps`) do NOT share a
+/// Valkey hash-tag `{…}` in the current key shape. In cluster mode an
+/// FCALL only sees keys on a single slot; packaging SSCAN + per-worker
+/// HGET into one Lua body would silently drop workers whose caps key
+/// hashes to a different slot than the index SET. A restructure to
+/// share `{ns}` as a hash tag (e.g. `ff:idx:{<ns>}:workers` +
+/// `ff:worker:{<ns>}:<inst>:caps`) would require migrating the SDK
+/// preamble + `ff_register_worker` FCALL + every reader in one hop —
+/// cross-cutting change, deferred past the #502 closing-PR scope. The
+/// SSCAN + bounded-concurrent fan-out below is already the shape we'd
+/// emit from Lua, minus the single-round-trip framing.
+///
 /// Cluster-safe enumeration pattern (matches Batch A's index SETs for
 /// budget/flow/deps): SSCAN the namespace-scoped
 /// `workers_index_key_ns(namespace)` SET (single-slot, no hash tag
