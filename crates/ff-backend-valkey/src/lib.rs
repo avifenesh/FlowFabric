@@ -9409,7 +9409,7 @@ impl EngineBackend for ValkeyBackend {
                 // evict. Log so operators can distinguish this from a
                 // dropped worker without digging through keyspace.
                 tracing::debug!(
-                    instance_id = %instance_id,
+                    instance_id = %id_str,
                     caps_key = %caps_key,
                     "list_workers: caps hash missing for indexed instance (TTL race); skipping"
                 );
