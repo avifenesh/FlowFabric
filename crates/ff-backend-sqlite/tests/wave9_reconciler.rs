@@ -213,12 +213,14 @@ async fn supervisor_starts_and_stops_cleanly() {
     let b = fresh_backend("start-stop").await;
     let installed = b.with_scanners(SqliteScannerConfig {
         budget_reset_interval: Duration::from_millis(100),
+        worker_registry_ttl_interval: Duration::from_millis(0),
     });
     assert!(installed, "first with_scanners call installs supervisor");
 
     // Second call is a no-op (idempotent).
     let again = b.with_scanners(SqliteScannerConfig {
         budget_reset_interval: Duration::from_millis(100),
+        worker_registry_ttl_interval: Duration::from_millis(0),
     });
     assert!(!again, "second with_scanners call must be a no-op");
 
@@ -241,6 +243,7 @@ async fn supervisor_shutdown_drains_immediately_after_install() {
     b.with_scanners(SqliteScannerConfig {
         // 1h cadence — the task is parked at `select!`, not doing work.
         budget_reset_interval: Duration::from_secs(3600),
+        worker_registry_ttl_interval: Duration::from_secs(3600),
     });
     b.shutdown_prepare(Duration::from_secs(2))
         .await
@@ -256,6 +259,7 @@ async fn supervisor_zero_interval_is_disabled_not_panic() {
     let b = fresh_backend("zero-interval").await;
     b.with_scanners(SqliteScannerConfig {
         budget_reset_interval: Duration::from_millis(0),
+        worker_registry_ttl_interval: Duration::from_millis(0),
     });
     // Shutdown should still work and report zero timed-out tasks.
     b.shutdown_prepare(Duration::from_secs(1))
@@ -280,6 +284,7 @@ async fn supervisor_tick_advances_on_cadence() {
     // Short cadence to force at least one tick inside the test.
     b.with_scanners(SqliteScannerConfig {
         budget_reset_interval: Duration::from_millis(50),
+        worker_registry_ttl_interval: Duration::from_millis(0),
     });
 
     // Wait up to ~3s for the supervisor to notice the due row.
