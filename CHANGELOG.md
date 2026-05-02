@@ -7,6 +7,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`scripts/run-all-examples.sh` phase 3c.ii** — Postgres preflight
+  + `v011-wave9-postgres` live-run. The preflight prefers
+  `pg_isready`, falls back to `psql "SELECT 1"`, then to a bare
+  `/dev/tcp` socket probe. `FF_PG_TEST_URL` (defaults to the README
+  shape `postgres://postgres:postgres@localhost:5432/ff_v011_demo`)
+  is piped to the example verbatim so preflight + run always target
+  the same endpoint. Unreachable Postgres SKIPs with an actionable
+  "start postgres + create db (or set FF_PG_TEST_URL)" message.
+  Sweep today: 5 PASS / 8 SKIP / 0 FAIL.
 - **`scripts/run-all-examples.sh` phase 3c.i** — two more live-runs
   + a Valkey preflight helper. `incident-remediation` (SQLite embedded
   path — the Valkey path errors out asking for a scheduler+scanner
