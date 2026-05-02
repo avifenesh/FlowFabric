@@ -16,7 +16,7 @@ description = "FlowFabric claim-grant scheduler"
 observability = ["ff-observability/enabled"]
 
 [dependencies]
-ff-core = { version = "0.13.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.14.0", path = "../ff-core", default-features = false, features = ["core"] }
 # Issue #171: ff-scheduler's claim dispatcher uses FCALL helpers from
 # ff-script, so explicitly enable `valkey-client`.
 ff-script = { workspace = true, features = ["valkey-client"] }

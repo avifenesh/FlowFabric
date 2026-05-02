@@ -235,12 +235,14 @@ impl FlowFabricWorker {
 
         // v0.12 PR-6: the Valkey-specific preamble (PING, alive-key
         // SET-NX, `ff:config:partitions` HGETALL, caps ingress +
-        // sorted-dedup CSV, caps STRING + workers-index writes) lives
-        // in `crate::valkey_preamble`. Extracted byte-for-byte from
-        // the pre-PR-6 inline body; the write order is observable
-        // from scheduler-side reads (unblock scanner:
-        // SMEMBERS ff:idx:workers → GET ff:worker:{id}:caps) so
-        // preservation is load-bearing. See `valkey_preamble::run`.
+        // sorted-dedup CSV, caps HASH + workers-index writes) lives
+        // in `crate::valkey_preamble`. RFC-025 Phase 5 cutover: the
+        // caps write is now a namespaced HASH matching the
+        // `ff_register_worker` FCALL shape. The write order is
+        // observable from scheduler-side reads (unblock scanner:
+        // SMEMBERS ff:idx:{ns}:workers → HGET ff:worker:{ns}:{id}:caps
+        // caps_csv) so preservation is load-bearing. See
+        // `valkey_preamble::run`.
         let crate::valkey_preamble::PreambleOutput {
             partition_config,
             capabilities_csv: _worker_capabilities_csv,

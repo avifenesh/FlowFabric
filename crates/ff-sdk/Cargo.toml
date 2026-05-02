@@ -84,7 +84,7 @@ layer-circuit-breaker = ["dep:async-trait"]
 # future tranches will add trait methods + types requiring the Valkey
 # backend). The `valkey-default` feature re-enables them below for the
 # default build.
-ff-core = { version = "0.13.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.14.0", path = "../ff-core", default-features = false, features = ["core"] }
 # Issue #171: ff-script's defaults are empty — the `valkey-client`
 # feature (which owns the `ferriskey` dep edge) is activated below by
 # the `valkey-default` feature, NOT here. This keeps
@@ -102,7 +102,7 @@ ferriskey = { workspace = true, optional = true }
 # RFC-023 Phase 1a: optional SQLite backend edge, activated by the
 # `sqlite` feature above. Off by default so Valkey consumers pay no
 # sqlx compile cost.
-ff-backend-sqlite = { version = "0.13.0", path = "../ff-backend-sqlite", optional = true, default-features = false, features = ["core"] }
+ff-backend-sqlite = { version = "0.14.0", path = "../ff-backend-sqlite", optional = true, default-features = false, features = ["core"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

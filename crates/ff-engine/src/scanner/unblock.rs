@@ -7,15 +7,21 @@
 //! Cross-partition budget check is cached per scan cycle (MANDATORY —
 //! without it, 50K blocked executions = 50K budget reads).
 //!
-//! Capability sweep reads the union of non-authoritative worker cap sets
-//! (`ff:worker:*:caps` — written by `ff-sdk::FlowFabricWorker::connect`)
-//! ONCE per scan cycle and uses it to decide whether a `waiting_for_capable_worker`
-//! execution has a matching worker. This is best-effort: caps sets may
-//! be slightly stale (TTL-less STRING, overwrite on restart), but the
-//! promotion path is self-correcting — a promoted execution that still
-//! can't be claimed gets re-blocked on the next scheduler tick. RFC-009
-//! §7.5 documents the v1 sweep approach and defers connect-triggered
-//! sweeps to V2.
+//! Capability sweep reads the union of non-authoritative worker cap
+//! HASHes (`ff:worker:{ns}:{instance_id}:caps` — written by
+//! `ff-sdk::FlowFabricWorker::connect` and by the `ff_register_worker`
+//! FCALL) ONCE per scan cycle PER NAMESPACE, and uses it to decide
+//! whether a `waiting_for_capable_worker` execution has a matching
+//! worker. This is best-effort: caps HASHes may be slightly stale
+//! (TTL'd, refreshed on connect), but the promotion path is
+//! self-correcting — a promoted execution that still can't be claimed
+//! gets re-blocked on the next scheduler tick. RFC-009 §7.5 documents
+//! the v1 sweep approach and defers connect-triggered sweeps to V2.
+//!
+//! RFC-025 Phase 5 cutover: caps reads go through the namespace-scoped
+//! `ff:idx:{ns}:workers` + `ff:worker:{ns}:{id}:caps` helpers; the
+//! cache keys off `Namespace` so multi-tenant deployments don't mix
+//! capability sets across tenants.
 //!
 //! MUST skip `paused_by_flow_cancel` — only cancel_flow clears that.
 //!
@@ -32,7 +38,7 @@ use ff_core::backend::ScannerFilter;
 use ff_core::engine_backend::EngineBackend;
 use ff_core::keys::IndexKeys;
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition};
-use ff_core::types::{BudgetId, ExecutionId, LaneId, TimestampMs};
+use ff_core::types::{BudgetId, ExecutionId, LaneId, Namespace, TimestampMs};
 
 use super::{should_skip_candidate, ScanResult, Scanner};
 
@@ -73,13 +79,28 @@ pub struct UnblockScanner {
     backend: Option<Arc<dyn EngineBackend>>,
 }
 
-/// Worker-caps union snapshot with a monotonic freshness timestamp.
-/// `None` on first scan; filled by `get_or_load`. Invalidated when
-/// `Instant::now() - fetched_at >= ttl`.
+/// Per-namespace worker-caps union cache. Every blocked execution
+/// carries a `namespace` field on `exec_core`; the scanner reads that
+/// alongside `blocking_reason` and routes the subset check to the
+/// union of caps advertised by workers in THAT namespace only. Absent
+/// this partitioning, a tenant-A worker advertising
+/// `required_caps=[gpu]` would unblock a tenant-B execution waiting on
+/// the same token.
 struct CapsUnionCache {
+    /// TTL applied uniformly to every namespace entry — same cadence
+    /// as `UnblockScanner::interval`, so a freshly-connected worker
+    /// propagates into its namespace's union on the next scan cycle.
+    ttl: Duration,
+    /// Entry per observed namespace. Grows as new namespaces surface
+    /// on blocked executions; entries do NOT expire (the bounded fleet
+    /// of namespaces is small and refreshing an unused entry on next
+    /// visit costs one SSCAN). Cleared on scanner restart.
+    entries: HashMap<Namespace, CapsUnionEntry>,
+}
+
+struct CapsUnionEntry {
     snapshot: Option<BTreeSet<String>>,
     fetched_at: Option<Instant>,
-    ttl: Duration,
 }
 
 impl UnblockScanner {
@@ -101,9 +122,8 @@ impl UnblockScanner {
             partition_config,
             filter,
             caps_cache: Arc::new(AsyncMutex::new(CapsUnionCache {
-                snapshot: None,
-                fetched_at: None,
                 ttl: interval,
+                entries: HashMap::new(),
             })),
             backend: None,
         }
@@ -124,9 +144,8 @@ impl UnblockScanner {
             partition_config,
             filter,
             caps_cache: Arc::new(AsyncMutex::new(CapsUnionCache {
-                snapshot: None,
-                fetched_at: None,
                 ttl: interval,
+                entries: HashMap::new(),
             })),
             backend: Some(backend),
         }
@@ -270,12 +289,16 @@ async fn scan_blocked_set(
         if should_skip_candidate(backend, filter, partition.index, eid_str).await {
             continue;
         }
-        // Read blocking_reason from exec_core to confirm still blocked
+        // Read blocking_reason + namespace from exec_core. Namespace
+        // gates the caps-union subset check so tenant-A worker caps
+        // never unblock a tenant-B `blocked_by_route` execution —
+        // RFC-025 Phase 5 multi-tenant safety property.
         let core_key = format!("ff:exec:{}:{}:core", tag, eid_str);
-        let reason: Option<String> = match client
-            .cmd("HGET")
+        let fields: Vec<Option<String>> = match client
+            .cmd("HMGET")
             .arg(&core_key)
             .arg("blocking_reason")
+            .arg("namespace")
             .execute()
             .await
         {
@@ -284,14 +307,38 @@ async fn scan_blocked_set(
                 tracing::warn!(
                     execution_id = eid_str.as_str(),
                     error = %e,
-                    "unblock_scanner: HGET blocking_reason failed, skipping"
+                    "unblock_scanner: HMGET blocking_reason/namespace failed, skipping"
                 );
                 errors += 1;
                 continue;
             }
         };
-
-        let reason = reason.unwrap_or_default();
+        if fields.len() < 2 {
+            tracing::warn!(
+                execution_id = eid_str.as_str(),
+                returned_fields = fields.len(),
+                "unblock_scanner: HMGET returned < 2 fields, skipping"
+            );
+            errors += 1;
+            continue;
+        }
+        let reason = fields[0].clone().unwrap_or_default();
+        let namespace = match fields[1].as_deref().filter(|s| !s.is_empty()) {
+            Some(ns_str) => Namespace::new(ns_str),
+            None => {
+                // Every execution gets a namespace at create-time
+                // (`ff_create_execution` HSETs it). Missing here = data
+                // integrity defect; skip rather than risk a
+                // cross-tenant promotion.
+                tracing::warn!(
+                    execution_id = eid_str.as_str(),
+                    core_key = %core_key,
+                    "unblock_scanner: exec_core missing namespace field, skipping"
+                );
+                errors += 1;
+                continue;
+            }
+        };
 
         // Skip if not blocked by the expected reason (e.g. paused_by_flow_cancel)
         if reason != expected_reason {
@@ -307,7 +354,7 @@ async fn scan_blocked_set(
                 check_quota_cleared(client, backend, &core_key, eid_str, partition_config).await
             }
             "waiting_for_capable_worker" => {
-                check_route_cleared(client, &core_key, caps_cache).await
+                check_route_cleared(client, &core_key, caps_cache, &namespace).await
             }
             _ => false,
         };
@@ -663,6 +710,7 @@ async fn check_route_cleared(
     client: &ferriskey::Client,
     core_key: &str,
     caps_cache: &Arc<AsyncMutex<CapsUnionCache>>,
+    namespace: &Namespace,
 ) -> bool {
     let required_csv: Option<String> = client
         .cmd("HGET")
@@ -681,21 +729,34 @@ async fn check_route_cleared(
     // n is bounded by total caps across the fleet — typically tens).
     // Holding the mutex across the subset loop would serialize every
     // partition's capability-block decision behind this one mutex.
+    //
+    // Per-namespace entries: cache refresh decision keys off the
+    // execution's namespace, so tenants with very different update
+    // cadences don't invalidate each other.
     let snapshot: BTreeSet<String> = {
         let mut guard = caps_cache.lock().await;
-        let stale = guard
+        let ttl = guard.ttl;
+        let entry = guard
+            .entries
+            .entry(namespace.clone())
+            .or_insert(CapsUnionEntry {
+                snapshot: None,
+                fetched_at: None,
+            });
+        let stale = entry
             .fetched_at
-            .map(|t| t.elapsed() >= guard.ttl)
+            .map(|t| t.elapsed() >= ttl)
             .unwrap_or(true);
         if stale {
-            match load_worker_caps_union(client).await {
+            match load_worker_caps_union(client, namespace).await {
                 Ok(union) => {
-                    guard.snapshot = Some(union);
-                    guard.fetched_at = Some(Instant::now());
+                    entry.snapshot = Some(union);
+                    entry.fetched_at = Some(Instant::now());
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
+                        namespace = %namespace,
                         "unblock_scanner: failed to read worker caps union — \
                          assuming match possible (fail-open to preserve liveness)"
                     );
@@ -703,7 +764,7 @@ async fn check_route_cleared(
                 }
             }
         }
-        guard.snapshot.clone().unwrap_or_default()
+        entry.snapshot.clone().unwrap_or_default()
     };
 
     // Subset check: every non-empty token in required_csv present in union.
@@ -713,37 +774,47 @@ async fn check_route_cleared(
         .all(|t| snapshot.contains(t))
 }
 
-/// Union of every connected worker's advertised capabilities.
+/// Union of every connected worker's advertised capabilities within
+/// the given namespace.
 ///
 /// Cluster-safe enumeration pattern (matches Batch A's index SETs for
-/// budget/flow/deps): SSCAN the `workers_index_key()` SET (single-slot,
-/// no hash tag needed — the key name literally hashes to one slot), then
-/// fan-out concurrent `GET ff:worker:<id>:caps` with a bounded concurrency
-/// cap. A keyspace `SCAN MATCH ff:worker:*:caps` in cluster mode visits
-/// only one shard per call and silently drops workers on other shards —
-/// exactly the class of bug Batch A Issue #11 fixed.
+/// budget/flow/deps): SSCAN the namespace-scoped
+/// `workers_index_key_ns(namespace)` SET (single-slot, no hash tag
+/// needed — the key name literally hashes to one slot), then fan-out
+/// concurrent `HGET ff:worker:{ns}:{id}:caps caps_csv` with a bounded
+/// concurrency cap. A keyspace `SCAN MATCH ff:worker:*:caps` in
+/// cluster mode visits only one shard per call and silently drops
+/// workers on other shards — exactly the class of bug Batch A Issue
+/// #11 fixed.
+///
+/// Caps storage is a HASH (RFC-025 Phase 5 post-cutover — shape
+/// matches `ff_register_worker` FCALL + the SDK preamble), and only
+/// the `caps_csv` field drives the union. Per-worker HGET is a
+/// single-field read, not HGETALL, so the scanner pays only the bytes
+/// it uses.
 ///
 /// SSCAN is used instead of SMEMBERS so a fleet of thousands of workers
 /// doesn't round-trip the entire member list in one reply. `COUNT = 100`
 /// matches the convention in budget_reconciler / flow_projector.
 ///
-/// Empty caps STRING or missing key = "no caps for that worker"; scanner
-/// keeps accumulating. Per-worker GET error, in contrast, PROPAGATES — a
-/// previous version used `.unwrap_or(None)` which silently merged error
-/// and empty into the same branch, making a transient error look like
-/// "this worker has no caps". In a single-capable-worker fleet that
-/// produced false-negative unions and left executions blocked even
-/// though a matching worker existed, contradicting the scanner's
-/// documented fail-open behavior. Now an error bubbles up; the only
-/// caller (`check_route_cleared`) treats `Err` by returning `true`
-/// (unblock — "we don't know, let the scheduler re-decide next tick"),
-/// which preserves liveness uniformly whether the fault is SSCAN, GET,
-/// or deeper transport.
+/// Empty `caps_csv` or missing key = "no caps for that worker";
+/// scanner keeps accumulating. Per-worker HGET error, in contrast,
+/// PROPAGATES — a previous version used `.unwrap_or(None)` which
+/// silently merged error and empty into the same branch, making a
+/// transient error look like "this worker has no caps". In a
+/// single-capable-worker fleet that produced false-negative unions and
+/// left executions blocked even though a matching worker existed,
+/// contradicting the scanner's documented fail-open behavior. Now an
+/// error bubbles up; the only caller (`check_route_cleared`) treats
+/// `Err` by returning `true` (unblock — "we don't know, let the
+/// scheduler re-decide next tick"), which preserves liveness uniformly
+/// whether the fault is SSCAN, HGET, or deeper transport.
 async fn load_worker_caps_union(
     client: &ferriskey::Client,
+    namespace: &Namespace,
 ) -> Result<BTreeSet<String>, ferriskey::Error> {
     let mut union = BTreeSet::new();
-    let index_key = ff_core::keys::workers_index_key();
+    let index_key = ff_core::keys::workers_index_key_ns(namespace);
 
     // Helper: drain one completed future and fold its caps into the
     // union, or propagate its error. Centralizing keeps the in-loop +
@@ -779,7 +850,7 @@ async fn load_worker_caps_union(
         cursor = reply.0;
         let worker_ids = reply.1;
 
-        // Bounded concurrent GETs per SSCAN page. FuturesUnordered with
+        // Bounded concurrent HGETs per SSCAN page. FuturesUnordered with
         // a buffered stream caps in-flight work at CAPS_GET_CONCURRENCY —
         // enough parallelism to amortize round-trip latency, bounded so
         // one scanner tick can't flood the shared Valkey client. Each
@@ -789,11 +860,15 @@ async fn load_worker_caps_union(
         let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
         for id in worker_ids {
             let client = client.clone();
+            let namespace = namespace.clone();
             pending.push(async move {
-                let caps_key = format!("ff:worker:{}:caps", id);
+                let instance = ff_core::types::WorkerInstanceId::new(id);
+                let caps_key =
+                    ff_core::keys::worker_caps_key_ns(&namespace, &instance);
                 let csv: Option<String> = client
-                    .cmd("GET")
+                    .cmd("HGET")
                     .arg(&caps_key)
+                    .arg("caps_csv")
                     .execute()
                     .await?;
                 Ok::<Option<String>, ferriskey::Error>(csv)

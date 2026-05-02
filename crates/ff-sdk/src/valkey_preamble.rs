@@ -1,22 +1,22 @@
 //! Valkey-specific connect preamble for [`FlowFabricWorker::connect`].
 //!
-//! v0.12 backend-agnostic SDK PR-6: the Valkey-specific observable work
-//! that `connect` used to do inline — PING, SET-NX alive-key guard,
-//! `ff:config:partitions` HGETALL, capability ingress validation + CSV
-//! compute, and the `ff:worker:{id}:caps` advertisement / `ff:idx:workers`
-//! index write — lives here as a single [`run`] entry point so
-//! `connect`'s body shrinks to three statements (build_client, run
-//! preamble, wrap backend).
+//! v0.12 backend-agnostic SDK PR-6 extracted the inline preamble body
+//! (PING, SET-NX alive-key guard, `ff:config:partitions` HGETALL,
+//! capability ingress validation + CSV compute, caps advertisement +
+//! index SADD) into this module so `connect` shrinks to three statements
+//! (build_client, run preamble, wrap backend).
+//!
+//! RFC-025 Phase 5 cutover: the caps advertisement now writes the same
+//! namespaced HASH shape as the trait-route `ff_register_worker` FCALL
+//! (`ff:worker:{ns}:{instance_id}:caps`, fields
+//! `worker_id,lanes_csv,caps_csv,ttl_ms,registered_at_ms`) and the
+//! index SADD targets `ff:idx:{ns}:workers`. This closes the preamble /
+//! FCALL shape divergence so the unblock scanner and `list_workers` see
+//! an identical surface regardless of which path registered the worker.
 //!
 //! The module is `#[cfg(feature = "valkey-default")]`-gated: a
 //! `--no-default-features --features sqlite` build does not compile it,
 //! matching the gate on [`FlowFabricWorker::connect`] itself.
-//!
-//! **Behaviour preservation.** The write order is observable from the
-//! scheduler side (`unblock` scanner reads `ff:idx:workers` then GETs
-//! `ff:worker:{id}:caps`). The extraction is byte-for-byte identical to
-//! the pre-PR-6 inline body — see the PR-6 description in the archive
-//! repo for the key-write diff.
 //!
 //! [`FlowFabricWorker::connect`]: crate::FlowFabricWorker::connect
 
@@ -35,9 +35,11 @@ use crate::SdkError;
 /// `claim_next_via_backend` needs the hash for its per-mismatch log
 /// surface regardless of which claim path the worker uses.
 ///
-/// The `ff:worker:{id}:caps` + `ff:idx:workers` advertisement writes
-/// also run on every worker (v0.13 ungate) so the unblock scanner has
-/// caps keys regardless of direct-claim vs server-routed claim.
+/// The `ff:worker:{ns}:{id}:caps` HASH + `ff:idx:{ns}:workers` SET
+/// advertisement writes also run on every worker (v0.13 ungate) so the
+/// unblock scanner has caps keys regardless of direct-claim vs
+/// server-routed claim. Shape matches the `ff_register_worker` FCALL
+/// post-RFC-025 Phase 5.
 ///
 /// [`FlowFabricWorker`]: crate::FlowFabricWorker
 pub(crate) struct PreambleOutput {
@@ -51,18 +53,20 @@ pub(crate) struct PreambleOutput {
 ///
 /// Executes (in order — the order is observable from scheduler reads):
 /// 1. `PING` connectivity probe.
-/// 2. `SET NX PX` on `ff:worker:{instance_id}:alive` (duplicate-instance
-///    guard, TTL = 2 × `lease_ttl_ms`).
+/// 2. `SET NX PX` on `ff:worker:{ns}:{instance_id}:alive`
+///    (duplicate-instance guard, TTL = 2 × `lease_ttl_ms`).
 /// 3. `HGETALL ff:config:partitions` (falls back to `PartitionConfig::default()`
 ///    on absence, which is the SDK-only-test shape).
 /// 4. Capability ingress validation + sorted-dedup CSV compute
 ///    (always-on; v0.13 ungate). Under `direct-valkey-claim` the FNV-1a
 ///    digest + full-CSV connect-time log also run.
-/// 5. `SET`/`DEL` of `ff:worker:{instance_id}:caps` + `SADD`/`SREM` of
-///    the `ff:idx:workers` index (always-on; v0.13 ungate — needed by
-///    the unblock scanner's `load_worker_caps_union` on both
-///    direct-claim and server-routed worker paths). Caps-first write
-///    order is load-bearing.
+/// 5. `HSET`+`PEXPIRE`/`DEL` of `ff:worker:{ns}:{instance_id}:caps`
+///    (HASH — fields `worker_id,lanes_csv,caps_csv,ttl_ms,registered_at_ms`
+///    matching `ff_register_worker`) + `SADD`/`SREM` of
+///    `ff:idx:{ns}:workers` (always-on; v0.13 ungate — needed by the
+///    unblock scanner's `load_worker_caps_union` on both direct-claim
+///    and server-routed worker paths). Caps-first write order is
+///    load-bearing.
 pub(crate) async fn run(
     client: &Client,
     config: &WorkerConfig,
@@ -85,7 +89,8 @@ pub(crate) async fn run(
     // `worker_instance_id`. See `FlowFabricWorker::connect` rustdoc for
     // the full three limitations (startup-only, restart delay, no
     // graceful cleanup) — documented at the caller.
-    let alive_key = format!("ff:worker:{}:alive", config.worker_instance_id);
+    let alive_key =
+        ff_core::keys::worker_alive_key_ns(&config.namespace, &config.worker_instance_id);
     let alive_ttl_ms = (config.lease_ttl_ms.saturating_mul(2)).max(1_000);
     let set_result: Option<String> = client
         .cmd("SET")
@@ -210,13 +215,20 @@ pub(crate) async fn run(
     // `blocked_by_route → runnable` promotion; server-routed workers
     // need these keys populated too, not just `direct-valkey-claim`
     // ones. The AUTHORITATIVE source for scheduling decisions at
-    // claim-time is still ARGV[9] on each claim. The caps STRING is
+    // claim-time is still ARGV[9] on each claim.
+    //
+    // RFC-025 Phase 5: shape matches the `ff_register_worker` FCALL —
+    // HASH with `worker_id, lanes_csv, caps_csv, ttl_ms,
+    // registered_at_ms` under a namespace-scoped key. The caps HASH is
     // written BEFORE the index SADD so that when the scheduler's
     // unblock scanner observes the id in the index, the caps key is
-    // guaranteed to resolve to a non-stale CSV.
+    // guaranteed to resolve to a non-stale HASH.
     {
-        let caps_key = ff_core::keys::worker_caps_key(&config.worker_instance_id);
-        let index_key = ff_core::keys::workers_index_key();
+        let caps_key = ff_core::keys::worker_caps_key_ns(
+            &config.namespace,
+            &config.worker_instance_id,
+        );
+        let index_key = ff_core::keys::workers_index_key_ns(&config.namespace);
         let instance_id = config.worker_instance_id.to_string();
         if capabilities_csv.is_empty() {
             let _ = client
@@ -235,15 +247,49 @@ pub(crate) async fn run(
                     "SREM workers-index failed; continuing (non-authoritative)");
             }
         } else {
+            // Sorted + joined lanes CSV — mirrors how `capabilities_csv`
+            // is built above, and matches the shape
+            // `ff_register_worker` writes via `RegisterWorkerArgv.lanes_csv`.
+            let lanes_csv: String = {
+                let set: std::collections::BTreeSet<&str> =
+                    config.lanes.iter().map(|l| l.as_str()).collect();
+                set.into_iter().collect::<Vec<_>>().join(",")
+            };
+            let now_ms: u64 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let ttl_ms_str = alive_ttl_ms.to_string();
+            let now_ms_str = now_ms.to_string();
+            let worker_id_str = config.worker_id.to_string();
             if let Err(e) = client
-                .cmd("SET")
+                .cmd("HSET")
                 .arg(&caps_key)
-                .arg(&capabilities_csv)
-                .execute::<Option<String>>()
+                .arg("worker_id")
+                .arg(worker_id_str.as_str())
+                .arg("lanes_csv")
+                .arg(lanes_csv.as_str())
+                .arg("caps_csv")
+                .arg(capabilities_csv.as_str())
+                .arg("ttl_ms")
+                .arg(ttl_ms_str.as_str())
+                .arg("registered_at_ms")
+                .arg(now_ms_str.as_str())
+                .execute::<Option<i64>>()
                 .await
             {
                 tracing::warn!(error = %e, key = %caps_key,
-                    "SET worker caps advertisement failed; continuing");
+                    "HSET worker caps advertisement failed; continuing");
+            }
+            if let Err(e) = client
+                .cmd("PEXPIRE")
+                .arg(&caps_key)
+                .arg(ttl_ms_str.as_str())
+                .execute::<Option<i64>>()
+                .await
+            {
+                tracing::warn!(error = %e, key = %caps_key,
+                    "PEXPIRE worker caps HASH failed; continuing");
             }
             if let Err(e) = client
                 .cmd("SADD")
