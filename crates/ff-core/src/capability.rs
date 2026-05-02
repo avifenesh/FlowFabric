@@ -143,6 +143,18 @@ pub struct Supports {
     pub stream_durable_summary: bool,
     /// `tail_stream` (best-effort live tail).
     pub stream_best_effort_live: bool,
+
+    // ── Worker registry (RFC-025) ──
+    /// `register_worker`.
+    pub register_worker: bool,
+    /// `heartbeat_worker`.
+    pub heartbeat_worker: bool,
+    /// `mark_worker_dead`.
+    pub mark_worker_dead: bool,
+    /// `list_expired_leases`.
+    pub list_expired_leases: bool,
+    /// `list_workers` (RFC-025 Phase 6, §9.4).
+    pub list_workers: bool,
     // Add new fields here, preserving parity-matrix order.
 }
 
@@ -187,6 +199,11 @@ impl Supports {
             subscribe_instance_tags: false,
             stream_durable_summary: false,
             stream_best_effort_live: false,
+            register_worker: false,
+            heartbeat_worker: false,
+            mark_worker_dead: false,
+            list_expired_leases: false,
+            list_workers: false,
         }
     }
 }

@@ -88,6 +88,14 @@ use crate::contracts::{
     ResumeExecutionResult, RevokeLeaseArgs, RevokeLeaseResult,
     StageDependencyEdgeArgs, StageDependencyEdgeResult,
 };
+// RFC-025 worker registry.
+#[cfg(feature = "core")]
+use crate::contracts::{
+    HeartbeatWorkerArgs, HeartbeatWorkerOutcome, ListWorkersArgs, ListWorkersResult,
+    MarkWorkerDeadArgs, MarkWorkerDeadOutcome, RegisterWorkerArgs, RegisterWorkerOutcome,
+};
+#[cfg(feature = "suspension")]
+use crate::contracts::{ListExpiredLeasesArgs, ListExpiredLeasesResult};
 #[cfg(feature = "core")]
 use crate::state::PublicState;
 #[cfg(feature = "core")]
@@ -1871,6 +1879,68 @@ pub trait EngineBackend: Send + Sync + 'static {
     /// Postgres: `SELECT 1`.
     async fn ping(&self) -> Result<(), EngineError> {
         Err(EngineError::Unavailable { op: "ping" })
+    }
+
+    // ── RFC-025 worker registry ────────────────────────────────
+    //
+    // Four core primitives + Phase-6 `list_workers` readback. See
+    // `rfcs/RFC-025-worker-registry.md` for the full design. Default
+    // impls return `Unavailable` so out-of-tree backends keep
+    // compiling; every in-tree backend overrides.
+
+    /// Register (or idempotently refresh) a worker instance. See RFC-025 §4.
+    #[cfg(feature = "core")]
+    async fn register_worker(
+        &self,
+        _args: RegisterWorkerArgs,
+    ) -> Result<RegisterWorkerOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "register_worker",
+        })
+    }
+
+    /// Refresh the worker-instance liveness TTL.
+    #[cfg(feature = "core")]
+    async fn heartbeat_worker(
+        &self,
+        _args: HeartbeatWorkerArgs,
+    ) -> Result<HeartbeatWorkerOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "heartbeat_worker",
+        })
+    }
+
+    /// Operator-driven worker death (distinct from passive TTL expiry).
+    #[cfg(feature = "core")]
+    async fn mark_worker_dead(
+        &self,
+        _args: MarkWorkerDeadArgs,
+    ) -> Result<MarkWorkerDeadOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "mark_worker_dead",
+        })
+    }
+
+    /// Enumerate expired leases for reclaim-decision tooling.
+    #[cfg(feature = "suspension")]
+    async fn list_expired_leases(
+        &self,
+        _args: ListExpiredLeasesArgs,
+    ) -> Result<ListExpiredLeasesResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "list_expired_leases",
+        })
+    }
+
+    /// Enumerate live workers (RFC-025 Phase 6, §9.4).
+    #[cfg(feature = "core")]
+    async fn list_workers(
+        &self,
+        _args: ListWorkersArgs,
+    ) -> Result<ListWorkersResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "list_workers",
+        })
     }
 
     // ── RFC-017 Stage A — Scheduling (1) ───────────────────────
