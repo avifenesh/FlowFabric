@@ -640,3 +640,28 @@ reconcile hook. Consumers embedding `Engine` get backend-agnostic
 scanner routing: PR-7b final scaffolding asserts `Unsupported` on
 PG/SQLite for scanner-shaped calls, and the engine's scanner
 supervisor skips the tick entirely on those backends.
+
+
+## Release: v0.14.0 (RFC-025 worker registry, 2026-05-02)
+
+**cairn #473 — worker-registry primitives (RFC-025):**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `register_worker` | `impl` | `impl` | `impl` | Atomic idempotent register + refresh. Valkey: new `ff_register_worker` Lua FCALL (v32) with KEYS=3 (alive/caps/idx) + ARGV=(instance_id, worker_id, lanes_csv, caps_csv, ttl_ms, now); SET PX (no NX, idempotent overwrite per RFC §9.3) + HSET caps hash + PEXPIRE caps + SADD index. Returns `"registered"` / `"refreshed"`. Postgres: `INSERT INTO ff_worker_registry ON CONFLICT DO UPDATE RETURNING (xmax = 0)` inside a tx; preflight `SELECT ... FOR UPDATE` rejects `worker_instance_id` reassigned under a different `worker_id` with `Validation(InvalidInput, "instance_id reassigned")`. SQLite: preflight SELECT + `INSERT ON CONFLICT DO UPDATE` in a `BEGIN IMMEDIATE` tx (mirrors PG sans partitioning). |
+| `heartbeat_worker` | `impl` | `impl` | `impl` | TTL refresh. Valkey: HGET `ff:worker:{ns}:{inst}:caps` `ttl_ms` → PEXPIRE alive; `PEXPIRE → 0` surfaces as `NotRegistered`. Postgres/SQLite: UPDATE with `last_heartbeat_ms + liveness_ttl_ms > $now` predicate — refuses to revive TTL-expired rows; RETURNING `liveness_ttl_ms` so the caller receives `next_expiry_ms = now + ttl`. Append `'heartbeat'` event row on PG/SQLite. |
+| `mark_worker_dead` | `impl` | `impl` | `impl` | Operator-driven death (distinct from passive TTL expiry). All three backends validate `reason` ≤ 256 bytes + no control chars (`MARK_WORKER_DEAD_REASON_MAX_BYTES`). Valkey: sequential DEL alive + DEL caps + SREM index (atomicity ceiling sufficient per §Non-goals 1). PG/SQLite: DELETE RETURNING 1 → `Marked`; 0 rows → `NotRegistered` (idempotent). Event row `'marked_dead'` with reason. |
+| `list_expired_leases` | `impl` | `impl` | `impl` | Enumerate leases with `expires_at_ms <= as_of`. Cursor is `ExpiredLeasesCursor { expires_at_ms, execution_id }` tuple (§9 locked — stable under equal-expiry). Defaults: `limit = 1000`, `max_partitions_per_call = 32`, cap `limit = 10_000`. Valkey: ZRANGEBYSCORE `ff:idx:{p}:lease_expiry` fanned across `max_partitions_per_call` partitions from cursor's partition offset; merged + sorted. PG: JOIN `ff_attempt` + `ff_exec_core` on existing `ff_attempt_lease_expiry_idx`, namespace filter via `c.raw_fields->>'namespace'`. SQLite: same JOIN, namespace via `json_extract`, `execution_id` hex-normalised for the cursor strict-greater predicate. Synthetic `lease_id` derived byte-identically across PG/SQLite via `synthetic_lease_uuid(exec_uuid, attempt_index, lease_epoch)`. Gate: `all(core, suspension)`. |
+| `list_workers` | `impl` | `impl` | `impl` | Live worker listing for operator tooling (RFC §9.4 scope addition). Namespace-scoped; cross-namespace (`namespace = None`) rejects with `EngineError::Unavailable` on all three backends — single-key `WorkerInstanceId` cursor can't disambiguate across tenants. Valkey: SMEMBERS `ff:idx:{ns}:workers` → HGETALL `ff:worker:{ns}:{inst}:caps` pipeline; TTL-race entries (caps missing) logged at `tracing::debug!` + skipped. PG/SQLite: straight SELECT with `ORDER BY worker_instance_id LIMIT`. `capabilities_csv` parsed via `split(',').filter(|s| !s.is_empty())` on all backends — guards against empty-token idempotency drift. |
+
+**Backend-specific notes:**
+
+- **Valkey key shape:** all RFC-025 writes use namespace-prefixed keys (`ff:worker:{ns}:{inst}:alive` / `:caps`, `ff:idx:{ns}:workers`). The legacy SDK-preamble shape (`ff:worker:{inst}:alive`, `ff:idx:workers`) coexists during Phase 5 rollout; both are read-safe because no writer sees the other's keys. Preamble + unblock-scanner migration to the new shape lands alongside this matrix update.
+
+- **PG partitioning:** `ff_worker_registry` + `ff_worker_registry_event` are both 256-way HASH-partitioned on `partition_key = (fnv1a_u64(worker_instance_id.as_bytes()) % 256)::smallint` — identical derivation to `ff_budget_usage_by_exec` (migration 0020) so register / heartbeat / mark_dead / ttl_sweep all land on the same partition for a given `worker_instance_id`.
+
+- **SQLite flat tables:** per RFC-023 §4.1 A3 (single-writer, no HASH partitioning). `lanes` stored as sorted-joined CSV since SQLite lacks `text[]`.
+
+- **TTL sweep (PG + SQLite):** new `worker_registry_ttl_sweep` scanner, 30s cadence matching `budget_reconciler`. CTE: `DELETE FROM ff_worker_registry WHERE last_heartbeat_ms + liveness_ttl_ms < $now RETURNING ... → INSERT INTO ff_worker_registry_event ('ttl_swept')`. Valkey uses native PEXPIRE, no scanner.
+
+- **RFC-018 Supports flags:** 5 new bools — `register_worker`, `heartbeat_worker`, `mark_worker_dead`, `list_expired_leases`, `list_workers`. All `true` on every in-tree backend at RFC-025 acceptance.
