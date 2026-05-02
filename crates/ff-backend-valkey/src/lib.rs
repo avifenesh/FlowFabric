@@ -9079,10 +9079,11 @@ impl EngineBackend for ValkeyBackend {
             _ => return Ok(HeartbeatWorkerOutcome::NotRegistered),
         };
 
-        // PEXPIRE returns 0 if the alive key no longer exists (TTL
-        // elapsed between HGET and PEXPIRE, or operator-initiated
-        // mark_worker_dead raced us).
-        let pexpire: i64 = self
+        // PEXPIRE returns 1 when the TTL was applied, 0 when the key
+        // is absent (TTL elapsed between HGET and PEXPIRE, or
+        // operator-initiated mark_worker_dead raced us). ferriskey
+        // decodes this as a boolean, not an integer.
+        let pexpire_applied: bool = self
             .client
             .cmd("PEXPIRE")
             .arg(alive_key.as_str())
@@ -9094,7 +9095,7 @@ impl EngineBackend for ValkeyBackend {
                 "heartbeat_worker: PEXPIRE alive",
             ))?;
 
-        if pexpire == 0 {
+        if !pexpire_applied {
             Ok(HeartbeatWorkerOutcome::NotRegistered)
         } else {
             let next_expiry_ms = TimestampMs::from_millis(
