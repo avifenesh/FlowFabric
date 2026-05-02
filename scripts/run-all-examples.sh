@@ -158,7 +158,13 @@ for dir in "$EXAMPLES_DIR"/*/; do
     # ── build (phase 3a) ──
     if [ "$MODE" = "both" ] || [ "$MODE" = "build" ]; then
         echo "[build] $name …"
-        if ! (cd "$dir" && cargo build --locked --bins) >"$LOG_TMP" 2>&1; then
+        # --release matches what the phase-3b run commands use below, so
+        # the default `both` mode compiles each example exactly once
+        # instead of debug-then-release. Callers who want a faster debug-
+        # only build-check can add `--build-only` + set the profile
+        # themselves (future; not exposed today since 3b + 3c all use
+        # release for realistic runtime behaviour).
+        if ! (cd "$dir" && cargo build --locked --release --bins) >"$LOG_TMP" 2>&1; then
             record_fail "$name" "cargo build failed"
             echo
             continue
