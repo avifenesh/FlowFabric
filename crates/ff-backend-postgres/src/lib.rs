@@ -123,6 +123,8 @@ pub mod suspend_ops;
 #[cfg(feature = "core")]
 pub(crate) mod typed_ops;
 pub mod version;
+#[cfg(feature = "core")]
+pub mod worker_registry;
 
 pub use completion::{PostgresCompletionStream, COMPLETION_CHANNEL};
 pub use error::{map_sqlx_error, PostgresTransportError};
@@ -213,6 +215,13 @@ fn postgres_supports_base() -> ff_core::capability::Supports {
     s.list_pending_waitpoints = true;
     s.cancel_flow_header = true;
     s.ack_cancel_member = true;
+
+    // ── RFC-025 Phase 3 — worker registry ──
+    s.register_worker = true;
+    s.heartbeat_worker = true;
+    s.mark_worker_dead = true;
+    s.list_expired_leases = true;
+    s.list_workers = true;
 
     s
 }
@@ -1839,6 +1848,61 @@ impl EngineBackend for PostgresBackend {
             });
         }
         Ok(ms as u64)
+    }
+
+    // ── RFC-025 Phase 3 — worker registry ───────────────────────
+    //
+    // Bodies live in `crate::worker_registry`; the overrides here
+    // just forward to those free functions so the trait
+    // `#[cfg(feature = ..)]` gates match the module-level gate.
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.register_worker", skip_all)]
+    async fn register_worker(
+        &self,
+        args: ff_core::contracts::RegisterWorkerArgs,
+    ) -> Result<ff_core::contracts::RegisterWorkerOutcome, EngineError> {
+        worker_registry::register_worker(&self.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.heartbeat_worker", skip_all)]
+    async fn heartbeat_worker(
+        &self,
+        args: ff_core::contracts::HeartbeatWorkerArgs,
+    ) -> Result<ff_core::contracts::HeartbeatWorkerOutcome, EngineError> {
+        worker_registry::heartbeat_worker(&self.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.mark_worker_dead", skip_all)]
+    async fn mark_worker_dead(
+        &self,
+        args: ff_core::contracts::MarkWorkerDeadArgs,
+    ) -> Result<ff_core::contracts::MarkWorkerDeadOutcome, EngineError> {
+        worker_registry::mark_worker_dead(&self.pool, args).await
+    }
+
+    // List-expired-leases joins ff_attempt+ff_exec_core, which live in
+    // the `worker_registry` module (gated on `core`). Require both
+    // features to keep the body's dep chain intact; a standalone
+    // suspension-only build has no lease-bearing tables to scan.
+    #[cfg(all(feature = "core", feature = "suspension"))]
+    #[tracing::instrument(name = "pg.list_expired_leases", skip_all)]
+    async fn list_expired_leases(
+        &self,
+        args: ff_core::contracts::ListExpiredLeasesArgs,
+    ) -> Result<ff_core::contracts::ListExpiredLeasesResult, EngineError> {
+        worker_registry::list_expired_leases(&self.pool, args).await
+    }
+
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.list_workers", skip_all)]
+    async fn list_workers(
+        &self,
+        args: ff_core::contracts::ListWorkersArgs,
+    ) -> Result<ff_core::contracts::ListWorkersResult, EngineError> {
+        worker_registry::list_workers(&self.pool, args).await
     }
 }
 

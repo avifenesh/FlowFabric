@@ -17,9 +17,15 @@ description = "FlowFabric EngineBackend impl — Postgres backend (RFC-v0.7, Wav
 # write surface; ff-backend-valkey takes the same stance via its
 # hard ff-core feature activation). `streaming` tracks ff-core's
 # `streaming` default.
-default = ["core", "streaming"]
+default = ["core", "streaming", "suspension"]
 core = ["ff-core/core"]
 streaming = ["ff-core/streaming"]
+# RFC-025 Phase 3: `list_expired_leases` trait method rides `ff-core`'s
+# `suspension` gate (the method reads lease/attempt state coupled with
+# suspend). Default-on so the in-tree release feature-set keeps parity
+# with Valkey + SQLite; downstream consumers can disable via
+# `default-features = false`.
+suspension = ["ff-core/suspension"]
 # Issue #154 — enable real OTEL metric emission via `ff-observability`.
 # Off by default; mirrors `ff-backend-valkey`.
 observability = ["ff-observability/enabled"]
@@ -28,7 +34,7 @@ observability = ["ff-observability/enabled"]
 # Wave 0: `core`, `suspension`, `budget` match ff-backend-valkey's
 # ff-core feature set so the Postgres backend honours the same
 # `EngineBackend` method surface.
-ff-core = { version = "0.13.0", path = "../ff-core", default-features = false, features = ["core"] }
+ff-core = { version = "0.13.0", path = "../ff-core", default-features = false, features = ["core", "suspension"] }
 # Always-present observability shim (no-op unless `observability`
 # feature flips the shim to real OTEL). Mirrors ff-backend-valkey.
 ff-observability = { workspace = true }
