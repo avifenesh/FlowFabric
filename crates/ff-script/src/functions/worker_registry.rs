@@ -13,14 +13,18 @@ use crate::result::{FcallResult, FromFcallResult};
 
 impl FromFcallResult for RegisterWorkerOutcome {
     fn from_fcall_result(raw: &ferriskey::Value) -> Result<Self, ScriptError> {
+        // Lua convention (RFC-010 §4.9): ok("registered") returns
+        // `{1, "OK", "registered"}`. `status` = "OK"; the variant tag
+        // lives in `fields[0]` (elem[2] of the raw array).
         let r = FcallResult::parse(raw)?.into_success()?;
-        match r.status.as_str() {
+        let tag = r.field_str(0);
+        match tag.as_str() {
             "registered" => Ok(RegisterWorkerOutcome::Registered),
             "refreshed" => Ok(RegisterWorkerOutcome::Refreshed),
             other => Err(ScriptError::Parse {
                 fcall: "ff_register_worker".into(),
                 execution_id: None,
-                message: format!("unexpected status: {other}"),
+                message: format!("unexpected outcome tag: {other:?}"),
             }),
         }
     }
