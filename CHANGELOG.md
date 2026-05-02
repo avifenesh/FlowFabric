@@ -7,6 +7,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`scripts/run-all-examples.sh` phase 3c.v** — `deploy-approval`
+  HITL orchestration. New `run_deploy_approval()` function spawns
+  the 6-worker choreography (build + 3× test kinds + deploy +
+  verify), submits a flow, parses flow_id / deploy_eid /
+  waitpoint_id from the bg logs, fires two distinct-source approves
+  (alice appends, bob resumes), then waits for
+  `deploy_full_rollout_completed` + `verify_completed` markers.
+  All children killed on exit via local trap-equivalent. ff-server's
+  FF_LANES broadened from `default` to
+  `default,build,test,deploy,verify` (union of every lane any
+  example uses — harmless for examples that don't use the extras).
+  Sweep today: **9 PASS / 4 SKIP / 0 FAIL**. Only remaining SKIPs
+  are 3d (LLM-dependent) + grafana (no Cargo).
 - **`scripts/run-all-examples.sh` phase 3c.iii+3c.iv** — ff-server
   lifecycle helpers + 3 new live-runs (`retry-and-cancel`,
   `v010-read-side-ergonomics`, `token-budget`). The harness
