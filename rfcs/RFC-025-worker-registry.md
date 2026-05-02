@@ -50,20 +50,28 @@ Added to `ff_core::engine_backend::EngineBackend`, all four gated behind an exis
 pub struct RegisterWorkerArgs {
     pub worker_id: WorkerId,
     pub worker_instance_id: WorkerInstanceId,
-    pub lane_id: LaneId,
+    /// Workers serve one-or-more lanes; BTreeSet for stable iteration
+    /// + dedup. A worker advertising `{"default","build"}` is
+    /// addressable from both lanes' claim queues. Rev-3 fix: was
+    /// `lane_id: LaneId` in Rev-1 — single-lane forced N round-trips
+    /// per multi-lane worker.
+    pub lanes: BTreeSet<LaneId>,
     pub capabilities: BTreeSet<String>,
-    /// Liveness TTL. Operator-observable key expires after this
-    /// window unless heartbeated; cleared on mark_worker_dead.
+    /// Liveness TTL. Stored alongside the registration so
+    /// `heartbeat_worker` refreshes to the same value without the
+    /// caller re-supplying it.
     pub liveness_ttl_ms: u64,
     /// Opaque `namespace` — isolates multi-tenant deployments.
     pub namespace: Namespace,
     pub now: TimestampMs,
 }
 
-/// Result of `register_worker`. Registration is idempotent: re-
-/// registering with the same `(worker_id, worker_instance_id)`
-/// refreshes TTL + overwrites caps (the stateless operator reboot
-/// path). Re-registering with the same `worker_instance_id` under a
+/// Result of `register_worker`. Registration is idempotent:
+///   * `Registered` — no prior live key for this `worker_instance_id`
+///     (fresh boot or post-TTL-expiry).
+///   * `Refreshed` — existing live key was found; TTL reset +
+///     caps/lanes overwritten (in-process hot-restart).
+/// Re-registering with the same `worker_instance_id` under a
 /// DIFFERENT `worker_id` is rejected with
 /// `Validation(InvalidInput, "instance_id reassigned")`.
 #[non_exhaustive]
@@ -72,6 +80,7 @@ pub enum RegisterWorkerOutcome {
     Refreshed,
 }
 
+/// Feature gate: `core`.
 async fn register_worker(
     &self,
     args: RegisterWorkerArgs,
@@ -89,13 +98,16 @@ pub struct HeartbeatWorkerArgs {
 
 #[non_exhaustive]
 pub enum HeartbeatWorkerOutcome {
-    Refreshed { last_heartbeat_ms: TimestampMs },
-    /// Instance's liveness key was already absent — TTL ran out or
-    /// operator invoked `mark_worker_dead` earlier. Caller's job is
-    /// to re-register, not to re-heartbeat.
+    /// TTL refreshed. `next_expiry_ms = now + last-registered ttl`
+    /// — stored at register-time, not re-supplied by caller.
+    /// Callers schedule the next heartbeat from this value.
+    Refreshed { next_expiry_ms: TimestampMs },
+    /// Liveness key was absent — TTL ran out or `mark_worker_dead`
+    /// landed earlier. Caller re-registers, not re-heartbeats.
     NotRegistered,
 }
 
+/// Feature gate: `core`.
 async fn heartbeat_worker(
     &self,
     args: HeartbeatWorkerArgs,
@@ -103,15 +115,16 @@ async fn heartbeat_worker(
     Err(EngineError::Unavailable { op: "heartbeat_worker" })
 }
 
-/// Args for `mark_worker_dead`. Explicit operator action; distinct
-/// from passive TTL expiry (`NotRegistered` on next heartbeat).
+/// Args for `mark_worker_dead`. Explicit operator action.
+///
+/// `reason` is capped at 256 bytes and must not contain control
+/// characters; oversize / invalid reject with
+/// `Validation(InvalidInput, "reason: …")`. Mirrors
+/// `fail_execution`'s `failure_reason` discipline.
 #[non_exhaustive]
 pub struct MarkWorkerDeadArgs {
     pub worker_instance_id: WorkerInstanceId,
     pub namespace: Namespace,
-    /// Free-form text retained on the operator event emitted
-    /// downstream (RFC-019 lease-event stream gains a
-    /// `WorkerDeathRecorded` variant in this RFC).
     pub reason: String,
     pub now: TimestampMs,
 }
@@ -119,10 +132,13 @@ pub struct MarkWorkerDeadArgs {
 #[non_exhaustive]
 pub enum MarkWorkerDeadOutcome {
     Marked,
-    /// The instance was already absent — no-op, idempotent.
-    AlreadyAbsent,
+    /// Liveness key already absent — no-op, idempotent. Unified
+    /// variant name with `HeartbeatWorkerOutcome::NotRegistered`
+    /// for cross-method consistency.
+    NotRegistered,
 }
 
+/// Feature gate: `core`.
 async fn mark_worker_dead(
     &self,
     args: MarkWorkerDeadArgs,
@@ -130,19 +146,40 @@ async fn mark_worker_dead(
     Err(EngineError::Unavailable { op: "mark_worker_dead" })
 }
 
-/// Args for `list_expired_leases`. Pagination matches
-/// `ListPendingWaitpointsArgs`: `after` = cursor, `limit` = max
-/// page size, backend-enforced cap (1000).
+/// Cursor for `list_expired_leases`. Tuple (not bare `ExecutionId`)
+/// so pagination is stable under equal-expiry: ZRANGEBYSCORE with
+/// `LIMIT` keyed on score alone duplicates or skips when two leases
+/// share a millisecond. Backends order strictly by
+/// `(expires_at_ms ASC, execution_id ASC)`.
+///
+/// Example: `ExpiredLeasesCursor { expires_at_ms: TimestampMs::new(1_715_856_000_000), execution_id: ExecutionId::parse("{fp:7}:11111111-2222-3333-4444-555555555555").unwrap() }`.
+#[non_exhaustive]
+pub struct ExpiredLeasesCursor {
+    pub expires_at_ms: TimestampMs,
+    pub execution_id: ExecutionId,
+}
+
+/// Args for `list_expired_leases`.
+///
+/// Per-call partition fan-out capped at `PARTITION_SCAN_CHUNK`
+/// (32, matching unblock scanner's rolling-window convention) so
+/// latency stays bounded on Valkey. Callers sweep full keyspace
+/// across iterations via `after`, not per-call.
 #[non_exhaustive]
 pub struct ListExpiredLeasesArgs {
-    /// Expiry threshold — every returned lease has
-    /// `expires_at_ms <= as_of`. The caller's `now_ms` on hot paths;
-    /// in tests, a pinned past timestamp.
+    /// Every returned lease has `expires_at_ms <= as_of`. Caller's
+    /// `now_ms` on hot paths; pinned-past in tests.
     pub as_of: TimestampMs,
     /// Exclusive pagination cursor. `None` = scan from earliest.
-    pub after: Option<ExecutionId>,
+    pub after: Option<ExpiredLeasesCursor>,
+    /// Default 1000 when `None`; backend cap 10_000 for bulk scans.
     pub limit: Option<u32>,
-    pub namespace: Namespace,
+    /// Max partitions to fan across per call. Default 32 when `None`.
+    pub max_partitions_per_call: Option<u32>,
+    /// `None` = cross-namespace sweep for operator tooling (auth
+    /// enforced at ff-server admin route, NOT the trait boundary).
+    /// `Some(ns)` = per-tenant scope, cairn's default.
+    pub namespace: Option<Namespace>,
 }
 
 #[non_exhaustive]
@@ -158,9 +195,10 @@ pub struct ExpiredLeaseInfo {
 #[non_exhaustive]
 pub struct ListExpiredLeasesResult {
     pub entries: Vec<ExpiredLeaseInfo>,
-    pub cursor: Option<ExecutionId>,
+    pub cursor: Option<ExpiredLeasesCursor>,
 }
 
+/// Feature gate: `suspension` (reads lease/attempt state).
 async fn list_expired_leases(
     &self,
     args: ListExpiredLeasesArgs,
@@ -169,43 +207,67 @@ async fn list_expired_leases(
 }
 ```
 
-**Default impls return `EngineError::Unavailable`** so out-of-tree backends keep compiling. Every in-tree backend overrides.
+**Default impls return `EngineError::Unavailable`** so out-of-tree backends keep compiling. Every in-tree backend overrides. Paired with four RFC-018 `Supports.*` flags: `register_worker`, `heartbeat_worker`, `mark_worker_dead`, `list_expired_leases` — all `true` on every in-tree impl at RFC completion.
 
 ## 5. Per-backend delivery
 
 ### 5.1 Valkey
 
-All four methods route to existing keys (no new Lua functions; no FCALL_LIBRARY version bump):
+`register_worker` lands as a new atomic Lua FCALL; heartbeat + mark_dead + list_expired stay as direct commands (each atomic on its own). `FLOWFABRIC_LIB_VERSION` bumps.
 
 | Method | Impl |
 |---|---|
-| `register_worker` | `SET ff:worker:{inst}:alive 1 NX PX <ttl>` + `SET ff:worker:{inst}:caps <csv>` + `SADD ff:idx:workers {inst}` — identical to `valkey_preamble::run` today; SDK preamble calls this method instead of duplicating. |
-| `heartbeat_worker` | `PEXPIRE ff:worker:{inst}:alive <ttl>`. `0` reply → `NotRegistered` (key absent). |
-| `mark_worker_dead` | `DEL ff:worker:{inst}:alive ff:worker:{inst}:caps` + `SREM ff:idx:workers {inst}` + emit operator event via existing RFC-019 stream (new `WorkerDeathRecorded` variant). |
-| `list_expired_leases` | `ZRANGEBYSCORE ff:idx:{p}:lease_expiry -inf <as_of> LIMIT 0 <limit>` fanned across partitions; merged + sorted by score in memory. Cursor is the last-seen execution id. |
+| `register_worker` | New FCALL `ff_register_worker`, KEYS=3 (`alive`, `caps_hash`, `idx_workers`), ARGV=(worker_id, lanes_csv, caps_csv, ttl_ms, now). Body: SET NX PX alive + HSET caps_hash {worker_id, lanes_csv, caps_csv, ttl_ms} + SADD idx_workers. Atomic; concurrent mark_worker_dead can't interleave. Returns `"registered"` or `"refreshed"`. |
+| `heartbeat_worker` | HGET `ff:worker:{inst}:caps` ttl_ms (single round-trip) → PEXPIRE `ff:worker:{inst}:alive <ttl>`. `0` reply → `NotRegistered`. Refreshed branch computes `next_expiry_ms = now + ttl`. |
+| `mark_worker_dead` | MULTI/EXEC: DEL alive + DEL caps + SREM idx_workers. Atomic via MULTI. reason-string validation at trait ingress. |
+| `list_expired_leases` | `ZRANGEBYSCORE ff:idx:{p}:lease_expiry -inf <as_of> WITHSCORES LIMIT 0 <limit>` fanned across `max_partitions_per_call` partitions starting from cursor's partition offset; merged + sorted by `(expires_at_ms, execution_id)`. Cursor is `ExpiredLeasesCursor`. |
 
-**Effort:** ~150 LOC net (mostly plumbing; the SDK preamble refactor extracts logic, doesn't add it).
+**Effort:** ~200 LOC net — `ff_register_worker` Lua (~15 lines) + 4 Rust bodies + SDK preamble compat test.
 
 ### 5.2 Postgres
 
-New table:
+Migration 0021 lands two tables:
 
 ```sql
+-- Current state (one row per live worker_instance_id).
 CREATE TABLE ff_worker_registry (
+    -- fnv1a_u64(worker_instance_id.as_bytes()) % 256 as smallint.
+    -- Documented derivation rule — both register + heartbeat +
+    -- mark_worker_dead compute the same partition for the same id.
     partition_key          smallint NOT NULL,
     namespace              text     NOT NULL,
     worker_instance_id     text     NOT NULL,
     worker_id              text     NOT NULL,
-    lane_id                text     NOT NULL,
+    -- lanes as text[] since a worker serves one-or-more lanes
+    -- (Rev-3 fix). Stored sorted so equality-checks are stable.
+    lanes                  text[]   NOT NULL,
     capabilities_csv       text     NOT NULL,
     last_heartbeat_ms      bigint   NOT NULL,
     liveness_ttl_ms        bigint   NOT NULL,
-    state                  text     NOT NULL, -- 'alive' | 'dead'
-    dead_reason            text     NULL,
+    registered_at_ms       bigint   NOT NULL,
     PRIMARY KEY (partition_key, namespace, worker_instance_id)
 ) PARTITION BY HASH (partition_key);
--- 256 hash partitions, mirrors ff_budget_usage_by_exec's shape
+-- 256 hash partitions, mirrors ff_budget_usage_by_exec's shape.
+
+-- Append-only audit trail. Shape supports future operator-tooling
+-- (listing recently-dead workers, registration bursts) without a
+-- 0022 migration churn. Unused by this RFC's bodies; written to
+-- by mark_worker_dead + the TTL-sweep scanner.
+CREATE TABLE ff_worker_registry_event (
+    partition_key          smallint NOT NULL,
+    namespace              text     NOT NULL,
+    worker_instance_id     text     NOT NULL,
+    -- 'registered' | 'heartbeat' | 'marked_dead' | 'ttl_swept'
+    event_kind             text     NOT NULL,
+    event_at_ms            bigint   NOT NULL,
+    -- Free-form; populated from MarkWorkerDeadArgs.reason for
+    -- mark_dead events, null otherwise.
+    reason                 text     NULL,
+    PRIMARY KEY (partition_key, namespace, worker_instance_id, event_at_ms)
+) PARTITION BY HASH (partition_key);
 ```
+
+Plus a new TTL-sweep scanner (§5.4 below).
 
 `list_expired_leases` uses the existing `ff_attempt` + `ff_exec_core` join, keyed on a new expiry index:
 
@@ -219,7 +281,19 @@ Partial index keeps the scan small (only live leases). Migration `0021_worker_re
 
 ### 5.3 SQLite
 
-Mirror the PG schema, flat table (no partitioning per RFC-023 §4.1 A3). Migration `0021_worker_registry.sql` sibling.
+Mirror the PG schema, flat tables (no partitioning per RFC-023 §4.1 A3). Migration `0021_worker_registry.sql` sibling. `lanes` stored as text (sorted-joined CSV) since SQLite lacks text[]; encoding matches Valkey's CSV.
+
+### 5.4 PG/SQLite TTL sweep scanner
+
+New scanner `ff_worker_registry_ttl_sweep`, per-partition, 30s interval matching the existing `budget_reconciler` cadence. Body:
+
+```sql
+DELETE FROM ff_worker_registry
+WHERE partition_key = $1
+  AND last_heartbeat_ms + liveness_ttl_ms < $2;  -- $2 = now_ms
+```
+
+Each eviction appends a `'ttl_swept'` event to `ff_worker_registry_event`. Without this, rows persist past declared liveness and `heartbeat_worker` returns `Refreshed` on a logically-dead row. Valkey's native PEXPIRE handles this natively; PG/SQLite need the explicit sweep.
 
 **Delivery phasing** (mirrors #453/#454):
 - Phase 1: RFC accept + types/contracts in `ff_core::contracts`.
@@ -233,12 +307,25 @@ Mirror the PG schema, flat table (no partitioning per RFC-023 §4.1 A3). Migrati
 
 ## 6. Non-goals
 
-1. **Worker fencing at the Lua/SQL layer.** Concurrent register of the same `worker_instance_id` is rejected at FF trait ingress via `Validation(InvalidInput)` — not a backend-atomic guard. Mirrors today's SDK preamble behaviour.
-2. **Worker discovery / listing of live workers.** Cairn asked for *register / heartbeat / mark_dead / list_expired_leases*; a generic `list_workers` is deferred. If operators need it later, add `ListWorkersArgs` as a separate method — this RFC doesn't pre-build it.
-3. **Lease reclaim dispatch.** `list_expired_leases` returns the data; the *decision* to reclaim (via `reclaim_execution`, RFC-024) stays with the caller. FF doesn't auto-reclaim behind the scenes.
+1. **Worker fencing at the SQL layer.** Concurrent register of the same `worker_instance_id` is rejected at FF trait ingress via `Validation(InvalidInput)`. On Valkey, `ff_register_worker`'s FCALL atomicity covers the SET+HSET+SADD race. On PG/SQLite, the `(partition_key, namespace, worker_instance_id)` PK + `ON CONFLICT DO UPDATE` path handles concurrent register idempotently.
+2. **Worker discovery / listing live workers.** Cairn asked for register/heartbeat/mark_dead/list_expired_leases; a generic `list_workers` is a known future addition rather than principled deferral — operator-tooling for "who's running right now" is obvious follow-on work. Not in this RFC.
+3. **Lease reclaim dispatch.** `list_expired_leases` returns data; the *decision* to reclaim (via `reclaim_execution`, RFC-024) stays with the caller. FF doesn't auto-reclaim behind the scenes.
 4. **Cross-partition global worker identity.** `worker_instance_id` is unique within `(namespace, partition)`; two namespaces can reuse the same string. Matches current Valkey shape.
+5. **Worker-to-lane fencing at the storage layer.** Nothing in this RFC prevents two workers advertising the same lane + same caps; scheduler-side admission (RFC-012 claim_for_worker) already handles that contention fairly. Adding fencing would duplicate existing logic.
+6. **Per-worker backpressure signals.** No `current_in_flight_count` field on the registration row. Consumers that want that signal can maintain it out-of-band.
+7. **Worker restart-crash-loop detection.** Heartbeat cadence + `last_heartbeat_ms` gives the raw data; detection logic belongs in operator tooling, not the trait.
+8. **Cross-worker leader election.** Any orchestrator-level leader-election (e.g. for cron dispatching) is consumer-layer and orthogonal to this RFC.
+9. **Worker-stats aggregation / operator-event stream.** Deferred to a future RFC alongside any operator event stream (likely the same RFC that introduces cross-worker dashboards).
 
-## 7. Consumer migration
+## 7. Terminology glossary
+
+Used throughout this RFC; added as a standing glossary for future consumer RFCs that need to distinguish.
+
+- **`worker_id` (FF)** — pool / logical identity. Stable across restarts. Multiple worker processes (instances) can share the same `worker_id` (horizontal scale-out of a worker pool).
+- **`worker_instance_id` (FF)** — process identity. Unique per-boot. Identifies the specific OS process a lease is held by.
+- **`worker_id` (cairn upstream)** — maps to FF's `worker_instance_id`. Cairn's adapter layer performs the rename; FF's trait doesn't bend to the consumer's naming.
+
+## 8. Consumer migration
 
 Cairn's current Valkey-specific worker registry (`cairn-fabric::engine::valkey_impl`) drops once the trait ships:
 
@@ -297,22 +384,28 @@ Eight changes on top of rev-3:
 7. **§Non-goals sweep.** Six additions: `list_workers` (see §F1 — acknowledged as known future addition, not principled deferral), `worker-to-lane fencing at the storage layer`, `per-worker backpressure signals`, `worker restart-crash-loop detection`, `cross-worker leader election`, `worker-stats aggregation` (future operator event stream). Each one-line with a pointer at what might motivate adding it later.
 8. **§Risks expanded.** Three new entries: (a) ff-backend-postgres version pin during cairn rollout (schema drift hazard); (b) `list_expired_leases` performance under >10k live leases — explain-analyze required in the PR's §9 release gate; (c) TTL sweep scanner correctness — test-fixture pinned to fire the TTL-driven deletion AND the `mark_worker_dead` deletion, assert idempotency + ordering.
 
-## 8. Open questions (adjudicate before accept)
+## 9. Open questions (adjudicate before accept)
 
-1. **Feature gating.** `core` (always on), `suspension`, or a new `worker-registry` feature? Lease-expiry coupling with suspend state argues for `suspension`; cairn's registration is orthogonal to suspend.
-2. **Namespace granularity.** Should `worker_instance_id` be unique across the whole Valkey keyspace, or per-namespace? Current preamble treats it as global (`ff:worker:{id}`); per-namespace would require a schema bump.
-3. **Expired-lease cursor type.** `ExecutionId` vs `(expires_at_ms, ExecutionId)` tuple. Tuple is paging-stable (ZRANGEBYSCORE semantics); simple id loses a tiebreaker on equal expiry. Lean tuple, but cairn didn't specify.
-4. **`WorkerDeathRecorded` operator-event payload.** Goes through the RFC-019 stream; what fields? At minimum `(worker_instance_id, reason, now, affected_lease_ids)`. Affected lease enumeration requires a secondary scan — make it optional?
-5. **`list_expired_leases` cross-namespace.** Operator tooling wanting to sweep every namespace — separate method, or a `namespace: Option<Namespace>` variant? Lean separate method for explicit scope.
+Items locked in through rev-2/3/4 (not open):
+- Expired-lease cursor type → `(expires_at_ms, ExecutionId)` tuple (rev-2).
+- `list_expired_leases` cross-namespace → `namespace: Option<Namespace>` variant (rev-3).
+- Operator-event payload → deferred entirely to a future operator-event RFC (rev-3).
 
-## 9. Release gate / acceptance
+Still open for owner adjudication:
+
+1. **Namespace granularity of `worker_instance_id` uniqueness.** Current Valkey key is `ff:worker:{id}:alive` — global (no namespace prefix). PG schema PK includes `namespace`. Should Valkey also namespace-prefix (`ff:worker:{namespace}:{id}:alive`)? Requires schema bump but aligns with PG. Alternative: keep Valkey global and document namespace as logical-only.
+2. **`max_partitions_per_call` default.** 32 (matches unblock scanner) or smaller (16) for tighter latency at cost of more round trips? Depends on cairn's reclaim-scanner tick cadence.
+3. **Whether `ff_register_worker` Lua should be idempotent on caps/lanes change.** If caller re-registers with DIFFERENT caps or lanes under the same `worker_instance_id` — Refreshed (overwrite) or Rejected (Validation)? Leaning Refreshed for operational ergonomics; argument for Rejected is caught-early drift detection.
+4. **Operator-tooling `list_workers` follow-on.** Land in this RFC's Phase 6 as an add-on (cheap given the state table exists), or defer to a separate RFC as originally planned? 5-minute decision with no delivery impact either way.
+
+## 10. Release gate / acceptance
 
 - All four methods shipped on all three backends; no `Unavailable` in any in-tree impl.
 - CLAUDE.md §5 full release gate (smoke, examples live-run via `scripts/run-all-examples.sh` phase 3e harness, new headline example for worker-registry round trip).
 - `docs/POSTGRES_PARITY_MATRIX.md` gains four rows, all `impl` on all three backends.
 - Cairn's `valkey_impl` / `postgres_control_plane_impl` both swap to trait dispatch in the same wave (cairn PR-C5).
 
-## 10. Risks
+## 11. Risks
 
 - **Schema bump on PG/SQLite** — migration 0021 lands under sqlx check; no shape of `ff_exec_core` / `ff_attempt` changes.
 - **SDK preamble refactor** — the one consumer-breaking shape is if the preamble's current `SET ff:worker:{id}:alive NX` semantics drift; we preserve NX (duplicate-instance guard) via the trait's `Validation(InvalidInput, "instance_id reassigned")`. No wire-level change.
