@@ -63,16 +63,24 @@ check_valkey() {
     elif command -v redis-cli >/dev/null 2>&1; then
         probe="redis-cli"
     else
-        # No CLI tool — fall through to a /dev/tcp probe. Bash opens
-        # TCP sockets via /dev/tcp/<host>/<port>; if the connect
-        # succeeds we treat Valkey as reachable (we can't PING without
-        # a client).
-        if (exec 3<>"/dev/tcp/$VALKEY_HOST/$VALKEY_PORT") 2>/dev/null; then
-            exec 3<&-; exec 3>&-
+        # No CLI tool — use a RESP-level probe over bash's /dev/tcp.
+        # Sends the inline `PING\r\n` command and checks for `+PONG`
+        # in the reply, so an unrelated process listening on the port
+        # is correctly reported as not-Valkey rather than a false
+        # ready. All inside a subshell so the FD is released on exit.
+        if (
+            exec 3<>"/dev/tcp/$VALKEY_HOST/$VALKEY_PORT" 2>/dev/null || exit 1
+            printf 'PING\r\n' >&3
+            # Short read with a timeout so we don't hang on a silent
+            # listener. `read -t` wants fractional seconds on Bash 4+;
+            # pass an integer for 3.2 compat.
+            IFS= read -r -t 2 reply <&3 || exit 2
+            case "$reply" in *PONG*) exit 0 ;; *) exit 3 ;; esac
+        ); then
             VALKEY_READY=1
-            return 0
+        else
+            VALKEY_READY=0
         fi
-        VALKEY_READY=0
         return 0
     fi
     if "$probe" -h "$VALKEY_HOST" -p "$VALKEY_PORT" PING 2>/dev/null | grep -q PONG; then
@@ -131,7 +139,12 @@ run_cmd() {
             # sqlite flag. Stay on the sqlite path for CI.
             echo "FF_DEV_MODE=1 ${t}cargo run --locked --release -- --backend sqlite" ;;
         v013-cairn-454-budget-ledger)
-            echo "${t}cargo run --locked --release --bin budget-ledger" ;;
+            # Pipe VALKEY_HOST/PORT through the example's own
+            # `FF_DEMO_VALKEY_HOST/PORT` knobs so a caller overriding
+            # FF_HOST/FF_PORT sees preflight and run hit the *same*
+            # socket. Without this, `FF_HOST=remote` would preflight
+            # against remote but run against localhost.
+            echo "FF_DEMO_VALKEY_HOST='$VALKEY_HOST' FF_DEMO_VALKEY_PORT='$VALKEY_PORT' ${t}cargo run --locked --release --bin budget-ledger" ;;
         *)
             echo "" ;;
     esac
