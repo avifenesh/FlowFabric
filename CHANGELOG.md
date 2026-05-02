@@ -7,6 +7,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`scripts/run-all-examples.sh` phase 3c.i** — two more live-runs
+  + a Valkey preflight helper. `incident-remediation` (SQLite embedded
+  path — the Valkey path errors out asking for a scheduler+scanner
+  deployment, per its own hint) and `v013-cairn-454-budget-ledger`
+  (Valkey trait-direct) both move from SKIP to PASS. New per-example
+  `requires()` metadata with a preflight dispatcher: missing fixtures
+  SKIP with an actionable "bring it up" message (e.g. "valkey
+  unreachable at localhost:6379 — start valkey-server and re-run")
+  instead of failing cryptically inside the example. The Valkey probe
+  prefers `valkey-cli`, falls back to `redis-cli`, falls back to a
+  bare `/dev/tcp` socket probe. Sweep today: 4 PASS / 9 SKIP / 0 FAIL.
 - **`scripts/run-all-examples.sh` phase 3b** — live-run coverage for
   the two examples that have no external dependency beyond the
   bundled SQLite: `ff-dev` (`FF_DEV_MODE=1`) and `external-callback
