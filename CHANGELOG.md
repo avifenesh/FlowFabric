@@ -7,6 +7,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`scripts/lint-grafana-dashboard.sh`** (phase 3f) — jq-based
+  validation of `examples/grafana/flowfabric-ops.json`. Checks valid
+  JSON, required top-level keys (`title`, `panels`, `schemaVersion`,
+  `uid`), non-empty panel array, every panel has `id`/`title`/`type`/
+  `gridPos`, `uid` is non-empty, `schemaVersion >= 36` (Grafana 9+).
+  Invoked as grafana's `run_cmd` in the harness — flips grafana from
+  SKIP to PASS. Sweep today: **10 PASS / 3 SKIP / 0 FAIL**. Only
+  remaining SKIPs are 3d LLM-dependent (pre-release-local). CI
+  workflow grows `jq` in its `apt-get` step.
 - **`.github/workflows/examples.yml`** (phase 3e) — CI wiring for the
   run-all-examples harness. Single job on ubuntu-latest with Valkey 8
   (alpine) + Postgres 16 (alpine) services; triggers on PRs + pushes
