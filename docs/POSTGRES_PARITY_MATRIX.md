@@ -665,3 +665,24 @@ supervisor skips the tick entirely on those backends.
 - **TTL sweep (PG + SQLite):** new `worker_registry_ttl_sweep` scanner, 30s cadence matching `budget_reconciler`. CTE: `DELETE FROM ff_worker_registry WHERE last_heartbeat_ms + liveness_ttl_ms < $now RETURNING ... → INSERT INTO ff_worker_registry_event ('ttl_swept')`. Valkey uses native PEXPIRE, no scanner.
 
 - **RFC-018 Supports flags:** 5 new bools — `register_worker`, `heartbeat_worker`, `mark_worker_dead`, `list_expired_leases`, `list_workers`. All `true` on every in-tree backend at RFC-025 acceptance.
+
+## Release: v0.15.0 (FF #511 scheduler-agnostic, 2026-05-03)
+
+**cairn #511 — drop `ferriskey::Client` coupling from `ff_scheduler::Scheduler`:**
+
+| Method | Valkey | Postgres | SQLite | Notes |
+|---|---|---|---|---|
+| `release_admission` | `impl` | `impl` | `impl` | Idempotent quota-admission slot release. Valkey wraps the pre-#511 `ff_release_admission` FCALL; PG/SQLite `DELETE ff_quota_admitted` + `UPDATE active_concurrency = GREATEST(c-1, 0)` in one tx. |
+| `read_quota_policy_limits` | `impl` | `impl` | `impl` | Typed snapshot of `(max_requests_per_window, requests_per_window_seconds, active_concurrency_cap, jitter_ms)`. Valkey: single HMGET. PG/SQLite: SELECT (no `jitter_ms` column; defaults to 0). Returns `None` when the policy row is absent. |
+| `block_execution_for_admission` | `impl` | `Unavailable` | `Unavailable` | Generalised admission block covering budget/quota/capability reason codes via the `BlockingReason` enum. Valkey routes to `ff:idx:{p}:lane:{lane}:blocked_<reason>` via the existing Lua FCALL. PG/SQLite stay `Unavailable` — scheduler is a Valkey-only concept; PG/SQLite wire native claim paths. |
+| `read_budget_usage_and_limits` | `impl` | `Unavailable` | `Unavailable` | Typed snapshot of a budget's HGETALL limits + per-dim HGET usage. Same Valkey-only posture — scheduler path. |
+
+**`Scheduler` refactor (FF #511 Phase 2c + Phase 3):**
+
+- `Scheduler.backend: Weak<dyn EngineBackend>` — admission primitives route through the trait (6 call-sites migrated: `server_time_ms`, `read_quota_policy_limits`, `check_admission`, `block_execution_for_admission`, `release_admission`, `issue_claim_grant`).
+- `Scheduler.client: Option<ferriskey::Client>` — `Some` on Valkey deploys (scanner ZRANGEBYSCORE + handful of exec_core HGETs still need direct access); `None` on backend-only deploys. `claim_for_worker` short-circuits to `Ok(None)` when client is None — PG/SQLite consumers wire their own native claim paths (`PostgresScheduler`, `SqliteBackend::claim_for_worker`).
+- New `Scheduler::new_with_backend(weak_backend, config)` constructor — no ferriskey argument.
+
+**Why the cycle is safe:** Scheduler holds `Weak<dyn EngineBackend>`, not `Arc`. Valkey and Postgres backends embed the Scheduler inside their struct; an Arc cycle would leak both. Upgrade-or-degrade pattern on every scheduler call handles the rare backend-dropped-mid-tick case by returning `SchedulerError::Config`.
+
+**RFC-018 Supports flags:** `release_admission`, `read_quota_policy_limits`, `block_execution_for_admission`, `read_budget_usage_and_limits` — 4 new bools. `release_admission` + `read_quota_policy_limits` on all 3 backends; the other 2 on Valkey only.
