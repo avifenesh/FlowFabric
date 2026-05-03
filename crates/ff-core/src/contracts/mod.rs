@@ -2070,6 +2070,47 @@ pub enum ReleaseAdmissionResult {
     Released,
 }
 
+// ─── read_quota_policy_limits (FF #511 Phase 2a) ───
+
+/// Typed snapshot of the admission-relevant fields on a quota policy.
+/// Returned by [`crate::engine_backend::EngineBackend::read_quota_policy_limits`]
+/// so the scheduler can make admission decisions without reaching
+/// directly at Valkey-shaped HGETs on `ff:quota:{K}:def`.
+///
+/// Fields match the Lua contract for `ff_check_admission_and_record`.
+/// Zero values are the well-defined "no limit" signal (the scheduler
+/// skips admission when both `max_requests_per_window` and
+/// `active_concurrency_cap` are zero).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct QuotaPolicyLimits {
+    pub max_requests_per_window: u64,
+    pub requests_per_window_seconds: u64,
+    pub active_concurrency_cap: u64,
+    pub jitter_ms: u64,
+}
+
+impl QuotaPolicyLimits {
+    pub fn new(
+        max_requests_per_window: u64,
+        requests_per_window_seconds: u64,
+        active_concurrency_cap: u64,
+        jitter_ms: u64,
+    ) -> Self {
+        Self {
+            max_requests_per_window,
+            requests_per_window_seconds,
+            active_concurrency_cap,
+            jitter_ms,
+        }
+    }
+
+    /// Policy declares no admission limits — caller skips admission.
+    pub fn is_unlimited(&self) -> bool {
+        self.max_requests_per_window == 0 && self.active_concurrency_cap == 0
+    }
+}
+
 // ─── block_execution_for_admission ───
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

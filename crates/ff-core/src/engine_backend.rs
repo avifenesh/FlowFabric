@@ -80,8 +80,8 @@ use crate::contracts::{
     EvaluateFlowEligibilityArgs, EvaluateFlowEligibilityResult, ExecutionInfo,
     FailExecutionArgs, FailExecutionResult,
     IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs,
-    RecordSpendArgs, ReleaseAdmissionArgs, ReleaseAdmissionResult, ReleaseBudgetArgs,
-    ScanEligibleArgs,
+    QuotaPolicyLimits, RecordSpendArgs, ReleaseAdmissionArgs, ReleaseAdmissionResult,
+    ReleaseBudgetArgs, ScanEligibleArgs,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
     ListPendingWaitpointsResult, ListSuspendedPage, RenewLeaseArgs, RenewLeaseResult,
     ReplayExecutionArgs, ReplayExecutionResult,
@@ -1687,6 +1687,22 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<CheckAdmissionResult, EngineError> {
         Err(EngineError::Unavailable {
             op: "check_admission",
+        })
+    }
+
+    /// Read the admission-relevant fields of a quota policy
+    /// (rate limit, window, concurrency cap, jitter). Replaces the
+    /// Valkey-shaped 4-HGET pattern on `ff:quota:{K}:def` that
+    /// `ff_scheduler` used pre-FF #511. Returns `None` when the
+    /// policy row is absent; absence is a well-defined "no admission
+    /// configured" signal, not an error.
+    #[cfg(feature = "core")]
+    async fn read_quota_policy_limits(
+        &self,
+        _quota_policy_id: &crate::types::QuotaPolicyId,
+    ) -> Result<Option<QuotaPolicyLimits>, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_quota_policy_limits",
         })
     }
 

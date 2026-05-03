@@ -2318,6 +2318,8 @@ fn sqlite_supports_base() -> Supports {
 
     // ── FF #511 Phase 1 scheduler primitive ──
     s.release_admission = true;
+    // ── FF #511 Phase 2a scheduler primitive ──
+    s.read_quota_policy_limits = true;
 
     // ── Stay `false` (see struct-level rustdoc above) ──
     // s.claim_for_worker — RFC-023 §5 non-goal
@@ -3092,6 +3094,15 @@ impl EngineBackend for SqliteBackend {
     ) -> Result<ff_core::contracts::ReleaseAdmissionResult, EngineError> {
         let pool = &self.inner.pool;
         retry_serializable(|| crate::typed_ops::release_admission(pool, args.clone())).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn read_quota_policy_limits(
+        &self,
+        quota_policy_id: &ff_core::types::QuotaPolicyId,
+    ) -> Result<Option<ff_core::contracts::QuotaPolicyLimits>, EngineError> {
+        let pool = &self.inner.pool;
+        crate::typed_ops::read_quota_policy_limits(pool, quota_policy_id).await
     }
 
     #[cfg(feature = "core")]

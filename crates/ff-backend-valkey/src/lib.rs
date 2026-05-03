@@ -177,6 +177,7 @@ fn valkey_supports_base() -> ff_core::capability::Supports {
     s.list_expired_leases = true;
     s.list_workers = true;
     s.release_admission = true;
+    s.read_quota_policy_limits = true;
     s.prepare = true;
     s.subscribe_lease_history = true;
     s.subscribe_completion = true;
@@ -6090,6 +6091,55 @@ impl EngineBackend for ValkeyBackend {
                     "release_budget: FCALL ff_release_budget",
                 )
             })
+    }
+
+    /// FF #511 Phase 2a — typed snapshot of the admission fields on a
+    /// quota policy. Replaces the Valkey-shaped 4-HGET pattern
+    /// `ff_scheduler` used pre-#511.
+    async fn read_quota_policy_limits(
+        &self,
+        quota_policy_id: &ff_core::types::QuotaPolicyId,
+    ) -> Result<Option<ff_core::contracts::QuotaPolicyLimits>, EngineError> {
+        use ff_core::keys::QuotaKeyContext;
+        use ff_core::partition::quota_partition;
+        let partition = quota_partition(quota_policy_id, &self.partition_config);
+        let ctx = QuotaKeyContext::new(&partition, quota_policy_id);
+        let def_key = ctx.definition();
+
+        // HMGET the 4 fields in one round-trip. Missing key (no policy
+        // row) → vec of `None`s; caller-visible as `Ok(None)`.
+        let fields: Vec<Option<String>> = self
+            .client
+            .cmd("HMGET")
+            .arg(def_key.as_str())
+            .arg("max_requests_per_window")
+            .arg("requests_per_window_seconds")
+            .arg("active_concurrency_cap")
+            .arg("jitter_ms")
+            .execute()
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "read_quota_policy_limits: HMGET",
+            ))?;
+
+        if fields.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        let parse_u64 = |i: usize, default: u64| -> u64 {
+            fields
+                .get(i)
+                .and_then(|f| f.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        };
+        Ok(Some(ff_core::contracts::QuotaPolicyLimits::new(
+            parse_u64(0, 0),
+            parse_u64(1, 60),
+            parse_u64(2, 0),
+            parse_u64(3, 0),
+        )))
     }
 
     /// FF #511 Phase 1 — idempotent quota-admission slot release.
