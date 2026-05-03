@@ -169,6 +169,10 @@ pub struct Supports {
     /// covering budget / quota / capability reason codes
     /// (FF #511 Phase 2b).
     pub block_execution_for_admission: bool,
+    /// `read_budget_usage_and_limits` — typed snapshot of a budget's
+    /// usage + limits hashes (FF #511 Phase 3). Replaces the
+    /// scheduler's Valkey-shaped HGETALL/HGET pattern.
+    pub read_budget_usage_and_limits: bool,
     // Add new fields here, preserving parity-matrix order.
 }
 
@@ -221,6 +225,7 @@ impl Supports {
             release_admission: false,
             read_quota_policy_limits: false,
             block_execution_for_admission: false,
+            read_budget_usage_and_limits: false,
         }
     }
 }

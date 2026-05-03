@@ -179,6 +179,7 @@ fn valkey_supports_base() -> ff_core::capability::Supports {
     s.release_admission = true;
     s.read_quota_policy_limits = true;
     s.block_execution_for_admission = true;
+    s.read_budget_usage_and_limits = true;
     s.prepare = true;
     s.subscribe_lease_history = true;
     s.subscribe_completion = true;
@@ -567,7 +568,7 @@ impl ValkeyBackend {
         let backend_arc = Arc::new_cyclic(move |weak_self: &std::sync::Weak<Self>| {
             let weak_trait: std::sync::Weak<dyn EngineBackend> = weak_self.clone();
             let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
-                client_for_sched,
+                Some(client_for_sched),
                 weak_trait,
                 partition_config_clone,
                 metrics_clone.clone(),
@@ -6197,6 +6198,61 @@ impl EngineBackend for ValkeyBackend {
                 message: e.to_string(),
             }),
         }
+    }
+
+    /// FF #511 Phase 3 — typed snapshot of a budget's usage + limits
+    /// hashes. Replaces the scheduler's Valkey-shaped HGETALL/HGET
+    /// pattern. Missing limits hash → empty snapshot (not an error;
+    /// "no limits configured").
+    async fn read_budget_usage_and_limits(
+        &self,
+        budget_id: &ff_core::types::BudgetId,
+    ) -> Result<ff_core::contracts::BudgetUsageAndLimits, EngineError> {
+        use ff_core::partition::budget_partition;
+        let partition = budget_partition(budget_id, &self.partition_config);
+        let tag = partition.hash_tag();
+        let usage_key = format!("ff:budget:{}:{}:usage", tag, budget_id);
+        let limits_key = format!("ff:budget:{}:{}:limits", tag, budget_id);
+
+        let limits_map: std::collections::HashMap<String, String> = self
+            .client
+            .hgetall(limits_key.as_str())
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "read_budget_usage_and_limits: HGETALL limits",
+            ))?;
+
+        if limits_map.is_empty() {
+            return Ok(ff_core::contracts::BudgetUsageAndLimits::empty());
+        }
+
+        let mut limits: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut usage: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for (field, val) in limits_map {
+            if let Some(dim) = field.strip_prefix("hard:") {
+                let raw: Option<String> = self
+                    .client
+                    .cmd("HGET")
+                    .arg(usage_key.as_str())
+                    .arg(dim)
+                    .execute()
+                    .await
+                    .map_err(|e| ff_core::engine_error::backend_context(
+                        transport_fk(e),
+                        "read_budget_usage_and_limits: HGET usage",
+                    ))?;
+                let used: u64 = raw
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                usage.insert(dim.to_owned(), used);
+            }
+            limits.insert(field, val);
+        }
+        Ok(ff_core::contracts::BudgetUsageAndLimits::new(limits, usage))
     }
 
     /// FF #511 Phase 2a — typed snapshot of the admission fields on a

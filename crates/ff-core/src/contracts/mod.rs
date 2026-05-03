@@ -2070,6 +2070,54 @@ pub enum ReleaseAdmissionResult {
     Released,
 }
 
+// ─── read_budget_usage_and_limits (FF #511 Phase 3) ───
+
+/// Typed snapshot of one budget's usage + limits map. Returned by
+/// [`crate::engine_backend::EngineBackend::read_budget_usage_and_limits`]
+/// so the scheduler's `BudgetChecker` can evaluate hard-limit
+/// breaches without reaching at Valkey-shaped HGETs.
+///
+/// `limits` keys are full field names written by the control-plane
+/// (`hard:<dimension>`, `soft:<dimension>`, etc.); the scheduler
+/// filters on the `hard:` prefix itself. `usage` keys are raw
+/// dimension names (no prefix) — one entry per dimension currently
+/// counting.
+///
+/// Missing limits hash ⇒ both maps empty (return `Ok(Self::empty())`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BudgetUsageAndLimits {
+    pub limits: std::collections::BTreeMap<String, String>,
+    pub usage: std::collections::BTreeMap<String, u64>,
+}
+
+impl BudgetUsageAndLimits {
+    pub fn new(
+        limits: std::collections::BTreeMap<String, String>,
+        usage: std::collections::BTreeMap<String, u64>,
+    ) -> Self {
+        Self { limits, usage }
+    }
+
+    /// Empty snapshot — returned when the budget's limits hash is
+    /// absent. Scheduler treats this as "no limits configured".
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Iterator over `hard:<dimension>` limits paired with the
+    /// current usage for that dimension. Usage defaults to 0 for
+    /// dimensions present in `limits` but missing from `usage`.
+    pub fn hard_limits_with_usage(&self) -> impl Iterator<Item = (&str, u64, u64)> {
+        self.limits.iter().filter_map(|(field, v)| {
+            let dim = field.strip_prefix("hard:")?;
+            let limit: u64 = v.parse().ok().filter(|&n: &u64| n > 0)?;
+            let used = *self.usage.get(dim).unwrap_or(&0);
+            Some((dim, used, limit))
+        })
+    }
+}
+
 // ─── read_quota_policy_limits (FF #511 Phase 2a) ───
 
 /// Typed snapshot of the admission-relevant fields on a quota policy.
