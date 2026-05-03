@@ -9100,14 +9100,13 @@ impl EngineBackend for ValkeyBackend {
         let caps_key = worker_caps_key_ns(&args.namespace, &args.worker_instance_id);
         let index_key = workers_index_key_ns(&args.namespace);
 
-        // TODO(RFC-025 Phase 2): ferriskey's typed `Client` doesn't
-        // expose MULTI/EXEC directly today. For Phase 2 we issue three
-        // sequential commands; concurrent mark_worker_dead on the
-        // same instance_id is benign (idempotent no-op on the
-        // already-deleted branch). A concurrent register+mark race is
-        // the same hazard either path has — documented in §Non-goals
-        // item 1. Phase 5 can promote to a Lua FCALL if cairn's
-        // stress tests surface a real-world ordering bug.
+        // ferriskey's typed `Client` doesn't expose MULTI/EXEC
+        // directly; three sequential commands is fine here —
+        // concurrent mark_worker_dead on the same instance_id is an
+        // idempotent no-op on the already-deleted branch, and the
+        // concurrent register+mark race is documented in RFC-025
+        // §Non-goals item 1. Promote to Lua FCALL only if a real
+        // ordering bug surfaces.
         let del_alive: i64 = self
             .client
             .cmd("DEL")

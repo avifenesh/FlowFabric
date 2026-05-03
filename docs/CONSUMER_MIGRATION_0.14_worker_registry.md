@@ -55,7 +55,8 @@ backend.
 
 | | Valkey | Postgres | SQLite |
 |-|-|-|-|
-| Register | New atomic `ff_register_worker` FCALL (v32) | `INSERT … ON CONFLICT DO UPDATE RETURNING (xmax=0)` | Preflight SELECT + `INSERT … ON CONFLICT DO UPDATE` in tx |
+| Register | New atomic `ff_register_worker` FCALL (library v34) | `INSERT … ON CONFLICT DO UPDATE RETURNING (xmax=0)` | Preflight SELECT + `INSERT … ON CONFLICT DO UPDATE` in tx |
+| Heartbeat | New atomic `ff_heartbeat_worker` FCALL (library v34) — single round-trip (HGET ttl + PEXPIRE alive + PEXPIRE caps + HSET last_heartbeat_ms) | UPDATE with `last_heartbeat_ms + liveness_ttl_ms > now` predicate | Same UPDATE predicate in `BEGIN IMMEDIATE` tx |
 | TTL | Native PEXPIRE | 30s `ttl_sweep` scanner | 30s `ttl_sweep` scanner |
 | Storage | `ff:worker:{ns}:{inst}:{alive,caps}` hashes | `ff_worker_registry` (256-way HASH) + `ff_worker_registry_event` | Flat `ff_worker_registry` + event (no partitioning per RFC-023 §4.1 A3) |
 | `lanes` | CSV in caps hash | `text[]` | sorted-joined CSV |
