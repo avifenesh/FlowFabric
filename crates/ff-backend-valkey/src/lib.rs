@@ -480,6 +480,41 @@ impl ValkeyBackend {
         self.scheduler.as_ref()
     }
 
+    /// FF #511 Phase 2c: install a scheduler that holds a
+    /// `Weak<dyn EngineBackend>` into this backend, via `Arc::new_cyclic`.
+    ///
+    /// Takes the already-constructed (but scheduler-less) `Arc<Self>`
+    /// and a closure that produces the scheduler given the final
+    /// backend's `Weak<dyn EngineBackend>`. Returns a new `Arc<Self>`
+    /// with the scheduler installed. Needed because
+    /// [`Self::with_scheduler`] uses `Arc::get_mut`, which fails once
+    /// a `Weak<dyn EngineBackend>` has been minted against the
+    /// backend Arc — exactly the state after constructing the
+    /// scheduler externally.
+    pub fn install_scheduler_cyclic(
+        existing: Arc<Self>,
+        build_scheduler: impl FnOnce(std::sync::Weak<dyn EngineBackend>) -> Arc<ff_scheduler::Scheduler>,
+    ) -> Result<Arc<Self>, &'static str> {
+        // Unpack the fields from the existing Arc. `try_unwrap`
+        // succeeds only if the Arc is unique (which it is at this
+        // boot-path moment).
+        let inner = Arc::try_unwrap(existing).map_err(|_| {
+            "install_scheduler_cyclic: backend Arc has other strong refs; cannot install scheduler"
+        })?;
+
+        // `Arc::new_cyclic` gives `build_scheduler` the Weak pointer
+        // to the final Arc before Arc construction completes.
+        let new_arc = Arc::new_cyclic(move |weak_self: &std::sync::Weak<Self>| {
+            let weak_trait: std::sync::Weak<dyn EngineBackend> = weak_self.clone();
+            let scheduler = build_scheduler(weak_trait);
+            Self {
+                scheduler: Some(scheduler),
+                ..inner
+            }
+        });
+        Ok(new_arc)
+    }
+
     /// Build a `ValkeyBackend` with an embedded scheduler instance, so
     /// [`EngineBackend::claim_for_worker`] works from direct-`Arc<dyn
     /// EngineBackend>` consumers (i.e. outside of `ff-server`'s boot

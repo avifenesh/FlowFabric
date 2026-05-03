@@ -543,6 +543,9 @@ impl Server {
         // path so migrated + legacy handlers observe identical state.
         // Stage B relocates `tail_client` / `stream_semaphore` into
         // the backend; Stage E retires the Client fields entirely.
+        // Step 1: build the backend with stream-semaphore sized but
+        // without the scheduler yet (scheduler needs a Weak<dyn
+        // EngineBackend> we can only mint once the Arc exists).
         let mut valkey_backend = ff_backend_valkey::ValkeyBackend::from_client_partitions_and_connection(
             client.clone(),
             config.partition_config,
@@ -556,37 +559,33 @@ impl Server {
                 c
             },
         );
-        // RFC-017 Stage B: size the backend's stream-op semaphore
-        // before handing out the `Arc`. `get_mut` succeeds here
-        // because `valkey_backend` is the sole `Arc` owner at this
-        // point.
         if !valkey_backend.with_stream_semaphore_permits(config.max_concurrent_stream_ops) {
             return Err(ServerError::OperationFailed(
                 "ValkeyBackend stream semaphore sizing failed (unexpected Arc sharing)".into(),
             ));
         }
-        // FF #511 Phase 2c: Scheduler holds a Weak<dyn EngineBackend>
-        // so we must construct it AFTER the backend Arc exists.
-        // `Arc::downgrade` yields the Weak; the backend-as-Arc<dyn>
-        // coercion happens after the scheduler install.
-        let backend_arc_concrete = valkey_backend;
-        let weak_trait: std::sync::Weak<dyn EngineBackend> =
-            Arc::downgrade(&backend_arc_concrete) as std::sync::Weak<dyn EngineBackend>;
-        let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
-            client.clone(),
-            weak_trait,
-            config.partition_config,
-            metrics.clone(),
-        ));
-        // Re-acquire a &mut via a local rebind — `Arc::get_mut`
-        // succeeds because no other Arc clones exist yet.
-        let mut valkey_backend = backend_arc_concrete;
-        if !valkey_backend.with_scheduler(scheduler) {
-            return Err(ServerError::OperationFailed(
-                "ValkeyBackend scheduler wiring failed (unexpected Arc sharing)".into(),
-            ));
-        }
-        let backend: Arc<dyn EngineBackend> = valkey_backend as Arc<dyn EngineBackend>;
+
+        // Step 2: materialise the final trait-object Arc first so the
+        // scheduler's Weak<dyn> can be minted against it. Mutating
+        // the backend AFTER this would fail (strong or weak count
+        // > 0); we must defer the scheduler install to `with_scheduler_via_weak`
+        // which accepts a Weak producer.
+        // FF #511 Phase 2c: install via Arc::new_cyclic pattern —
+        // Scheduler is built inside the backend's cyclic closure and
+        // installed into the backend struct in one go.
+        let valkey_backend_with_sched = ff_backend_valkey::ValkeyBackend::install_scheduler_cyclic(
+            valkey_backend,
+            |weak_trait| {
+                Arc::new(ff_scheduler::Scheduler::with_metrics(
+                    client.clone(),
+                    weak_trait,
+                    config.partition_config,
+                    metrics.clone(),
+                ))
+            },
+        )
+        .map_err(|e| ServerError::OperationFailed(e.into()))?;
+        let backend: Arc<dyn EngineBackend> = valkey_backend_with_sched as Arc<dyn EngineBackend>;
 
         Ok(Self {
             // Single-permit semaphore: only one rotate-waitpoint-secret can
