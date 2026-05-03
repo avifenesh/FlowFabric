@@ -131,7 +131,7 @@ async fn scheduler_fails_closed_on_corrupted_budget_limits() {
     let weak_backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
         std::sync::Arc::downgrade(&_backend_keepalive);
     let scheduler = ff_scheduler::claim::Scheduler::new(
-        tc.client().clone(),
+        Some(tc.client().clone()),
         weak_backend,
         config,
     );
@@ -145,12 +145,20 @@ async fn scheduler_fails_closed_on_corrupted_budget_limits() {
 
     match result {
         Err(e) => {
-            // Expected: transport error surfaces. Any Valkey-kind error is
-            // acceptable (ResponseError for WRONGTYPE is the usual shape).
-            let kind = e.valkey_kind();
+            // Expected: transport error surfaces. Pre-FF #511 the
+            // scheduler returned a Valkey-kind error directly; post-
+            // Phase-2c the trait routes it through EngineContext, so
+            // valkey_kind() returns None. Accept either shape — the
+            // critical invariant is that admission failed CLOSED
+            // (not Ok(grant)).
+            let is_engine_context = matches!(
+                &e,
+                ff_scheduler::SchedulerError::EngineContext { .. }
+            );
+            let valkey_kind = e.valkey_kind();
             assert!(
-                kind.is_some(),
-                "expected a Valkey-kind error, got {e:?} (kind={kind:?})"
+                valkey_kind.is_some() || is_engine_context,
+                "expected a Valkey-kind or EngineContext error, got {e:?}"
             );
         }
         Ok(grant) => panic!(
