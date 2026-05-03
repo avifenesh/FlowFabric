@@ -528,6 +528,7 @@ skip_reason() {
 requires() {
     case "$1" in
         v013-cairn-454-budget-ledger) echo "valkey" ;;
+        v014-rfc025-worker-registry) echo "valkey" ;;
         v011-wave9-postgres) echo "postgres" ;;
         retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
             echo "ff-server" ;;
@@ -583,6 +584,8 @@ run_cmd() {
             echo "${t}cargo run --locked --release -- --backend sqlite" ;;
         v013-cairn-454-budget-ledger)
             echo "${t}cargo run --locked --release --bin budget-ledger" ;;
+        v014-rfc025-worker-registry)
+            echo "${t}cargo run --locked --release --bin worker-registry-demo" ;;
         v011-wave9-postgres)
             echo "${t}cargo run --locked --release" ;;
         retry-and-cancel|v010-read-side-ergonomics|token-budget)
@@ -606,7 +609,7 @@ apply_env() {
     case "$1" in
         ff-dev|external-callback|incident-remediation)
             export FF_DEV_MODE=1 ;;
-        v013-cairn-454-budget-ledger)
+        v013-cairn-454-budget-ledger|v014-rfc025-worker-registry)
             # Pipe VALKEY_HOST/PORT through the example's own
             # FF_DEMO_VALKEY_HOST/PORT knobs so a caller overriding
             # FF_HOST/FF_PORT sees preflight + run hit the same socket.
@@ -633,7 +636,7 @@ run_env_preview() {
     case "$1" in
         ff-dev|external-callback|incident-remediation)
             echo "FF_DEV_MODE=1" ;;
-        v013-cairn-454-budget-ledger)
+        v013-cairn-454-budget-ledger|v014-rfc025-worker-registry)
             echo "FF_DEMO_VALKEY_HOST=$VALKEY_HOST FF_DEMO_VALKEY_PORT=$VALKEY_PORT" ;;
         v011-wave9-postgres)
             echo "FF_PG_TEST_URL=$(_pg_url_redact "$POSTGRES_URL")" ;;

@@ -283,16 +283,20 @@ pub(crate) async fn run(
                 tracing::warn!(error = %e, key = %caps_key,
                     "HSET worker caps advertisement failed; continuing");
             }
-            if let Err(e) = client
-                .cmd("PEXPIRE")
-                .arg(&caps_key)
-                .arg(ttl_ms_str.as_str())
-                .execute::<Option<i64>>()
-                .await
-            {
-                tracing::warn!(error = %e, key = %caps_key,
-                    "PEXPIRE worker caps HASH failed; continuing");
-            }
+            // NOTE: we intentionally do NOT PEXPIRE the caps HASH
+            // from the preamble path. SDK-dialed workers
+            // (`FlowFabricWorker::connect`) don't run a background
+            // heartbeat loop — they only refresh the alive_key TTL
+            // implicitly via `heartbeat_worker` calls during task
+            // processing. If the caps hash also expired on idle
+            // workers, the unblock scanner's caps-union read would
+            // silently drop them and the scheduler would stop
+            // routing blocked-by-route executions. The
+            // `ff_register_worker` FCALL path used by consumers like
+            // cairn DOES PEXPIRE caps because those consumers own an
+            // explicit heartbeat loop. Alive_key retains TTL as the
+            // duplicate-instance guard; caps membership persists
+            // alongside the index until an explicit SREM.
             if let Err(e) = client
                 .cmd("SADD")
                 .arg(&index_key)
