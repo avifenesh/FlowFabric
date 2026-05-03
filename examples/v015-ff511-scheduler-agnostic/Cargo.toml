@@ -1,0 +1,28 @@
+[workspace]
+
+[package]
+name = "v015-ff511-scheduler-agnostic-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "v015-ff511-scheduler-agnostic"
+path = "src/main.rs"
+
+[dependencies]
+ff-backend-postgres = { path = "../../crates/ff-backend-postgres" }
+ff-core = { path = "../../crates/ff-core" }
+ff-scheduler = { path = "../../crates/ff-scheduler" }
+
+anyhow = "1"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

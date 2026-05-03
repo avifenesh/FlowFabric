@@ -530,6 +530,7 @@ requires() {
         v013-cairn-454-budget-ledger) echo "valkey" ;;
         v014-rfc025-worker-registry) echo "valkey" ;;
         v011-wave9-postgres) echo "postgres" ;;
+        v015-ff511-scheduler-agnostic) echo "postgres" ;;
         retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
             echo "ff-server" ;;
         *) echo "" ;;
@@ -588,6 +589,8 @@ run_cmd() {
             echo "${t}cargo run --locked --release --bin worker-registry-demo" ;;
         v011-wave9-postgres)
             echo "${t}cargo run --locked --release" ;;
+        v015-ff511-scheduler-agnostic)
+            echo "${t}cargo run --locked --release --bin v015-ff511-scheduler-agnostic" ;;
         retry-and-cancel|v010-read-side-ergonomics|token-budget)
             # All three call the harness-spawned ff-server via HTTP
             # and talk to Valkey directly for worker-side ops.
@@ -615,7 +618,7 @@ apply_env() {
             # FF_HOST/FF_PORT sees preflight + run hit the same socket.
             export FF_DEMO_VALKEY_HOST="$VALKEY_HOST"
             export FF_DEMO_VALKEY_PORT="$VALKEY_PORT" ;;
-        v011-wave9-postgres)
+        v011-wave9-postgres|v015-ff511-scheduler-agnostic)
             # Route the URL the preflight verified to the example.
             export FF_PG_TEST_URL="$POSTGRES_URL" ;;
         retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
@@ -638,7 +641,7 @@ run_env_preview() {
             echo "FF_DEV_MODE=1" ;;
         v013-cairn-454-budget-ledger|v014-rfc025-worker-registry)
             echo "FF_DEMO_VALKEY_HOST=$VALKEY_HOST FF_DEMO_VALKEY_PORT=$VALKEY_PORT" ;;
-        v011-wave9-postgres)
+        v011-wave9-postgres|v015-ff511-scheduler-agnostic)
             echo "FF_PG_TEST_URL=$(_pg_url_redact "$POSTGRES_URL")" ;;
         retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
             echo "FF_SERVER_URL=$FF_SERVER_URL FF_HOST=$VALKEY_HOST FF_PORT=$VALKEY_PORT" ;;
