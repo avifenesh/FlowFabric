@@ -223,6 +223,12 @@ fn postgres_supports_base() -> ff_core::capability::Supports {
     s.list_expired_leases = true;
     s.list_workers = true;
 
+    // ── FF #511 Phase 2a — scheduler-admission primitives ──
+    // block_execution_for_admission + read_budget_usage_and_limits
+    // stay `false` on PG (scheduler is Valkey-only per RFC-023 §4.1).
+    s.release_admission = true;
+    s.read_quota_policy_limits = true;
+
     s
 }
 
