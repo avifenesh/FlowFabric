@@ -5,6 +5,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-05-03
+
+### Fixed
+
+- **PG 16 `register_worker` regression (#508, reported by cairn).** The
+  v0.14.0 body issued `RETURNING (xmax = 0)` to distinguish Registered
+  vs Refreshed. Postgres 16 + sqlx 0.8.x reject that projection with
+  SQLSTATE 0A000 ("cannot retrieve a system column in this context",
+  `tts_virtual_getsysattr`) because sqlx's portal path evaluates
+  RETURNING through a virtual tuple slot. Casts (`xmax::text`,
+  `(xmax = 0)::bool`) don't help — same slot. Replaced with a
+  transactionally-consistent preflight `SELECT 1` + INSERT ... ON
+  CONFLICT DO UPDATE without RETURNING. Regression test
+  `crates/ff-backend-postgres/tests/worker_registry_pg16.rs` pins the
+  behaviour on PG 16+.
+
+### Changed
+
+- **Docs drift sweep (post-v0.14).** `docs/CONSUMER_MIGRATION_0.14_worker_registry.md`
+  + `docs/POSTGRES_PARITY_MATRIX.md` caught up with the actual shipped
+  shape: Lua library version is v34 (not v32), `register_worker` caps
+  HASH carries 6 fields (`last_heartbeat_ms` added at v33),
+  `heartbeat_worker` is a single atomic `ff_heartbeat_worker` FCALL
+  (not client-side HGET→PEXPIRE), `list_workers` Valkey body uses SSCAN
+  + concurrency-capped parallel HGETALL (not SMEMBERS + sequential).
+  Also removed a stale "TODO(RFC-025 Phase 2)" comment in
+  `ff-backend-valkey::mark_worker_dead`.
+
 ## [0.14.0] - 2026-05-03
 
 ### Added
