@@ -2113,6 +2113,90 @@ impl QuotaPolicyLimits {
 
 // ─── block_execution_for_admission ───
 
+/// Inputs to [`crate::engine_backend::EngineBackend::block_execution_for_admission`]
+/// (FF #511 Phase 2b). Generalises `block_route` (capability-mismatch
+/// only) to cover every admission-time block target: budget denial,
+/// quota denial, capability mismatch, operator pause, lane pause.
+///
+/// `BlockingReason` picks both the eligibility state written onto
+/// `exec_core` and the `blocked_<reason>` index the execution lands
+/// on, matching `ff_block_execution_for_admission` Lua's
+/// `REASON_TO_ELIGIBILITY` table.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct BlockExecutionForAdmissionArgs {
+    pub execution_id: ExecutionId,
+    pub lane_id: LaneId,
+    pub partition: crate::partition::Partition,
+    pub reason: BlockingReason,
+    /// Human-readable operator-visible detail; `None` = no detail.
+    pub reason_detail: Option<String>,
+    pub now: TimestampMs,
+}
+
+impl BlockExecutionForAdmissionArgs {
+    pub fn new(
+        execution_id: ExecutionId,
+        lane_id: LaneId,
+        partition: crate::partition::Partition,
+        reason: BlockingReason,
+        reason_detail: Option<String>,
+        now: TimestampMs,
+    ) -> Self {
+        Self {
+            execution_id,
+            lane_id,
+            partition,
+            reason,
+            reason_detail,
+            now,
+        }
+    }
+}
+
+/// Admission-time block reasons supported by
+/// `block_execution_for_admission`. Mirrors the Lua
+/// `REASON_TO_ELIGIBILITY` map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockingReason {
+    /// Budget counter denied — `blocked_by_budget`.
+    WaitingForBudget,
+    /// Quota admission denied — `blocked_by_quota`.
+    WaitingForQuota,
+    /// Capability mismatch — `blocked_by_route`. Equivalent to the
+    /// existing `block_route` trait method's target.
+    WaitingForCapableWorker,
+}
+
+impl BlockingReason {
+    /// The Lua-visible reason string (ARGV[2] in
+    /// `ff_block_execution_for_admission`).
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::WaitingForBudget => "waiting_for_budget",
+            Self::WaitingForQuota => "waiting_for_quota",
+            Self::WaitingForCapableWorker => "waiting_for_capable_worker",
+        }
+    }
+}
+
+/// Typed outcome of
+/// [`crate::engine_backend::EngineBackend::block_execution_for_admission`].
+///
+/// Mirrors [`BlockRouteOutcome`] but carries the reason so operator
+/// telemetry can distinguish budget-vs-quota-vs-capability rejects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockExecutionForAdmissionOutcome {
+    /// Execution moved eligible → blocked_<reason> successfully.
+    Blocked { execution_id: ExecutionId, reason: BlockingReason },
+    /// Lua returned a non-success result (e.g. execution went
+    /// terminal between pick and block).
+    LuaRejected { message: String },
+}
+
+// Deprecated alias shape — left intact for any pre-existing consumer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockExecutionArgs {
     pub execution_id: ExecutionId,

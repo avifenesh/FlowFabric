@@ -178,6 +178,7 @@ fn valkey_supports_base() -> ff_core::capability::Supports {
     s.list_workers = true;
     s.release_admission = true;
     s.read_quota_policy_limits = true;
+    s.block_execution_for_admission = true;
     s.prepare = true;
     s.subscribe_lease_history = true;
     s.subscribe_completion = true;
@@ -6091,6 +6092,63 @@ impl EngineBackend for ValkeyBackend {
                     "release_budget: FCALL ff_release_budget",
                 )
             })
+    }
+
+    /// FF #511 Phase 2b — generalised admission block. Routes to the
+    /// correct `blocked_<reason>` lane-index based on the enum tag,
+    /// then FCALLs `ff_block_execution_for_admission` with the same
+    /// KEYS=3 shape the scheduler used pre-#511.
+    async fn block_execution_for_admission(
+        &self,
+        args: ff_core::contracts::BlockExecutionForAdmissionArgs,
+    ) -> Result<ff_core::contracts::BlockExecutionForAdmissionOutcome, EngineError> {
+        use ff_core::contracts::{BlockExecutionForAdmissionOutcome, BlockingReason};
+
+        let ctx = ExecKeyContext::new(&args.partition, &args.execution_id);
+        let idx = IndexKeys::new(&args.partition);
+        let core_key = ctx.core();
+        let eligible_key = idx.lane_eligible(&args.lane_id);
+        let blocked_key = match args.reason {
+            BlockingReason::WaitingForBudget => idx.lane_blocked_budget(&args.lane_id),
+            BlockingReason::WaitingForQuota => idx.lane_blocked_quota(&args.lane_id),
+            BlockingReason::WaitingForCapableWorker => idx.lane_blocked_route(&args.lane_id),
+            _ => {
+                return Err(EngineError::Validation {
+                    kind: ValidationKind::InvalidInput,
+                    detail: format!(
+                        "block_execution_for_admission: unsupported reason {:?}",
+                        args.reason
+                    ),
+                });
+            }
+        };
+        let eid_s = args.execution_id.to_string();
+        let now_ms = args.now.0.to_string();
+        let reason_code = args.reason.reason_code();
+
+        let keys: [&str; 3] = [&core_key, &eligible_key, &blocked_key];
+        let reason_detail_s = args.reason_detail.as_deref().unwrap_or_default();
+        let argv: [&str; 4] = [&eid_s, reason_code, reason_detail_s, &now_ms];
+
+        let raw: ferriskey::Value = self
+            .client
+            .fcall("ff_block_execution_for_admission", &keys, &argv)
+            .await
+            .map_err(|e| ff_core::engine_error::backend_context(
+                transport_fk(e),
+                "block_execution_for_admission: FCALL ff_block_execution_for_admission",
+            ))?;
+
+        let parsed = ff_script::result::FcallResult::parse(&raw).map_err(EngineError::from)?;
+        match parsed.into_success() {
+            Ok(_) => Ok(BlockExecutionForAdmissionOutcome::Blocked {
+                execution_id: args.execution_id,
+                reason: args.reason,
+            }),
+            Err(e) => Ok(BlockExecutionForAdmissionOutcome::LuaRejected {
+                message: e.to_string(),
+            }),
+        }
     }
 
     /// FF #511 Phase 2a — typed snapshot of the admission fields on a
