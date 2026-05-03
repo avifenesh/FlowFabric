@@ -531,11 +531,11 @@ impl Server {
             config.partition_config.num_quota_partitions,
         );
 
-        let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
-            client.clone(),
-            config.partition_config,
-            metrics.clone(),
-        ));
+        // FF #511 Phase 2c: Scheduler now needs an `Arc<dyn
+        // EngineBackend>` — which we don't have until the ValkeyBackend
+        // below exists. Deferred to after the backend is constructed;
+        // the scheduler is installed via `with_scheduler` at the same
+        // point as before.
 
         // RFC-017 Stage A: synthesise an `Arc<ValkeyBackend>` around the
         // already-dialed client. Zero additional round-trips; the
@@ -565,11 +565,22 @@ impl Server {
                 "ValkeyBackend stream semaphore sizing failed (unexpected Arc sharing)".into(),
             ));
         }
-        // RFC-017 Stage C: install the scheduler handle so the
-        // backend's `claim_for_worker` trait impl dispatches through
-        // it. Stage E3 removed the redundant `Server::scheduler`
-        // field — the backend is the sole owner of the scheduler
-        // after this install.
+        // FF #511 Phase 2c: Scheduler holds a Weak<dyn EngineBackend>
+        // so we must construct it AFTER the backend Arc exists.
+        // `Arc::downgrade` yields the Weak; the backend-as-Arc<dyn>
+        // coercion happens after the scheduler install.
+        let backend_arc_concrete = valkey_backend;
+        let weak_trait: std::sync::Weak<dyn EngineBackend> =
+            Arc::downgrade(&backend_arc_concrete) as std::sync::Weak<dyn EngineBackend>;
+        let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
+            client.clone(),
+            weak_trait,
+            config.partition_config,
+            metrics.clone(),
+        ));
+        // Re-acquire a &mut via a local rebind — `Arc::get_mut`
+        // succeeds because no other Arc clones exist yet.
+        let mut valkey_backend = backend_arc_concrete;
         if !valkey_backend.with_scheduler(scheduler) {
             return Err(ServerError::OperationFailed(
                 "ValkeyBackend scheduler wiring failed (unexpected Arc sharing)".into(),
