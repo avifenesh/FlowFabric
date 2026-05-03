@@ -80,7 +80,8 @@ use crate::contracts::{
     EvaluateFlowEligibilityArgs, EvaluateFlowEligibilityResult, ExecutionInfo,
     FailExecutionArgs, FailExecutionResult,
     IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs,
-    RecordSpendArgs, ReleaseBudgetArgs, ScanEligibleArgs,
+    RecordSpendArgs, ReleaseAdmissionArgs, ReleaseAdmissionResult, ReleaseBudgetArgs,
+    ScanEligibleArgs,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
     ListPendingWaitpointsResult, ListSuspendedPage, RenewLeaseArgs, RenewLeaseResult,
     ReplayExecutionArgs, ReplayExecutionResult,
@@ -1743,6 +1744,28 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<(), EngineError> {
         Err(EngineError::Unavailable {
             op: "release_budget",
+        })
+    }
+
+    /// Release a quota-admission slot that was recorded via
+    /// [`Self::check_admission`] / `ff_check_admission_and_record` but
+    /// for which `issue_claim_grant` subsequently failed. Idempotent:
+    /// releasing an already-released slot is a no-op.
+    ///
+    /// Valkey wraps the existing `ff_release_admission` FCALL (DEL
+    /// guard + SREM admitted_set + DECR-if-positive concurrency
+    /// counter). PG/SQLite write to their admission-tracking rows.
+    ///
+    /// Used by `ff_scheduler::Scheduler` on the claim-fail rollback
+    /// path (FF #511). The default impl returns
+    /// [`EngineError::Unavailable`].
+    #[cfg(feature = "core")]
+    async fn release_admission(
+        &self,
+        _args: ReleaseAdmissionArgs,
+    ) -> Result<ReleaseAdmissionResult, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "release_admission",
         })
     }
 

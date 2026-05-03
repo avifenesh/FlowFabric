@@ -1872,6 +1872,59 @@ pub(crate) async fn issue_grant_and_claim(
     ))
 }
 
+/// PG body for [`ff_core::engine_backend::EngineBackend::release_admission`].
+///
+/// Mirrors the Valkey `ff_release_admission` FCALL: idempotent DEL of
+/// the admitted-guard row + SREM-equivalent (no separate set on PG;
+/// the admitted row IS the set) + DECR-if-positive on the policy's
+/// concurrency counter. Wrapped in a transaction so the delete and
+/// decrement land atomically. FF #511 Phase 1.
+pub(crate) async fn release_admission(
+    pool: &PgPool,
+    partition_config: &PartitionConfig,
+    args: ff_core::contracts::ReleaseAdmissionArgs,
+) -> Result<ff_core::contracts::ReleaseAdmissionResult, EngineError> {
+    let part = quota_partition(&args.quota_policy_id, partition_config).index as i16;
+    let policy_id_text = args.quota_policy_id.to_string();
+    let exec_id_text = args.execution_id.to_string();
+
+    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+    // Delete the admitted-guard row. `DELETE` returns 0 rows if absent;
+    // we use that as the idempotency signal without treating it as an
+    // error — matches the Lua's `DEL`-returns-0-on-absent behaviour.
+    let deleted = sqlx::query(
+        "DELETE FROM ff_quota_admitted \
+          WHERE partition_key = $1 AND quota_policy_id = $2 AND execution_id = $3",
+    )
+    .bind(part)
+    .bind(&policy_id_text)
+    .bind(&exec_id_text)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?
+    .rows_affected();
+
+    // Decrement concurrency only if we actually removed an admission
+    // row. Floor-at-zero invariant via the `GREATEST(..., 0)` clamp
+    // so a double-release can't drive the counter below zero.
+    if deleted > 0 {
+        sqlx::query(
+            "UPDATE ff_quota_policy SET \
+                 active_concurrency = GREATEST(active_concurrency - 1, 0) \
+              WHERE partition_key = $1 AND quota_policy_id = $2",
+        )
+        .bind(part)
+        .bind(&policy_id_text)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_error)?;
+    }
+
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(ff_core::contracts::ReleaseAdmissionResult::Released)
+}
+
 #[cfg(test)]
 mod tests {
     // Integration tests live in `tests/typed_renew_lease.rs` +

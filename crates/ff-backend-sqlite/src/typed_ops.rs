@@ -2178,3 +2178,46 @@ pub(crate) async fn issue_grant_and_claim(
         }
     }
 }
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::release_admission`].
+///
+/// Mirrors the Valkey + PG idempotent DEL + DECR-if-positive
+/// semantics. FF #511 Phase 1.
+pub(crate) async fn release_admission(
+    pool: &SqlitePool,
+    args: ff_core::contracts::ReleaseAdmissionArgs,
+) -> Result<ff_core::contracts::ReleaseAdmissionResult, EngineError> {
+    let part: i64 = 0; // SQLite single-writer flat layout per RFC-023 §4.1 A3
+    let policy_id_text = args.quota_policy_id.to_string();
+    let exec_id_text = args.execution_id.to_string();
+
+    let mut conn = begin_immediate(pool).await?;
+
+    let deleted = sqlx::query(
+        "DELETE FROM ff_quota_admitted \
+          WHERE partition_key = ?1 AND quota_policy_id = ?2 AND execution_id = ?3",
+    )
+    .bind(part)
+    .bind(&policy_id_text)
+    .bind(&exec_id_text)
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?
+    .rows_affected();
+
+    if deleted > 0 {
+        sqlx::query(
+            "UPDATE ff_quota_policy SET \
+                 active_concurrency = MAX(active_concurrency - 1, 0) \
+              WHERE partition_key = ?1 AND quota_policy_id = ?2",
+        )
+        .bind(part)
+        .bind(&policy_id_text)
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx_error)?;
+    }
+
+    commit_or_rollback(&mut conn).await?;
+    Ok(ff_core::contracts::ReleaseAdmissionResult::Released)
+}
