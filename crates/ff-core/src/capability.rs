@@ -155,6 +155,12 @@ pub struct Supports {
     pub list_expired_leases: bool,
     /// `list_workers` (RFC-025 Phase 6, §9.4).
     pub list_workers: bool,
+
+    // ── Scheduler (FF #511) ──
+    /// `release_admission` — idempotent quota-admission slot release
+    /// used by `ff_scheduler` on the claim-fail rollback path. `true`
+    /// on every in-tree backend post-FF-#511.
+    pub release_admission: bool,
     // Add new fields here, preserving parity-matrix order.
 }
 
@@ -204,6 +210,7 @@ impl Supports {
             mark_worker_dead: false,
             list_expired_leases: false,
             list_workers: false,
+            release_admission: false,
         }
     }
 }

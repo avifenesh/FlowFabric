@@ -2316,6 +2316,9 @@ fn sqlite_supports_base() -> Supports {
     s.list_expired_leases = true;
     s.list_workers = true;
 
+    // ── FF #511 Phase 1 scheduler primitive ──
+    s.release_admission = true;
+
     // ── Stay `false` (see struct-level rustdoc above) ──
     // s.claim_for_worker — RFC-023 §5 non-goal
     // s.subscribe_instance_tags — #311 all-backends
@@ -3080,6 +3083,15 @@ impl EngineBackend for SqliteBackend {
     ) -> Result<(), EngineError> {
         let pool = &self.inner.pool;
         retry_serializable(|| crate::typed_ops::release_budget(pool, args.clone())).await
+    }
+
+    #[cfg(feature = "core")]
+    async fn release_admission(
+        &self,
+        args: ff_core::contracts::ReleaseAdmissionArgs,
+    ) -> Result<ff_core::contracts::ReleaseAdmissionResult, EngineError> {
+        let pool = &self.inner.pool;
+        retry_serializable(|| crate::typed_ops::release_admission(pool, args.clone())).await
     }
 
     #[cfg(feature = "core")]

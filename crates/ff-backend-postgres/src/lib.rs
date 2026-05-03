@@ -1239,6 +1239,15 @@ impl EngineBackend for PostgresBackend {
         budget::release_budget_impl(&self.pool, &self.partition_config, args).await
     }
 
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.release_admission", skip_all)]
+    async fn release_admission(
+        &self,
+        args: ff_core::contracts::ReleaseAdmissionArgs,
+    ) -> Result<ff_core::contracts::ReleaseAdmissionResult, EngineError> {
+        crate::typed_ops::release_admission(&self.pool, &self.partition_config, args).await
+    }
+
     // ── HMAC secret rotation (v0.7 migration-master Q4) ──
     //
     // Wave 4 replaces this stub with a single INSERT into

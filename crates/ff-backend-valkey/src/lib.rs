@@ -176,6 +176,7 @@ fn valkey_supports_base() -> ff_core::capability::Supports {
     s.mark_worker_dead = true;
     s.list_expired_leases = true;
     s.list_workers = true;
+    s.release_admission = true;
     s.prepare = true;
     s.subscribe_lease_history = true;
     s.subscribe_completion = true;
@@ -6087,6 +6088,41 @@ impl EngineBackend for ValkeyBackend {
                 ff_core::engine_error::backend_context(
                     e,
                     "release_budget: FCALL ff_release_budget",
+                )
+            })
+    }
+
+    /// FF #511 Phase 1 — idempotent quota-admission slot release.
+    ///
+    /// Wraps the existing `ff_release_admission` FCALL (DEL guard +
+    /// SREM admitted_set + DECR-if-positive concurrency counter).
+    /// Used by `ff_scheduler::Scheduler` on the claim-fail rollback
+    /// path once Phase 2 trait-routes the scheduler.
+    async fn release_admission(
+        &self,
+        args: ff_core::contracts::ReleaseAdmissionArgs,
+    ) -> Result<ff_core::contracts::ReleaseAdmissionResult, EngineError> {
+        use ff_core::keys::QuotaKeyContext;
+        use ff_core::partition::quota_partition;
+        use ff_script::functions::quota::QuotaOpKeys;
+
+        let partition = quota_partition(&args.quota_policy_id, &self.partition_config);
+        let ctx = QuotaKeyContext::new(&partition, &args.quota_policy_id);
+        let keys = QuotaOpKeys {
+            ctx: &ctx,
+            // `dimension` is unused by ff_release_admission (it only
+            // touches admitted_guard / admitted_set / concurrency);
+            // any non-empty placeholder satisfies the QuotaOpKeys
+            // shape shared with check/create which do read it.
+            dimension: "admission",
+            execution_id: &args.execution_id,
+        };
+        ff_script::functions::quota::ff_release_admission(&self.client, &keys, &args)
+            .await
+            .map_err(|e| {
+                ff_core::engine_error::backend_context(
+                    transport_script(e),
+                    "release_admission: FCALL ff_release_admission",
                 )
             })
     }
