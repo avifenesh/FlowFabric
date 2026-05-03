@@ -258,7 +258,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "ferriskey"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -340,11 +340,11 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "ff-scheduler"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "ferriskey",
  "ff-core",
