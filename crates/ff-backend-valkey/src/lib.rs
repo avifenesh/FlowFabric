@@ -8060,10 +8060,10 @@ impl EngineBackend for ValkeyBackend {
                     ff_core::engine_error::backend_context(transport_fk(source), context)
                 }
                 ff_scheduler::SchedulerError::EngineContext { source, context } => {
-                    // Already a typed EngineError; just preserve the
-                    // scheduler-site context via backend_context's
-                    // prefix behaviour.
-                    ff_core::engine_error::backend_context(source, context)
+                    // Already a typed EngineError (boxed to keep
+                    // SchedulerError's Result small). Unbox + prefix
+                    // with scheduler-site context.
+                    ff_core::engine_error::backend_context(*source, context)
                 }
                 ff_scheduler::SchedulerError::Config(msg) => EngineError::Validation {
                     kind: ff_core::engine_error::ValidationKind::InvalidInput,

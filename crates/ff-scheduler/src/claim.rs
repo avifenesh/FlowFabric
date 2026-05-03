@@ -584,8 +584,7 @@ impl Scheduler {
         let scan_now_ms = match backend.server_time_ms().await {
             Ok(t) => t,
             Err(e) => {
-                return Err(SchedulerError::EngineContext {
-                    source: e,
+                return Err(SchedulerError::EngineContext { source: Box::new(e),
                     context: "scheduler: server_time_ms for rotation cursor".to_owned(),
                 });
             }
@@ -787,7 +786,7 @@ impl Scheduler {
                 lane.clone(),
                 worker_id.clone(),
                 worker_instance_id.clone(),
-                partition.clone(),
+                partition,
                 caps_set,
                 grant_ttl_ms,
                 ff_core::types::TimestampMs(now_ms as i64),
@@ -946,8 +945,7 @@ impl Scheduler {
             Ok(Some(l)) => l,
             Ok(None) => return Ok(QuotaCheckOutcome::NoQuota),
             Err(e) => {
-                return Err(SchedulerError::EngineContext {
-                    source: e,
+                return Err(SchedulerError::EngineContext { source: Box::new(e),
                     context: format!("check_quota: read_quota_policy_limits {qid}"),
                 });
             }
@@ -1024,8 +1022,7 @@ impl Scheduler {
                     error = %e,
                     "scheduler: check_admission failed, denying (fail-closed)"
                 );
-                Err(SchedulerError::EngineContext {
-                    source: e,
+                Err(SchedulerError::EngineContext { source: Box::new(e),
                     context: format!("check_admission {quota_id_str}"),
                 })
             }
@@ -1066,7 +1063,7 @@ impl Scheduler {
         let args = ff_core::contracts::BlockExecutionForAdmissionArgs::new(
             eid.clone(),
             lane.clone(),
-            partition.clone(),
+            *partition,
             reason,
             if blocking_detail.is_empty() {
                 None
@@ -1188,11 +1185,12 @@ pub enum SchedulerError {
     },
     /// FF #511 Phase 2c: trait-routed backend error (backend-agnostic).
     /// Carries the original `EngineError` so callers can classify by
-    /// kind via `EngineError::kind`-ish matchers.
+    /// kind via `EngineError::kind`-ish matchers. Boxed because
+    /// `EngineError` is large (clippy::result_large_err).
     #[error("engine ({context}): {source}")]
     EngineContext {
         #[source]
-        source: ff_core::engine_error::EngineError,
+        source: Box<ff_core::engine_error::EngineError>,
         context: String,
     },
     /// Caller-supplied value failed ingress validation. NOT retryable — the
