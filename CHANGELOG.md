@@ -5,6 +5,114 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-03
+
+### Added
+
+- **RFC-025 worker registry** — four + one new `EngineBackend` trait
+  methods for worker-pool lifecycle (`register_worker`,
+  `heartbeat_worker`, `mark_worker_dead`) + lease-expiry enumeration
+  (`list_expired_leases`) + live-worker listing (`list_workers`),
+  shipping bodies on all three in-tree backends. Closes cairn #473
+  bucket-C parity gap. Key decisions (§9 locked):
+  - Valkey keys are namespace-prefixed: `ff:worker:{ns}:{inst}:alive`,
+    `ff:worker:{ns}:{inst}:caps`, `ff:idx:{ns}:workers`. Multi-tenant
+    safe by construction.
+  - `ff_register_worker` is atomic via new Lua FCALL (library v33 →
+    v34 over the phase). `heartbeat_worker` followed with its own
+    FCALL on v34 collapsing the four-round-trip read+update path.
+  - Idempotent re-register under same `worker_instance_id` overwrites
+    caps + lanes + TTL (Refreshed outcome).
+  - `list_expired_leases` cursor is `(expires_at_ms, ExecutionId)`
+    tuple for pagination stability under equal-expiry.
+  - `list_workers` is namespace-scoped; cross-namespace returns
+    `Unavailable` until a tuple-cursor RFC lands.
+- **PG: `ff_worker_registry` + `ff_worker_registry_event` tables**
+  (migration 0021) — 256-way HASH-partitioned via
+  `(fnv1a_u64(worker_instance_id) % 256) as smallint`, identical to
+  `ff_budget_usage_by_exec` (migration 0020). `lanes text[]`
+  (sorted). Event log captures register/heartbeat/marked_dead/
+  ttl_swept transitions. Migration 0022 appends `event_kind` to the
+  event PK to avoid same-ms register→heartbeat collisions.
+- **SQLite: `ff_worker_registry` + event table** (migration 0021) —
+  flat tables per RFC-023 §4.1 A3; `lanes` as sorted-joined CSV since
+  SQLite lacks `text[]`. Migration 0022 adds `event_kind` to the PK
+  to match PG.
+- **PG + SQLite: TTL-sweep scanner** (`worker_registry_ttl_sweep`) at
+  30 s cadence, matching `budget_reconciler`. CTE DELETE + INSERT in
+  a single SQL statement (atomic). Valkey uses native PEXPIRE, no
+  scanner.
+- **5 new RFC-018 `Supports` flags** — `register_worker`,
+  `heartbeat_worker`, `mark_worker_dead`, `list_expired_leases`,
+  `list_workers`. All `true` on every in-tree backend.
+- **`examples/v014-rfc025-worker-registry/`** — headline example
+  (~170 LOC) round-tripping the five methods against local Valkey.
+  Exercises Registered → Refreshed caps hot-swap → heartbeat with
+  `next_expiry_ms` → `list_workers` namespace-scoped → mark_dead
+  idempotent replay → post-mark NotRegistered. Live-run PASS.
+- **`docs/CONSUMER_MIGRATION_0.14_worker_registry.md`** — cairn
+  migration guide with before/after code shape, naming map
+  (cairn upstream `worker_id` → FF `worker_instance_id`), per-backend
+  behavior matrix, and production cutover notes for the Valkey
+  key-shape coexistence window.
+- **`docs/POSTGRES_PARITY_MATRIX.md`** — new v0.14.0 section
+  documenting all 5 methods per backend + RFC-025 storage topology.
+
+### Changed
+
+- **SDK preamble (`crates/ff-sdk/src/valkey_preamble.rs`)** migrated
+  to the namespaced key shape written by `ff_register_worker`.
+  Preamble + trait now produce byte-identical Valkey state.
+- **ff-engine unblock scanner** (`crates/ff-engine/src/scanner/unblock.rs`)
+  is now namespace-aware: HMGETs `[blocking_reason, namespace]` off
+  the execution's `exec_core` hash per iteration; `CapsUnionCache`
+  rekeyed `HashMap<Namespace, entry>`; `load_worker_caps_union`
+  reads `workers_index_key_ns(ns)` + per-worker `HGET caps_key
+  caps_csv`. Multi-tenant-safe for the first time. Two-phase cache
+  access avoids holding the async mutex across the network refresh.
+- **Valkey read-path parallelization** — `list_expired_leases` fans
+  ZRANGEBYSCOREs per partition via `FuturesUnordered` +
+  concurrency-capped HMGETs; `list_workers` uses SSCAN (cluster-safe)
+  + parallel HGETALLs. Cursor stability preserved via indexed slot
+  collection + post-merge sort.
+- **Workspace version bump 0.13.0 → 0.14.0** — mandatory for
+  cargo-semver-checks (the RFC-025 cutover deleted the legacy
+  `ff_core::keys::{worker_key, worker_caps_key, workers_index_key}`
+  helpers).
+- **Valkey Lua library version bumped 31 → 34** over the RFC-025
+  delivery (v32 added `ff_register_worker`; v33 added
+  `last_heartbeat_ms` field to caps hash; v34 added
+  `ff_heartbeat_worker` FCALL).
+
+### Fixed
+
+- **PG `list_expired_leases` c.namespace** — Phase-3 query referenced
+  `c.namespace` which doesn't exist on `ff_exec_core` (namespace is
+  in `raw_fields jsonb`). Runtime crash on any call with
+  `namespace=Some`. Now uses `c.raw_fields->>'namespace'`.
+- **SQLite `list_expired_leases` cursor hex vs hyphen** — cursor
+  comparison concatenated un-hyphenated `lower(hex(execution_id))`
+  against hyphenated Rust-side UUID. Would silently skip/duplicate
+  entries on equal-expiry pages. Reconstructs the canonical
+  `{fp:N}:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` via `substr` parts.
+- **Valkey `heartbeat_worker` caps TTL asymmetry** — only refreshed
+  the alive-key TTL. Caps hash would silently expire first, leaving
+  `list_workers` returning partial state on long-lived workers. Now
+  refreshes both.
+- **Valkey `WorkerInfo.last_heartbeat_ms`** — was populated with
+  `registered_at_ms`. Added `last_heartbeat_ms` field to the caps
+  HASH; Lua seeds at register, `heartbeat_worker` HSETs each tick,
+  `list_workers` reads it with fallback.
+- **PG `ff_worker_registry_event` PK collision** — same-ms events
+  (fast register → heartbeat on boot) would collide under the
+  original PK `(partition_key, namespace, worker_instance_id,
+  event_at_ms)`. Migration 0022 appends `event_kind`.
+- **media-pipeline `scripts/setup.sh`** model-size floor was 50 MiB;
+  tiny.en-q5_1 is ~31 MiB. Relaxed to 20 MiB.
+- **media-pipeline `scripts/demo.sh`** was calling `review` without
+  `--waitpoint-id` (v0.13 made it required on the Suspended branch).
+  Now parses `REVIEW_NEEDED wp=…` out of summarize.log first.
+
 ### Added
 
 - **`scripts/lint-grafana-dashboard.sh`** (phase 3f) — jq-based
