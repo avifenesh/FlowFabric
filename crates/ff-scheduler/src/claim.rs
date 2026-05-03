@@ -108,8 +108,17 @@ impl BudgetChecker {
             return Ok(&self.cache[budget_id]);
         }
 
-        // Parse the budget id; fall through to "no limits" on
-        // non-UUID inputs (test-fixture compat, matches pre-#511).
+        // Parse the budget id. Pre-FF #511 the scheduler fell back
+        // to hardcoded `ff:budget:{b:0}:<raw_string>` keys for
+        // non-UUID IDs — a test-only shortcut that relied on Valkey
+        // HGETALL's tolerance for arbitrary-string IDs. The trait
+        // surface requires a typed `BudgetId` (UUID), so non-UUID
+        // inputs now resolve to "no limits" (cache Ok). Breaking
+        // this fallback is intentional: the in-workspace fixtures
+        // use `BudgetId::new()` (UUID), and out-of-tree consumers
+        // that hand-rolled non-UUID budget IDs should migrate —
+        // budget-row lookups stop working anyway once the trait
+        // surface is the sole admission path.
         let Ok(bid) = BudgetId::parse(budget_id) else {
             self.cache
                 .insert(budget_id.to_owned(), BudgetCheckResult::Ok);
