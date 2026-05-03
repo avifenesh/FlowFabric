@@ -620,6 +620,13 @@ apply_env() {
             export FF_DEMO_VALKEY_PORT="$VALKEY_PORT" ;;
         v011-wave9-postgres|v015-ff511-scheduler-agnostic)
             # Route the URL the preflight verified to the example.
+            # NOTE: when running multiple PG examples in one sweep,
+            # point each at its own db (each calls apply_migrations at
+            # boot; sharing one db triggers "relation already exists"
+            # on the second example). For release-gate runs, run PG
+            # examples individually via FF_EXAMPLES_ONLY against fresh
+            # per-example dbs. A per-example drop+recreate is queued as
+            # a v0.16 harness-hygiene fix.
             export FF_PG_TEST_URL="$POSTGRES_URL" ;;
         retry-and-cancel|v010-read-side-ergonomics|token-budget|deploy-approval)
             # All four examples default to http://localhost:9090 but
