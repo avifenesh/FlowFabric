@@ -577,7 +577,7 @@ impl Server {
             valkey_backend,
             |weak_trait| {
                 Arc::new(ff_scheduler::Scheduler::with_metrics(
-                    client.clone(),
+                    Some(client.clone()),
                     weak_trait,
                     config.partition_config,
                     metrics.clone(),

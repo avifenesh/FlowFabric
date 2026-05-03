@@ -4779,7 +4779,7 @@ async fn test_scheduler_claim_priority_ordering() {
     let _sched_weak: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
         std::sync::Arc::downgrade(&_sched_backend_keepalive);
     let scheduler = ff_scheduler::claim::Scheduler::new(
-        tc.client().clone(),
+        Some(tc.client().clone()),
         _sched_weak,
         config,
     );
@@ -4872,7 +4872,7 @@ async fn test_claim_from_grant_via_scheduler() {
     let _sched_weak: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
         std::sync::Arc::downgrade(&_sched_backend_keepalive);
     let scheduler = ff_scheduler::claim::Scheduler::new(
-        tc.client().clone(),
+        Some(tc.client().clone()),
         _sched_weak,
         test_config(),
     );
@@ -4981,7 +4981,7 @@ async fn test_claim_from_grant_rejects_at_capacity() {
     let _sched_weak: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
         std::sync::Arc::downgrade(&_sched_backend_keepalive);
     let scheduler = ff_scheduler::claim::Scheduler::new(
-        tc.client().clone(),
+        Some(tc.client().clone()),
         _sched_weak,
         test_config(),
     );
@@ -8548,7 +8548,7 @@ async fn test_capability_mismatch_blocks_to_route_zset() {
     let _sched_backend_keepalive = tc.backend();
     let _sched_weak: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
         std::sync::Arc::downgrade(&_sched_backend_keepalive);
-    let scheduler = ff_scheduler::claim::Scheduler::new(tc.client().clone(), _sched_weak, config);
+    let scheduler = ff_scheduler::claim::Scheduler::new(Some(tc.client().clone()), _sched_weak, config);
 
     // Worker has only {cpu}; execution requires {gpu} → mismatch.
     let cpu_only: std::collections::BTreeSet<String> =
@@ -8642,7 +8642,7 @@ async fn test_capable_worker_unblocks_route_blocked() {
     let _sched_backend_keepalive = tc.backend();
     let _sched_weak: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
         std::sync::Arc::downgrade(&_sched_backend_keepalive);
-    let scheduler = ff_scheduler::claim::Scheduler::new(tc.client().clone(), _sched_weak, config);
+    let scheduler = ff_scheduler::claim::Scheduler::new(Some(tc.client().clone()), _sched_weak, config);
     let cpu_only: std::collections::BTreeSet<String> =
         ["cpu".to_owned()].into_iter().collect();
     scheduler
@@ -8793,7 +8793,7 @@ async fn test_capable_worker_unblocks_on_get_error_failopen() {
     let _sched_backend_keepalive = tc.backend();
     let _sched_weak: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
         std::sync::Arc::downgrade(&_sched_backend_keepalive);
-    let scheduler = ff_scheduler::claim::Scheduler::new(tc.client().clone(), _sched_weak, config);
+    let scheduler = ff_scheduler::claim::Scheduler::new(Some(tc.client().clone()), _sched_weak, config);
     let cpu_only: std::collections::BTreeSet<String> =
         ["cpu".to_owned()].into_iter().collect();
     scheduler

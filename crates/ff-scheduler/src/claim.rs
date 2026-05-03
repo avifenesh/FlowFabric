@@ -20,7 +20,7 @@
 //! pipeline + isolation notes.
 
 use ff_core::keys::{ExecKeyContext, IndexKeys};
-use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
+use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, quota_partition};
 use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, WorkerId, WorkerInstanceId};
 use ff_script::retry::is_retryable_kind;
 use std::collections::BTreeSet;
@@ -77,14 +77,16 @@ pub struct BudgetChecker {
     /// Cached budget status: budget_id → BudgetCheckResult.
     /// Reset at the start of each scheduler cycle.
     cache: std::collections::HashMap<String, BudgetCheckResult>,
-    config: PartitionConfig,
 }
 
 impl BudgetChecker {
-    pub fn new(config: PartitionConfig) -> Self {
+    pub fn new(_config: PartitionConfig) -> Self {
+        // `_config` retained in the signature for backward-compat —
+        // pre-#511 BudgetChecker computed Valkey key tags from it.
+        // Phase 3 routes through `backend.read_budget_usage_and_limits`
+        // which computes its own partition internally.
         Self {
             cache: std::collections::HashMap::new(),
-            config,
         }
     }
 
@@ -99,91 +101,47 @@ impl BudgetChecker {
     /// candidates sharing a budget do one read per cycle, not 50K.
     pub async fn check_budget(
         &mut self,
-        client: &ferriskey::Client,
+        backend: &dyn ff_core::engine_backend::EngineBackend,
         budget_id: &str,
     ) -> Result<&BudgetCheckResult, SchedulerError> {
         if self.cache.contains_key(budget_id) {
             return Ok(&self.cache[budget_id]);
         }
 
-        // Compute real {b:M} partition tag from budget_id
-        let (usage_key, limits_key) = match BudgetId::parse(budget_id) {
-            Ok(bid) => {
-                let partition = budget_partition(&bid, &self.config);
-                let tag = partition.hash_tag();
-                (
-                    format!("ff:budget:{}:{}:usage", tag, budget_id),
-                    format!("ff:budget:{}:{}:limits", tag, budget_id),
-                )
-            }
-            Err(_) => {
-                // Fallback for non-UUID budget IDs (test compat)
-                (
-                    format!("ff:budget:{{b:0}}:{}:usage", budget_id),
-                    format!("ff:budget:{{b:0}}:{}:limits", budget_id),
-                )
-            }
+        // Parse the budget id; fall through to "no limits" on
+        // non-UUID inputs (test-fixture compat, matches pre-#511).
+        let Ok(bid) = BudgetId::parse(budget_id) else {
+            self.cache
+                .insert(budget_id.to_owned(), BudgetCheckResult::Ok);
+            return Ok(&self.cache[budget_id]);
         };
 
-        let result =
-            Self::read_and_check(client, &usage_key, &limits_key)
-                .await
-                .map_err(|source| SchedulerError::ValkeyContext {
-                    source,
-                    context: format!("budget_checker read {budget_id}"),
-                })?;
+        let snapshot = backend
+            .read_budget_usage_and_limits(&bid)
+            .await
+            .map_err(|source| SchedulerError::EngineContext {
+                source: Box::new(source),
+                context: format!("budget_checker read {budget_id}"),
+            })?;
 
-        self.cache.insert(budget_id.to_owned(), result);
-        Ok(&self.cache[budget_id])
-    }
-
-    /// Read budget usage and limits, compare each dimension.
-    async fn read_and_check(
-        client: &ferriskey::Client,
-        usage_key: &str,
-        limits_key: &str,
-    ) -> Result<BudgetCheckResult, ferriskey::Error> {
-        // Read all limit dimensions via hgetall (returns HashMap, not flat pairs)
-        let limits: std::collections::HashMap<String, String> = client
-            .hgetall(limits_key)
-            .await?;
-
-        // Parse hard limits
-        for (field, limit_val) in &limits {
-            if !field.starts_with("hard:") {
-                continue;
-            }
-            let dimension = &field[5..]; // strip "hard:" prefix
-            let limit: u64 = match limit_val.parse() {
-                Ok(v) if v > 0 => v,
-                _ => continue,
-            };
-
-            // Read current usage for this dimension. Fail-closed: a
-            // transport error must NOT silently default the usage to 0
-            // (which would make every breach invisible).  Absence is
-            // still treated as 0 — the caller is expected to HSET
-            // usage_key on every increment.
-            let usage_str: Option<String> = client
-                .cmd("HGET")
-                .arg(usage_key)
-                .arg(dimension)
-                .execute()
-                .await?;
-            let usage: u64 = usage_str
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-
-            if usage >= limit {
-                return Ok(BudgetCheckResult::HardBreach {
-                    dimension: dimension.to_owned(),
-                    detail: format!("budget {}: {} {}/{}", usage_key, dimension, usage, limit),
-                });
+        // Fail-closed on hard-limit breach; matches the pre-#511 logic
+        // byte-for-byte (strip "hard:" prefix, >0 sentinel, usage>=limit).
+        let mut result = BudgetCheckResult::Ok;
+        for (dim, used, limit) in snapshot.hard_limits_with_usage() {
+            if used >= limit {
+                result = BudgetCheckResult::HardBreach {
+                    dimension: dim.to_owned(),
+                    detail: format!(
+                        "budget ff:budget:{}:usage: {} {}/{}",
+                        budget_id, dim, used, limit
+                    ),
+                };
+                break;
             }
         }
 
-        Ok(BudgetCheckResult::Ok)
+        self.cache.insert(budget_id.to_owned(), result);
+        Ok(&self.cache[budget_id])
     }
 
     /// Clear the cache at the start of a new scheduler cycle.
@@ -274,7 +232,13 @@ fn iter_partitions(total: u16, start: u16, count: u16) -> impl Iterator<Item = u
 /// [`SchedulerConfig::rotation_window_ms`]. The per-worker FNV jitter is
 /// applied on top so different workers diverge within any given window.
 pub struct Scheduler {
-    client: ferriskey::Client,
+    /// FF #511 Phase 3: optional ferriskey client. `Some` on Valkey
+    /// deployments (used for the scanner ZRANGEBYSCORE + a handful of
+    /// exec_core HGETs that have no trait primitive yet). `None` on
+    /// backend-only deployments (PG / SQLite) — the scheduler's
+    /// `claim_for_worker` returns `Ok(None)` when no client is
+    /// present, matching the "scanner unavailable" posture.
+    client: Option<ferriskey::Client>,
     /// FF #511 Phase 2c: backend-agnostic routing for the 6 scheduler
     /// primitives that have trait coverage (`server_time_ms`,
     /// `read_quota_policy_limits`, `check_admission`,
@@ -330,7 +294,7 @@ impl Scheduler {
     /// `ferriskey::Client` can wrap it in a `ValkeyBackend` via
     /// `ValkeyBackend::from_client_and_partitions` + `Arc::downgrade`.
     pub fn new(
-        client: ferriskey::Client,
+        client: Option<ferriskey::Client>,
         backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
         config: PartitionConfig,
     ) -> Self {
@@ -339,7 +303,7 @@ impl Scheduler {
 
     /// Construct a scheduler with an explicit [`SchedulerConfig`].
     pub fn with_config(
-        client: ferriskey::Client,
+        client: Option<ferriskey::Client>,
         backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
         config: PartitionConfig,
         scheduler_config: SchedulerConfig,
@@ -355,7 +319,7 @@ impl Scheduler {
 
     /// PR-94: construct a scheduler with a shared observability registry.
     pub fn with_metrics(
-        client: ferriskey::Client,
+        client: Option<ferriskey::Client>,
         backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
         config: PartitionConfig,
         metrics: std::sync::Arc<ff_observability::Metrics>,
@@ -366,7 +330,7 @@ impl Scheduler {
     /// Construct a scheduler with an explicit
     /// [`SchedulerConfig`] AND a shared observability registry.
     pub fn with_config_and_metrics(
-        client: ferriskey::Client,
+        client: Option<ferriskey::Client>,
         backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
         config: PartitionConfig,
         scheduler_config: SchedulerConfig,
@@ -380,6 +344,30 @@ impl Scheduler {
             rotation_state: AtomicU64::new(0),
             metrics,
         }
+    }
+
+    /// FF #511 Phase 3 — backend-only constructor. Drops the
+    /// `ferriskey::Client` requirement for consumers that don't run
+    /// on Valkey. Admission primitives route through the trait;
+    /// however the ZRANGEBYSCORE + exec_core HGET scanner path has
+    /// no trait primitive yet, so a clientless scheduler's
+    /// `claim_for_worker` returns `Ok(None)` — "no hit, scanner
+    /// unavailable on this backend". PG / SQLite deployments can
+    /// still wire their own native claim path
+    /// (`PostgresScheduler`, `SqliteBackend::claim_for_worker`);
+    /// this constructor is for generic trait-only consumers that
+    /// accept the degraded scanner.
+    pub fn new_with_backend(
+        backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
+        config: PartitionConfig,
+    ) -> Self {
+        Self::with_config_and_metrics(
+            None,
+            backend,
+            config,
+            SchedulerConfig::default(),
+            std::sync::Arc::new(ff_observability::Metrics::new()),
+        )
     }
 
     /// Return the current cursor for this call, advancing it if we're the
@@ -491,6 +479,19 @@ impl Scheduler {
                 "num_flow_partitions must be > 0".to_owned(),
             ));
         }
+        // FF #511 Phase 3: backend-only schedulers have no Valkey
+        // client, and this scanner path still needs ZRANGEBYSCORE /
+        // exec_core HGETs that have no trait primitive yet. Degrade
+        // gracefully to "no hit" instead of panicking; consumers
+        // running on non-Valkey backends should wire their own
+        // native claim path (PostgresScheduler, SqliteBackend).
+        let Some(client) = self.client.as_ref() else {
+            tracing::debug!(
+                worker_instance_id = worker_instance_id.as_str(),
+                "scheduler: no client configured (backend-only); returning Ok(None)"
+            );
+            return Ok(None);
+        };
         let mut budget_checker = BudgetChecker::new(self.config);
 
         // Jitter the partition scan start to avoid thundering-herd on
@@ -631,8 +632,7 @@ impl Scheduler {
 
             // ZRANGEBYSCORE eligible -inf +inf LIMIT 0 1
             // Lowest score = highest priority candidate
-            let candidates: Vec<String> = match self
-                .client
+            let candidates: Vec<String> = match client
                 .cmd("ZRANGEBYSCORE")
                 .arg(&eligible_key)
                 .arg("-inf")
@@ -705,8 +705,7 @@ impl Scheduler {
             // A narrow race exists where `required_capabilities` is
             // updated between our HGET and the FCALL — the FCALL is still
             // atomic and correct.
-            let required_caps_csv: Option<String> = match self
-                .client
+            let required_caps_csv: Option<String> = match client
                 .cmd("HGET")
                 .arg(&core_key)
                 .arg("required_capabilities")
@@ -753,7 +752,7 @@ impl Scheduler {
 
             // ── Budget pre-check (cross-partition, cached per cycle) ──
             if let Some(block_detail) = self
-                .check_budgets(&mut budget_checker, &exec_ctx, &core_key, &eid_s)
+                .check_budgets(client, &mut budget_checker, &exec_ctx, &core_key, &eid_s)
                 .await?
             {
                 // Budget breached — block candidate and try next
@@ -766,7 +765,7 @@ impl Scheduler {
 
             // ── Quota pre-check (cross-partition FCALL on {q:K}) ──
             let quota_admission = self
-                .check_quota(&exec_ctx, &core_key, &eid, now_ms)
+                .check_quota(client, &exec_ctx, &core_key, &eid, now_ms)
                 .await?;
             match &quota_admission {
                 QuotaCheckOutcome::Blocked(block_detail) => {
@@ -889,14 +888,14 @@ impl Scheduler {
     /// string if any budget is breached, None if all pass.
     async fn check_budgets(
         &self,
+        client: &ferriskey::Client,
         checker: &mut BudgetChecker,
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
         _eid_s: &str,
     ) -> Result<Option<String>, SchedulerError> {
         // Read budget_ids from exec_core (comma-separated or JSON list)
-        let budget_ids_str: Option<String> = self
-            .client
+        let budget_ids_str: Option<String> = client
             .cmd("HGET")
             .arg(core_key)
             .arg("budget_ids")
@@ -917,7 +916,8 @@ impl Scheduler {
             if budget_id.is_empty() {
                 continue;
             }
-            let result = checker.check_budget(&self.client, budget_id).await?;
+            let backend_for_budget = self.upgrade_backend()?;
+            let result = checker.check_budget(&*backend_for_budget, budget_id).await?;
             if let BudgetCheckResult::HardBreach { dimension, detail } = &result {
                 // PR-94: budget hard-breach counter, labelled by
                 // dimension so operators can distinguish "tokens"
@@ -933,6 +933,7 @@ impl Scheduler {
     /// Check quota admission for the candidate.
     async fn check_quota(
         &self,
+        client: &ferriskey::Client,
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
         eid: &ExecutionId,
@@ -941,8 +942,7 @@ impl Scheduler {
         let eid_s = eid.to_string();
         let eid_s = eid_s.as_str();
         // Read quota_policy_id from exec_core
-        let quota_id_str: Option<String> = self
-            .client
+        let quota_id_str: Option<String> = client
             .cmd("HGET")
             .arg(core_key)
             .arg("quota_policy_id")

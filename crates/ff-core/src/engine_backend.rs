@@ -81,7 +81,8 @@ use crate::contracts::{
     EvaluateFlowEligibilityArgs, EvaluateFlowEligibilityResult, ExecutionInfo,
     FailExecutionArgs, FailExecutionResult,
     IssueClaimGrantArgs, IssueClaimGrantOutcome, IssueGrantAndClaimArgs,
-    QuotaPolicyLimits, RecordSpendArgs, ReleaseAdmissionArgs, ReleaseAdmissionResult,
+    BudgetUsageAndLimits, QuotaPolicyLimits, RecordSpendArgs, ReleaseAdmissionArgs,
+    ReleaseAdmissionResult,
     ReleaseBudgetArgs, ScanEligibleArgs,
     ListExecutionsPage, ListFlowsPage, ListLanesPage, ListPendingWaitpointsArgs,
     ListPendingWaitpointsResult, ListSuspendedPage, RenewLeaseArgs, RenewLeaseResult,
@@ -1709,6 +1710,21 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<BlockExecutionForAdmissionOutcome, EngineError> {
         Err(EngineError::Unavailable {
             op: "block_execution_for_admission",
+        })
+    }
+
+    /// FF #511 Phase 3 — typed snapshot of a budget's usage + limits
+    /// hashes. Replaces the scheduler's Valkey-shaped HGETALL/HGET
+    /// pattern on `ff:budget:{K}:{id}:limits` + `ff:budget:{K}:{id}:usage`.
+    /// Returns [`BudgetUsageAndLimits::empty`] when the limits hash
+    /// is absent ("no limits configured" — not an error).
+    #[cfg(feature = "core")]
+    async fn read_budget_usage_and_limits(
+        &self,
+        _budget_id: &BudgetId,
+    ) -> Result<BudgetUsageAndLimits, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "read_budget_usage_and_limits",
         })
     }
 
