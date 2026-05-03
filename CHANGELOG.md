@@ -5,6 +5,64 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **FF #511 scheduler backend-agnostic.** `ff_scheduler::Scheduler` no
+  longer hard-couples to `ferriskey::Client`. New constructor
+  `Scheduler::new_with_backend(Weak<dyn EngineBackend>, PartitionConfig)`
+  lets Postgres-only deployments wire the scheduler through trait-
+  routed admission primitives — the cairn-rs PG control-plane ask. Four
+  new `EngineBackend` methods landed: `release_admission` +
+  `read_quota_policy_limits` (all three backends),
+  `block_execution_for_admission` + `read_budget_usage_and_limits`
+  (Valkey-only; PG/SQLite stay `Unavailable` per RFC-023 §4.1).
+  `Scheduler.client` is now `Option<ferriskey::Client>`; on clientless
+  deploys `claim_for_worker` degrades to `Ok(None)` (the ZRANGEBYSCORE +
+  `exec_core` HGET scanner path remains Valkey-bound and will be lifted
+  via a follow-up RFC). See
+  [`docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md`](docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md).
+- **`v015-ff511-scheduler-agnostic` example.** v0.15 headline demo
+  under `examples/v015-ff511-scheduler-agnostic/` — a PG-only
+  deployment asserts the new capability surface, reads a typed
+  quota-policy snapshot, constructs `Scheduler::new_with_backend(..)`
+  without a `ferriskey::Client`, verifies `claim_for_worker` → `Ok(None)`,
+  and exercises `release_admission` + idempotent replay with
+  floor-clamp on `active_concurrency`.
+
+### Fixed
+
+- **PG capability surface missed FF #511 Phase 2a flags.** Caught by
+  the new v0.15 example: `postgres_supports_base()` advertised
+  `release_admission = false` + `read_quota_policy_limits = false`
+  even though the PG bodies shipped. Flipped both to `true` to match
+  Valkey + SQLite and the POSTGRES_PARITY_MATRIX entry.
+
+### Breaking
+
+- **`Scheduler::new` / `with_config` / `with_metrics` / `with_config_and_metrics`
+  signature change.** All four now take `Option<ferriskey::Client>` +
+  `Weak<dyn EngineBackend>` instead of `ferriskey::Client`. Wrap
+  existing `client.clone()` in `Some(..)` and pass an
+  `Arc::downgrade(&backend_arc) as Weak<dyn EngineBackend>`. When
+  constructing the backend and scheduler together, use
+  `ValkeyBackend::install_scheduler_cyclic` + `Arc::new_cyclic` so the
+  scheduler's `Weak` points at the final Arc at construction time.
+- **`SchedulerError` gained `EngineContext { source: Box<EngineError>, context: String }`.**
+  Wraps trait-routed errors with admission-site context.
+  `valkey_kind()` returns `None` for this variant (the classified
+  error carries its own typed `EngineError.kind`). Existing callers
+  matching `Valkey`/`ValkeyContext`/`Config` still compile —
+  non-exhaustive match is required.
+- **`BudgetChecker::check_budget` signature changed:**
+  `&ferriskey::Client` → `&dyn EngineBackend`. All in-workspace call
+  sites updated; out-of-workspace consumers (unlikely — this is a
+  scheduler-internal API) need to migrate.
+- **Non-UUID budget IDs no longer fall back to
+  `ff:budget:{b:0}:<raw>:limits`.** Pre-#511 the scheduler attempted
+  a sentinel partition for non-UUID ids; post-#511 they short-circuit
+  to "no limits configured". Use `BudgetId::new()` (UUID) for all
+  budgets.
+
 ## [0.14.1] - 2026-05-03
 
 ### Fixed
