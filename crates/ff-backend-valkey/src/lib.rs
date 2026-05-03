@@ -6127,18 +6127,29 @@ impl EngineBackend for ValkeyBackend {
             return Ok(None);
         }
 
-        let parse_u64 = |i: usize, default: u64| -> u64 {
-            fields
-                .get(i)
-                .and_then(|f| f.as_deref())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default)
+        // Fields written by `ff_create_quota_policy` Lua; any that's
+        // present-but-unparseable means the hash was corrupted
+        // out-of-band. Absent fields are treated as 0 (disabled)
+        // because the policy hash historically didn't carry every
+        // field — the scheduler's is_unlimited() short-circuit
+        // handles the all-zero case cleanly.
+        let parse_field = |i: usize, name: &str| -> Result<u64, EngineError> {
+            match fields.get(i).and_then(|f| f.as_deref()) {
+                None => Ok(0),
+                Some(s) => s.parse::<u64>().map_err(|e| EngineError::Validation {
+                    kind: ValidationKind::Corruption,
+                    detail: format!(
+                        "read_quota_policy_limits: quota_policy={} field={} value={:?}: {}",
+                        quota_policy_id, name, s, e
+                    ),
+                }),
+            }
         };
         Ok(Some(ff_core::contracts::QuotaPolicyLimits::new(
-            parse_u64(0, 0),
-            parse_u64(1, 60),
-            parse_u64(2, 0),
-            parse_u64(3, 0),
+            parse_field(0, "max_requests_per_window")?,
+            parse_field(1, "requests_per_window_seconds")?,
+            parse_field(2, "active_concurrency_cap")?,
+            parse_field(3, "jitter_ms")?,
         )))
     }
 

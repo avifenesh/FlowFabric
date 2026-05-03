@@ -1949,14 +1949,32 @@ pub(crate) async fn read_quota_policy_limits(
 
     let Some(row) = row else { return Ok(None); };
 
-    let max_requests_per_window: i64 = row.try_get("max_requests_per_window").map_err(map_sqlx_error)?;
-    let requests_per_window_seconds: i64 = row.try_get("requests_per_window_seconds").map_err(map_sqlx_error)?;
-    let active_concurrency_cap: i64 = row.try_get("active_concurrency_cap").map_err(map_sqlx_error)?;
+    let max_requests_per_window: i64 =
+        row.try_get("max_requests_per_window").map_err(map_sqlx_error)?;
+    let requests_per_window_seconds: i64 = row
+        .try_get("requests_per_window_seconds")
+        .map_err(map_sqlx_error)?;
+    let active_concurrency_cap: i64 =
+        row.try_get("active_concurrency_cap").map_err(map_sqlx_error)?;
+
+    // Stored as non-negative bigint per 0012_quota_policy.sql; a
+    // negative value here means the row was corrupted out-of-band.
+    // Surface as Corruption so callers don't silently degrade to
+    // "unlimited".
+    let to_u64 = |field: &str, v: i64| -> Result<u64, EngineError> {
+        u64::try_from(v).map_err(|_| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!(
+                "read_quota_policy_limits: quota_policy={} field={} value={} (negative)",
+                quota_policy_id, field, v
+            ),
+        })
+    };
 
     Ok(Some(ff_core::contracts::QuotaPolicyLimits::new(
-        u64::try_from(max_requests_per_window.max(0)).unwrap_or(0),
-        u64::try_from(requests_per_window_seconds.max(0)).unwrap_or(0),
-        u64::try_from(active_concurrency_cap.max(0)).unwrap_or(0),
+        to_u64("max_requests_per_window", max_requests_per_window)?,
+        to_u64("requests_per_window_seconds", requests_per_window_seconds)?,
+        to_u64("active_concurrency_cap", active_concurrency_cap)?,
         0, // PG has no jitter_ms column; scheduler treats 0 as disabled.
     )))
 }
