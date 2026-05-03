@@ -563,6 +563,14 @@ impl Scheduler {
                 worker_caps_csv.len()
             )));
         }
+        // FF #511 Phase 2c: build the caps BTreeSet once per claim call
+        // (worker_caps_csv is loop-invariant). Cloned into each
+        // IssueClaimGrantArgs inside the partition loop.
+        let worker_caps_set: std::collections::BTreeSet<String> = worker_caps_csv
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
 
         // ── Bounded scan with rotation cursor ──
         // Prior impl walked all `num_partitions` partitions on every call,
@@ -758,7 +766,7 @@ impl Scheduler {
 
             // ── Quota pre-check (cross-partition FCALL on {q:K}) ──
             let quota_admission = self
-                .check_quota(&exec_ctx, &core_key, &eid_s, now_ms)
+                .check_quota(&exec_ctx, &core_key, &eid, now_ms)
                 .await?;
             match &quota_admission {
                 QuotaCheckOutcome::Blocked(block_detail) => {
@@ -776,18 +784,13 @@ impl Scheduler {
             let _ = &core_key; // kept for any future direct read; unused post-trait-route
 
             // FF #511 Phase 2c: route through `backend.issue_claim_grant`.
-            let caps_set: std::collections::BTreeSet<String> = worker_caps_csv
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
             let args = ff_core::contracts::IssueClaimGrantArgs::new(
                 eid.clone(),
                 lane.clone(),
                 worker_id.clone(),
                 worker_instance_id.clone(),
                 partition,
-                caps_set,
+                worker_caps_set.clone(),
                 grant_ttl_ms,
                 ff_core::types::TimestampMs(now_ms as i64),
             );
@@ -796,12 +799,48 @@ impl Scheduler {
             let outcome = match backend.issue_claim_grant(args).await {
                 Ok(o) => o,
                 Err(e) => {
-                    tracing::warn!(
-                        partition = p_idx,
-                        execution_id = eid_s.as_str(),
-                        error = %e,
-                        "scheduler: issue_claim_grant transport error, trying next"
+                    // Classify the error. EngineError::Validation with
+                    // CapabilityMismatch is the Lua-race variant — it
+                    // means required_capabilities mutated between our
+                    // HGET pre-check and the trait body's re-check.
+                    // Must fail-closed by blocking (old behaviour);
+                    // otherwise the next tick re-picks the same
+                    // candidate in a tight loop.
+                    //
+                    // Any other error (transport, other validation,
+                    // logical rejects) is best-effort: log + rollback
+                    // admission + try next partition, matching the
+                    // pre-refactor path.
+                    let is_capability_mismatch = matches!(
+                        &e,
+                        ff_core::engine_error::EngineError::Validation {
+                            kind: ff_core::engine_error::ValidationKind::CapabilityMismatch,
+                            ..
+                        }
                     );
+                    if is_capability_mismatch {
+                        tracing::info!(
+                            partition = p_idx,
+                            execution_id = eid_s.as_str(),
+                            worker_id = %worker_id,
+                            worker_caps_hash = worker_caps_hash.as_str(),
+                            error = %e,
+                            "scheduler: capability mismatch via trait (race), blocking execution"
+                        );
+                        self.block_candidate(
+                            &partition, &idx, lane, &eid, &eligible_key,
+                            "waiting_for_capable_worker",
+                            "no connected worker satisfies required_capabilities",
+                            now_ms,
+                        ).await;
+                    } else {
+                        tracing::warn!(
+                            partition = p_idx,
+                            execution_id = eid_s.as_str(),
+                            error = %e,
+                            "scheduler: issue_claim_grant rejected, trying next"
+                        );
+                    }
                     if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
                         self.release_admission(tag, quota_id, eid).await;
                     }
@@ -809,11 +848,9 @@ impl Scheduler {
                 }
             };
 
-            // Trait's `IssueClaimGrantOutcome` only surfaces `Granted`
-            // as success today; Lua-level rejects (capability mismatch,
-            // grant_already_exists, etc.) come back on the outer `Err`
-            // branch above. Pattern-match with a wildcard to stay
-            // #[non_exhaustive]-robust without dropping into dead-code.
+            // `IssueClaimGrantOutcome` only surfaces `Granted` as
+            // success today; keep the wildcard to stay non_exhaustive-
+            // robust.
             let _ = outcome;
 
             partitions_hit += 1;
@@ -898,9 +935,11 @@ impl Scheduler {
         &self,
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
-        eid_s: &str,
+        eid: &ExecutionId,
         now_ms: u64,
     ) -> Result<QuotaCheckOutcome, SchedulerError> {
+        let eid_s = eid.to_string();
+        let eid_s = eid_s.as_str();
         // Read quota_policy_id from exec_core
         let quota_id_str: Option<String> = self
             .client
@@ -927,16 +966,15 @@ impl Scheduler {
             Err(_) => "{q:0}".to_owned(), // fallback for non-UUID test IDs
         };
 
-        let quota_def_key = format!("ff:quota:{}:{}", tag, quota_id_str);
-        let window_key = format!("ff:quota:{}:{}:window:requests_per_window", tag, quota_id_str);
-        let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id_str);
-        let admitted_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id_str, eid_s);
-        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id_str);
-
-        // FF #511 Phase 2c: route the policy-limits read through the
-        // trait. Parse failure on `quota_id_str` → treat as no-quota
-        // (matches pre-#511 behaviour where invalid IDs fell through
-        // to the unlimited branch).
+        // FF #511 Phase 2c: Valkey-shaped quota_def_key / window_key /
+        // concurrency_key / admitted_key / admitted_set_key used to
+        // be built here for the pre-#511 FCALL KEYS array. The trait
+        // primitives now compute their own keys from `quota_policy_id`
+        // + `execution_id`. No need to build them scheduler-side.
+        //
+        // Parse failure on `quota_id_str` → treat as no-quota (matches
+        // pre-#511 behaviour where invalid IDs fell through to the
+        // unlimited branch).
         let Ok(qid) = QuotaPolicyId::parse(&quota_id_str) else {
             return Ok(QuotaCheckOutcome::NoQuota);
         };
@@ -964,24 +1002,12 @@ impl Scheduler {
         }
 
         // FF #511 Phase 2c: route through `backend.check_admission`.
-        // The trait result enum maps 1:1 onto the pre-#511 Lua status
-        // strings: Admitted/AlreadyAdmitted → QuotaCheckOutcome::Admitted,
-        // RateExceeded → Blocked (rate), ConcurrencyExceeded → Blocked.
-        // Unused inline keys stay in scope as dead references only —
-        // remove them since the FCALL path is gone.
-        let _ = (&window_key, &concurrency_key, &quota_def_key,
-                 &admitted_key, &admitted_set_key);
-
-        let eid_typed = match ExecutionId::parse(eid_s) {
-            Ok(e) => e,
-            Err(_) => {
-                return Err(SchedulerError::Config(format!(
-                    "check_quota: invalid execution_id {eid_s:?}"
-                )));
-            }
-        };
+        // Trait's CheckAdmissionResult enum maps 1:1 onto the pre-#511
+        // Lua status strings: Admitted/AlreadyAdmitted →
+        // QuotaCheckOutcome::Admitted, RateExceeded → Blocked (rate),
+        // ConcurrencyExceeded → Blocked.
         let args = ff_core::contracts::CheckAdmissionArgs {
-            execution_id: eid_typed,
+            execution_id: eid.clone(),
             now: ff_core::types::TimestampMs(now_ms as i64),
             window_seconds: window_secs,
             rate_limit,
