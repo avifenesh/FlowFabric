@@ -38,16 +38,41 @@ impl LoadError {
 /// 2. If missing or version mismatch → `FUNCTION LOAD REPLACE` (with retry)
 /// 3. Verify by calling `ff_version` again
 pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
-    match check_version(client).await {
-        Ok(true) => {
-            tracing::debug!("flowfabric library already loaded at version {LIBRARY_VERSION}");
-            return Ok(());
-        }
-        Ok(false) => {
-            tracing::info!("flowfabric library version mismatch, reloading");
-        }
-        Err(_) => {
-            tracing::info!("flowfabric library not loaded, loading");
+    // Dev-only override: `FF_FORCE_LUA_RELOAD=1` forces FUNCTION LOAD
+    // REPLACE on every ensure_library call, skipping the version fast-
+    // path. Addresses the dev/test footgun where local Lua edits
+    // without a `flowfabric_lua_version` bump leave the cached library
+    // stale (silent stale FCALLs — cost the PR-F cap-exceeded
+    // investigation a session of red herrings before root-causing).
+    //
+    // The PR-level CI guardrail (`.github/workflows/matrix.yml` ff-
+    // script lua drift) catches the same shape before merge; this
+    // override covers the inner loop where a dev iterates locally
+    // without pushing. Production deployments leave the env unset, so
+    // the version-guard stays intact under concurrent deploys.
+    //
+    // Any truthy value (`1`, `true`, `yes`, case-insensitive) enables
+    // the force-reload. Empty or unset is a no-op.
+    let force_reload = std::env::var("FF_FORCE_LUA_RELOAD")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if force_reload {
+        tracing::info!(
+            "FF_FORCE_LUA_RELOAD set — bypassing version check, forcing FUNCTION LOAD REPLACE"
+        );
+    } else {
+        match check_version(client).await {
+            Ok(true) => {
+                tracing::debug!("flowfabric library already loaded at version {LIBRARY_VERSION}");
+                return Ok(());
+            }
+            Ok(false) => {
+                tracing::info!("flowfabric library version mismatch, reloading");
+            }
+            Err(_) => {
+                tracing::info!("flowfabric library not loaded, loading");
+            }
         }
     }
 
