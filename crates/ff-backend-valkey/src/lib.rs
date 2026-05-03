@@ -6127,7 +6127,8 @@ impl EngineBackend for ValkeyBackend {
         let reason_code = args.reason.reason_code();
 
         let keys: [&str; 3] = [&core_key, &eligible_key, &blocked_key];
-        let argv: [&str; 4] = [&eid_s, reason_code, &args.reason_detail, &now_ms];
+        let reason_detail_s = args.reason_detail.as_deref().unwrap_or_default();
+        let argv: [&str; 4] = [&eid_s, reason_code, reason_detail_s, &now_ms];
 
         let raw: ferriskey::Value = self
             .client

@@ -2129,8 +2129,8 @@ pub struct BlockExecutionForAdmissionArgs {
     pub lane_id: LaneId,
     pub partition: crate::partition::Partition,
     pub reason: BlockingReason,
-    /// Human-readable operator-visible detail (optional).
-    pub reason_detail: String,
+    /// Human-readable operator-visible detail; `None` = no detail.
+    pub reason_detail: Option<String>,
     pub now: TimestampMs,
 }
 
@@ -2140,7 +2140,7 @@ impl BlockExecutionForAdmissionArgs {
         lane_id: LaneId,
         partition: crate::partition::Partition,
         reason: BlockingReason,
-        reason_detail: String,
+        reason_detail: Option<String>,
         now: TimestampMs,
     ) -> Self {
         Self {
