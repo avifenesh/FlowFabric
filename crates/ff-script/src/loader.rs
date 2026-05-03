@@ -77,15 +77,60 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
     let backoff_ms: [u64; 5] = [500, 1_000, 2_000, 4_000, 7_000];
     let mut last_err = None;
     for attempt in 1..=MAX_ATTEMPTS {
+        let attempt_start = std::time::Instant::now();
         match client.function_load_replace(LIBRARY_SOURCE).await {
             Ok(_name) => {
                 last_err = None;
                 break;
             }
             Err(e) => {
+                let attempt_ms = attempt_start.elapsed().as_millis() as u64;
                 if is_permanent_load_error(&e) {
-                    tracing::error!(attempt, error = %e, "FUNCTION LOAD failed with permanent error");
+                    tracing::error!(attempt, attempt_ms, error = %e, "FUNCTION LOAD failed with permanent error");
                     return Err(LoadError::Valkey(e));
+                }
+                // Diagnostic instrumentation for the arm-cluster
+                // FUNCTION LOAD READONLY flake (memory note:
+                // project_arm_cluster_function_load_flake.md). On
+                // ferriskey::ErrorKind::ReadOnly from a cluster client,
+                // dump the canonical gossip-aggregated topology view
+                // via CLUSTER NODES alongside the per-attempt
+                // wall-clock so the next repro ships enough signal to
+                // disambiguate: (a) client-side stale slot map vs
+                // (b) cluster genuinely mid-gossip-convergence vs
+                // (c) ferriskey's retry budget getting cut short at
+                // 3 instead of the default 16.
+                //
+                // Gate: only runs on `ReadOnly`, so standalone dev
+                // loops and permanent-syntax-error paths stay clean.
+                // CLUSTER NODES is routed by ferriskey to a single
+                // node (whichever served the last request); on arm
+                // that's one of 7000-7005. A single-node answer is
+                // enough — gossip-converged clusters agree; a
+                // disagreement between that answer and ferriskey's
+                // fan-out targets IS the signal we're looking for.
+                if e.kind() == ferriskey::ErrorKind::ReadOnly {
+                    let cluster_nodes: Result<String, ferriskey::Error> = client
+                        .cmd("CLUSTER")
+                        .arg("NODES")
+                        .execute()
+                        .await;
+                    match cluster_nodes {
+                        Ok(view) => tracing::warn!(
+                            attempt,
+                            attempt_ms,
+                            error = %e,
+                            cluster_nodes = %view,
+                            "FUNCTION LOAD READONLY — canonical topology view (CLUSTER NODES) at failure"
+                        ),
+                        Err(probe_err) => tracing::warn!(
+                            attempt,
+                            attempt_ms,
+                            error = %e,
+                            probe_error = %probe_err,
+                            "FUNCTION LOAD READONLY — CLUSTER NODES probe also failed"
+                        ),
+                    }
                 }
                 if attempt < MAX_ATTEMPTS {
                     // Log the transient error's Display before moving
@@ -111,6 +156,7 @@ pub async fn ensure_library(client: &Client) -> Result<(), LoadError> {
                     }
                     tracing::warn!(
                         attempt,
+                        attempt_ms,
                         max_attempts = MAX_ATTEMPTS,
                         backoff_ms = backoff,
                         error = %e,
