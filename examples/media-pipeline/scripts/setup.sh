@@ -82,7 +82,7 @@ fi
 #    magic (the exact 4 bytes vary by whisper.cpp version, so just
 #    range-check the size).
 mkdir -p "$ROOT/models"
-MIN_MODEL_BYTES=50000000  # 50 MiB floor; real file is ~77 MiB
+MIN_MODEL_BYTES=20000000  # 20 MiB floor; tiny.en-q5_1 is ~31 MiB
 model_looks_complete() {
     [ -f "$1" ] || return 1
     local size

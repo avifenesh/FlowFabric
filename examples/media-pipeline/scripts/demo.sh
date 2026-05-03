@@ -81,9 +81,28 @@ if [ -z "$SUMMARIZE_EID" ]; then
 fi
 
 echo "[demo] summarize eid = $SUMMARIZE_EID"
+
+# Wait for summarize worker to emit REVIEW_NEEDED with the
+# waitpoint_id — the review CLI needs it on the Suspended branch.
+WAITPOINT_ID=""
+for _ in $(seq 1 300); do
+    if grep -q "REVIEW_NEEDED.*wp=" "$LOGDIR/summarize.log" 2>/dev/null; then
+        WAITPOINT_ID="$(grep -oE 'wp=[^ ]+' "$LOGDIR/summarize.log" | head -1 | sed 's/^wp=//')"
+        break
+    fi
+    sleep 1
+done
+
+if [ -z "$WAITPOINT_ID" ]; then
+    echo "[demo] could not extract waitpoint_id — summarize worker never suspended" >&2
+    exit 1
+fi
+echo "[demo] waitpoint_id = $WAITPOINT_ID"
+
 echo "[demo] running review --auto-approve"
 ./target/debug/review \
     --execution-id "$SUMMARIZE_EID" \
+    --waitpoint-id "$WAITPOINT_ID" \
     --server "$SERVER" \
     --auto-approve \
     2>&1 | tee "$LOGDIR/review.log"
