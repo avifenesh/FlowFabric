@@ -2032,12 +2032,40 @@ pub enum CheckAdmissionResult {
 
 // ─── release_admission ───
 
+/// Args for [`crate::engine_backend::EngineBackend::release_admission`].
+///
+/// Called when `issue_claim_grant` fails after admission was recorded,
+/// to prevent leaked concurrency slots. Semantics are idempotent: a
+/// release against an already-released slot is a no-op (matches the
+/// Valkey Lua body's DEL-is-idempotent + DECR-if-positive discipline).
+///
+/// FF #511 Phase 1 extended this with `quota_policy_id` so PG/SQLite
+/// bodies can locate the admission row without reverse-mapping from
+/// the execution. Valkey still derives its quota key from the
+/// `{p:N}` partition tag + quota id.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReleaseAdmissionArgs {
+    /// The quota policy whose admission slot should be released.
+    pub quota_policy_id: crate::types::QuotaPolicyId,
+    /// The execution whose slot was admitted.
     pub execution_id: ExecutionId,
 }
 
+impl ReleaseAdmissionArgs {
+    pub fn new(
+        quota_policy_id: crate::types::QuotaPolicyId,
+        execution_id: ExecutionId,
+    ) -> Self {
+        Self {
+            quota_policy_id,
+            execution_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ReleaseAdmissionResult {
     Released,
 }
