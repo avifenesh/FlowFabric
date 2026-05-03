@@ -1248,6 +1248,20 @@ impl EngineBackend for PostgresBackend {
         crate::typed_ops::release_admission(&self.pool, &self.partition_config, args).await
     }
 
+    #[cfg(feature = "core")]
+    #[tracing::instrument(name = "pg.read_quota_policy_limits", skip_all)]
+    async fn read_quota_policy_limits(
+        &self,
+        quota_policy_id: &ff_core::types::QuotaPolicyId,
+    ) -> Result<Option<ff_core::contracts::QuotaPolicyLimits>, EngineError> {
+        crate::typed_ops::read_quota_policy_limits(
+            &self.pool,
+            &self.partition_config,
+            quota_policy_id,
+        )
+        .await
+    }
+
     // ── HMAC secret rotation (v0.7 migration-master Q4) ──
     //
     // Wave 4 replaces this stub with a single INSERT into
