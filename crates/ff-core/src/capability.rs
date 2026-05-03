@@ -165,6 +165,10 @@ pub struct Supports {
     /// fields on a quota policy (FF #511 Phase 2a). Replaces the
     /// Valkey-shaped 4-HGET pattern.
     pub read_quota_policy_limits: bool,
+    /// `block_execution_for_admission` — generalised admission block
+    /// covering budget / quota / capability reason codes
+    /// (FF #511 Phase 2b).
+    pub block_execution_for_admission: bool,
     // Add new fields here, preserving parity-matrix order.
 }
 
@@ -216,6 +220,7 @@ impl Supports {
             list_workers: false,
             release_admission: false,
             read_quota_policy_limits: false,
+            block_execution_for_admission: false,
         }
     }
 }
