@@ -108,10 +108,34 @@ pub async fn register_worker(
         });
     }
 
-    // `RETURNING (xmax = 0)` is the idiomatic "was this an insert?"
-    // signal on Postgres UPSERTs: `xmax` is 0 on an insert, non-zero
-    // on an update-path through ON CONFLICT.
-    let registered: bool = sqlx::query_scalar(
+    // "Was this an INSERT vs a conflict-UPDATE?" signal.
+    //
+    // Postgres 16 + sqlx 0.8.x rejects any `RETURNING` projection
+    // that references the `xmax` system column with SQLSTATE 0A000
+    // "cannot retrieve a system column in this context"
+    // (tts_virtual_getsysattr, execTuples.c:144 — cairn bug FF #508).
+    // This is true even for `xmax::text` / `(xmax = 0)::bool` etc.
+    // because sqlx's portal path uses a virtual tuple slot that PG
+    // 16 rejects system-column access from.
+    //
+    // Workaround: issue a separate SELECT to learn if the target
+    // row existed before the UPSERT. Wrap both statements in the
+    // transaction we already hold so the read is consistent with
+    // the write.
+    let pre_existed: Option<i64> = sqlx::query_scalar(
+        "SELECT 1::bigint FROM ff_worker_registry \
+          WHERE partition_key = $1 \
+            AND namespace = $2 \
+            AND worker_instance_id = $3",
+    )
+    .bind(partition_key)
+    .bind(args.namespace.as_str())
+    .bind(args.worker_instance_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    sqlx::query(
         "INSERT INTO ff_worker_registry (\
              partition_key, namespace, worker_instance_id, worker_id, \
              lanes, capabilities_csv, last_heartbeat_ms, liveness_ttl_ms, \
@@ -122,8 +146,7 @@ pub async fn register_worker(
              lanes = EXCLUDED.lanes, \
              capabilities_csv = EXCLUDED.capabilities_csv, \
              last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, \
-             liveness_ttl_ms = EXCLUDED.liveness_ttl_ms \
-         RETURNING (xmax = 0)",
+             liveness_ttl_ms = EXCLUDED.liveness_ttl_ms",
     )
     .bind(partition_key)
     .bind(args.namespace.as_str())
@@ -134,9 +157,10 @@ pub async fn register_worker(
     .bind(args.now.0)
     .bind(args.liveness_ttl_ms as i64)
     .bind(args.now.0)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await
     .map_err(map_sqlx_error)?;
+    let registered = pre_existed.is_none();
 
     sqlx::query(
         "INSERT INTO ff_worker_registry_event \
