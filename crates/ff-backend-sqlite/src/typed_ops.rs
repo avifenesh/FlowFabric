@@ -2221,3 +2221,51 @@ pub(crate) async fn release_admission(
     commit_or_rollback(&mut conn).await?;
     Ok(ff_core::contracts::ReleaseAdmissionResult::Released)
 }
+
+/// SQLite body for [`ff_core::engine_backend::EngineBackend::read_quota_policy_limits`].
+///
+/// Mirror of the PG body (same schema columns, no `jitter_ms`).
+/// FF #511 Phase 2a.
+pub(crate) async fn read_quota_policy_limits(
+    pool: &SqlitePool,
+    quota_policy_id: &QuotaPolicyId,
+) -> Result<Option<ff_core::contracts::QuotaPolicyLimits>, EngineError> {
+    let part: i64 = 0;
+    let row = sqlx::query(
+        "SELECT max_requests_per_window, requests_per_window_seconds, active_concurrency_cap \
+           FROM ff_quota_policy \
+          WHERE partition_key = ?1 AND quota_policy_id = ?2",
+    )
+    .bind(part)
+    .bind(quota_policy_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    let Some(row) = row else { return Ok(None); };
+
+    let max_requests_per_window: i64 =
+        row.try_get("max_requests_per_window").map_err(map_sqlx_error)?;
+    let requests_per_window_seconds: i64 = row
+        .try_get("requests_per_window_seconds")
+        .map_err(map_sqlx_error)?;
+    let active_concurrency_cap: i64 =
+        row.try_get("active_concurrency_cap").map_err(map_sqlx_error)?;
+
+    let to_u64 = |field: &str, v: i64| -> Result<u64, EngineError> {
+        u64::try_from(v).map_err(|_| EngineError::Validation {
+            kind: ValidationKind::Corruption,
+            detail: format!(
+                "read_quota_policy_limits: quota_policy={} field={} value={} (negative)",
+                quota_policy_id, field, v
+            ),
+        })
+    };
+
+    Ok(Some(ff_core::contracts::QuotaPolicyLimits::new(
+        to_u64("max_requests_per_window", max_requests_per_window)?,
+        to_u64("requests_per_window_seconds", requests_per_window_seconds)?,
+        to_u64("active_concurrency_cap", active_concurrency_cap)?,
+        0,
+    )))
+}

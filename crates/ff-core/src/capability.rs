@@ -161,6 +161,10 @@ pub struct Supports {
     /// used by `ff_scheduler` on the claim-fail rollback path. `true`
     /// on every in-tree backend post-FF-#511.
     pub release_admission: bool,
+    /// `read_quota_policy_limits` — typed snapshot of the admission
+    /// fields on a quota policy (FF #511 Phase 2a). Replaces the
+    /// Valkey-shaped 4-HGET pattern.
+    pub read_quota_policy_limits: bool,
     // Add new fields here, preserving parity-matrix order.
 }
 
@@ -211,6 +215,7 @@ impl Supports {
             list_expired_leases: false,
             list_workers: false,
             release_admission: false,
+            read_quota_policy_limits: false,
         }
     }
 }
