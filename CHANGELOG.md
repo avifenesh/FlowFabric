@@ -5,6 +5,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`FF_FORCE_LUA_RELOAD` dev-only env override** (ff-script). When
+  set to `1` / `true` / `yes`, `ff_script::loader::ensure_library`
+  bypasses the version-check fast-path and always issues
+  `FUNCTION LOAD REPLACE`. Closes the dev/test footgun where local
+  Lua edits without a `flowfabric_lua_version` bump leave a
+  long-lived dev Valkey serving the stale cached library (silent
+  stale FCALLs). The PR-level CI guard (`ff-script lua drift`)
+  already catches un-bumped edits before merge; this env covers the
+  inner dev loop where the change isn't pushed yet. Production
+  deployments leave the env unset — the version-guard prevents
+  accidental reloads under concurrent deploys.
+
 ## [0.15.0] - 2026-05-03
 
 ### Added

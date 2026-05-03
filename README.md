@@ -167,6 +167,7 @@ For production deployments, use the Scheduler (`ff-scheduler`) which enforces ad
   | `FF_SQLITE_PATH` | `:memory:` | SQLite path or URI (required shape under `FF_BACKEND=sqlite`). File path (`/tmp/ff-dev.db`) or URI (`file:name?mode=memory&cache=shared`). Dev-only per RFC-023. |
   | `FF_SQLITE_POOL_SIZE` | `4` | SQLite pool size (1 writer + N–1 readers); ignored on non-SQLite paths. |
   | `FF_DEV_MODE` | *(unset)* | **Required** when `FF_BACKEND=sqlite` or when constructing `SqliteBackend::new` directly; server + backend refuse to start without it. Orthogonal to `FF_ENV=development` / `FF_BACKEND_ACCEPT_UNREADY=1`. No effect on Valkey / Postgres paths. See [`docs/dev-harness.md`](docs/dev-harness.md). |
+  | `FF_FORCE_LUA_RELOAD` | *(unset)* | **Dev-only.** When set to `1`/`true`/`yes`, `ff_script::loader::ensure_library` bypasses the version-check fast-path and always issues `FUNCTION LOAD REPLACE`. Use locally when iterating on Lua sources without bumping `crates/ff-script/src/flowfabric_lua_version` — otherwise a long-lived dev Valkey keeps serving the stale cached library. The PR-level CI guard (`ff-script lua drift`) catches un-bumped edits before merge; this env covers the inner dev loop. Leave unset in production — the version-guard prevents accidental reloads under concurrent deploys. |
   | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
   | `FF_LANES` | `default` | Comma-separated lane names |
   | `FF_FLOW_PARTITIONS` | `256` | Flow partition count (exec keys co-locate under RFC-011) |
