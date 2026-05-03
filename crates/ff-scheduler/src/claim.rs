@@ -22,8 +22,6 @@
 use ff_core::keys::{ExecKeyContext, IndexKeys};
 use ff_core::partition::{Partition, PartitionConfig, PartitionFamily, budget_partition, quota_partition};
 use ff_core::types::{BudgetId, ExecutionId, LaneId, QuotaPolicyId, WorkerId, WorkerInstanceId};
-use ff_script::error::ScriptError;
-use ff_script::result::FcallResult;
 use ff_script::retry::is_retryable_kind;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -277,6 +275,21 @@ fn iter_partitions(total: u16, start: u16, count: u16) -> impl Iterator<Item = u
 /// applied on top so different workers diverge within any given window.
 pub struct Scheduler {
     client: ferriskey::Client,
+    /// FF #511 Phase 2c: backend-agnostic routing for the 6 scheduler
+    /// primitives that have trait coverage (`server_time_ms`,
+    /// `read_quota_policy_limits`, `check_admission`,
+    /// `block_execution_for_admission`, `release_admission`,
+    /// `issue_claim_grant`). Budget HGETs stay on `client` for now —
+    /// no trait primitive exists yet; Phase 2d or a future refactor
+    /// can lift them.
+    ///
+    /// Held as `Weak` because Valkey/Postgres backends embed the
+    /// Scheduler inside the backend `Arc`; a strong reference here
+    /// would make an Arc-cycle and leak the backend. Every call-site
+    /// upgrades to `Arc` for the duration of the await; upgrade
+    /// failure (backend dropped mid-scheduler-tick) surfaces as a
+    /// `SchedulerError::Config`.
+    backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
     config: PartitionConfig,
     scheduler_config: SchedulerConfig,
     /// Packed rotation state: high 48 bits = last window epoch seen
@@ -295,54 +308,73 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(client: ferriskey::Client, config: PartitionConfig) -> Self {
-        Self::with_config(client, config, SchedulerConfig::default())
+    /// Upgrade the `Weak` backend ref to `Arc` for a single call.
+    /// Returns `Err(SchedulerError::Config)` if the backend was
+    /// dropped — mirrors a transport fault for caller-retry purposes.
+    fn upgrade_backend(
+        &self,
+    ) -> Result<std::sync::Arc<dyn ff_core::engine_backend::EngineBackend>, SchedulerError> {
+        self.backend.upgrade().ok_or_else(|| {
+            SchedulerError::Config(
+                "scheduler: backend Arc dropped (Weak upgrade failed); \
+                 caller must rebuild the scheduler"
+                    .to_owned(),
+            )
+        })
+    }
+
+    /// FF #511 Phase 2c: all constructors now require a trait-object
+    /// backend alongside the client. The backend routes admission
+    /// primitives; the client remains for Valkey-specific calls that
+    /// have no trait coverage yet (budget HGETs). Callers with only a
+    /// `ferriskey::Client` can wrap it in a `ValkeyBackend` via
+    /// `ValkeyBackend::from_client_and_partitions` + `Arc::downgrade`.
+    pub fn new(
+        client: ferriskey::Client,
+        backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
+        config: PartitionConfig,
+    ) -> Self {
+        Self::with_config(client, backend, config, SchedulerConfig::default())
     }
 
     /// Construct a scheduler with an explicit [`SchedulerConfig`].
-    /// Use this when you need non-default scan bounds (e.g., in tests that
-    /// want to walk every partition in one call, or deployments with
-    /// non-default polling cadence). Most callers should use
-    /// [`Self::new`].
     pub fn with_config(
         client: ferriskey::Client,
+        backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
         config: PartitionConfig,
         scheduler_config: SchedulerConfig,
     ) -> Self {
         Self::with_config_and_metrics(
             client,
+            backend,
             config,
             scheduler_config,
             std::sync::Arc::new(ff_observability::Metrics::new()),
         )
     }
 
-    /// PR-94: construct a scheduler with a shared observability
-    /// registry and default [`SchedulerConfig`]. Used by `ff-server`
-    /// so claim/budget/quota metrics land in the same registry
-    /// exposed at `/metrics`. For test harnesses that need both a
-    /// custom `SchedulerConfig` AND observability, use
-    /// [`Self::with_config_and_metrics`].
+    /// PR-94: construct a scheduler with a shared observability registry.
     pub fn with_metrics(
         client: ferriskey::Client,
+        backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
         config: PartitionConfig,
         metrics: std::sync::Arc<ff_observability::Metrics>,
     ) -> Self {
-        Self::with_config_and_metrics(client, config, SchedulerConfig::default(), metrics)
+        Self::with_config_and_metrics(client, backend, config, SchedulerConfig::default(), metrics)
     }
 
-    /// PR-94: construct a scheduler with an explicit
+    /// Construct a scheduler with an explicit
     /// [`SchedulerConfig`] AND a shared observability registry.
-    /// Convenience constructor so callers don't have to thread
-    /// both concerns through separate builders.
     pub fn with_config_and_metrics(
         client: ferriskey::Client,
+        backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend>,
         config: PartitionConfig,
         scheduler_config: SchedulerConfig,
         metrics: std::sync::Arc<ff_observability::Metrics>,
     ) -> Self {
         Self {
             client,
+            backend,
             config,
             scheduler_config,
             rotation_state: AtomicU64::new(0),
@@ -531,6 +563,14 @@ impl Scheduler {
                 worker_caps_csv.len()
             )));
         }
+        // FF #511 Phase 2c: build the caps BTreeSet once per claim call
+        // (worker_caps_csv is loop-invariant). Cloned into each
+        // IssueClaimGrantArgs inside the partition loop.
+        let worker_caps_set: std::collections::BTreeSet<String> = worker_caps_csv
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
 
         // ── Bounded scan with rotation cursor ──
         // Prior impl walked all `num_partitions` partitions on every call,
@@ -544,16 +584,16 @@ impl Scheduler {
         // time up front. One extra TIME round-trip for quiet-cluster no-hit
         // calls, but on hit paths the existing inner-loop `server_time_ms`
         // call is now redundant — we reuse this value.
-        let scan_now_ms = match server_time_ms(&self.client).await {
+        // FF #511 Phase 2c: route through the backend trait instead of
+        // the raw ferriskey TIME. Transport-level failures surface as
+        // `EngineError`; we map to `EngineContext` so callers backoff +
+        // retry the same way they did pre-#511.
+        let backend = self.upgrade_backend()?;
+        let scan_now_ms = match backend.server_time_ms().await {
             Ok(t) => t,
             Err(e) => {
-                // Transport error talking to Valkey; surface via the same
-                // `ValkeyContext` channel the admission checks use so the
-                // caller retries after backoff instead of silently hitting
-                // partition 0 with a zero cursor.
-                return Err(SchedulerError::ValkeyContext {
-                    source: e,
-                    context: "scheduler: TIME for rotation cursor".to_owned(),
+                return Err(SchedulerError::EngineContext { source: Box::new(e),
+                    context: "scheduler: server_time_ms for rotation cursor".to_owned(),
                 });
             }
         };
@@ -726,7 +766,7 @@ impl Scheduler {
 
             // ── Quota pre-check (cross-partition FCALL on {q:K}) ──
             let quota_admission = self
-                .check_quota(&exec_ctx, &core_key, &eid_s, now_ms)
+                .check_quota(&exec_ctx, &core_key, &eid, now_ms)
                 .await?;
             match &quota_admission {
                 QuotaCheckOutcome::Blocked(block_detail) => {
@@ -741,92 +781,51 @@ impl Scheduler {
 
             // ── All checks passed — issue claim grant ──
             let grant_key = exec_ctx.claim_grant();
-            let keys: [&str; 3] = [&core_key, &grant_key, &eligible_key];
+            let _ = &core_key; // kept for any future direct read; unused post-trait-route
 
-            let ttl_str = grant_ttl_ms.to_string();
-            let wid_s = worker_id.to_string();
-            let wiid_s = worker_instance_id.to_string();
-            let lane_s = lane.to_string();
+            // FF #511 Phase 2c: route through `backend.issue_claim_grant`.
+            let args = ff_core::contracts::IssueClaimGrantArgs::new(
+                eid.clone(),
+                lane.clone(),
+                worker_id.clone(),
+                worker_instance_id.clone(),
+                partition,
+                worker_caps_set.clone(),
+                grant_ttl_ms,
+                ff_core::types::TimestampMs(now_ms as i64),
+            );
 
-            let argv: [&str; 9] = [
-                &eid_s,
-                &wid_s,
-                &wiid_s,
-                &lane_s,
-                "",   // capability_hash
-                &ttl_str,
-                "",   // route_snapshot_json
-                "",   // admission_summary
-                &worker_caps_csv, // sorted CSV; empty → matches only empty-required execs
-            ];
-
-            let raw = match self
-                .client
-                .fcall::<ferriskey::Value>("ff_issue_claim_grant", &keys, &argv)
-                .await
-            {
-                Ok(v) => v,
+            let backend = self.upgrade_backend()?;
+            let outcome = match backend.issue_claim_grant(args).await {
+                Ok(o) => o,
                 Err(e) => {
-                    // Transport failure on the FCALL — NOSCRIPT, IoError,
-                    // ClusterDown, etc. This is NOT a normal soft-reject;
-                    // persistent transport errors mean the scheduler is
-                    // effectively idle even though it looks like it's
-                    // running. WARN so ops dashboards (WARN+ aggregators)
-                    // fire instead of burying it at DEBUG.
-                    tracing::warn!(
-                        partition = p_idx,
-                        execution_id = eid_s.as_str(),
-                        error = %e,
-                        "scheduler: ff_issue_claim_grant transport error, trying next"
+                    // Classify the error. EngineError::Validation with
+                    // CapabilityMismatch is the Lua-race variant — it
+                    // means required_capabilities mutated between our
+                    // HGET pre-check and the trait body's re-check.
+                    // Must fail-closed by blocking (old behaviour);
+                    // otherwise the next tick re-picks the same
+                    // candidate in a tight loop.
+                    //
+                    // Any other error (transport, other validation,
+                    // logical rejects) is best-effort: log + rollback
+                    // admission + try next partition, matching the
+                    // pre-refactor path.
+                    let is_capability_mismatch = matches!(
+                        &e,
+                        ff_core::engine_error::EngineError::Validation {
+                            kind: ff_core::engine_error::ValidationKind::CapabilityMismatch,
+                            ..
+                        }
                     );
-                    if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
-                        self.release_admission(tag, quota_id, eid).await;
-                    }
-                    continue;
-                }
-            };
-
-            match FcallResult::parse(&raw).and_then(|r| r.into_success()) {
-                Ok(_) => {
-                    partitions_hit += 1;
-                    tracing::debug!(
-                        partition = p_idx,
-                        execution_id = eid_s.as_str(),
-                        worker_instance_id = worker_instance_id.as_str(),
-                        start_p = scan_start,
-                        partitions_visited,
-                        partitions_skipped,
-                        partitions_hit,
-                        elapsed_ms = call_start.elapsed().as_millis() as u64,
-                        "scheduler: claim call completed (hit)"
-                    );
-                    return Ok(Some(ClaimGrant::new(
-                        eid,
-                        ff_core::partition::PartitionKey::from(&partition),
-                        grant_key.clone(),
-                        now_ms + grant_ttl_ms,
-                    )));
-                }
-                Err(script_err) => {
-                    if matches!(script_err, ScriptError::CapabilityMismatch(_)) {
-                        // Should be rare: the Rust pre-check above
-                        // normally catches this and blocks the execution
-                        // off eligible. Reaching here means the
-                        // required_capabilities field mutated between our
-                        // HGET and the Lua atomic check (narrow race).
-                        // Block here too so the next tick doesn't loop.
-                        //
-                        // Log uses worker_caps_hash (8-hex digest), not
-                        // the full 4KB CSV, to keep per-mismatch log
-                        // volume bounded. Full CSV is logged once at
-                        // worker connect under "worker caps" WARN.
+                    if is_capability_mismatch {
                         tracing::info!(
                             partition = p_idx,
                             execution_id = eid_s.as_str(),
-                            worker_id = wid_s.as_str(),
+                            worker_id = %worker_id,
                             worker_caps_hash = worker_caps_hash.as_str(),
-                            error = %script_err,
-                            "scheduler: capability mismatch via Lua (race), blocking execution"
+                            error = %e,
+                            "scheduler: capability mismatch via trait (race), blocking execution"
                         );
                         self.block_candidate(
                             &partition, &idx, lane, &eid, &eligible_key,
@@ -834,21 +833,12 @@ impl Scheduler {
                             "no connected worker satisfies required_capabilities",
                             now_ms,
                         ).await;
-                        if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
-                            self.release_admission(tag, quota_id, eid).await;
-                        }
-                        continue;
                     } else {
-                        // Any other logical reject (grant_already_exists,
-                        // execution_not_in_eligible_set, execution_not_eligible,
-                        // invalid_capabilities, etc.). These are rare and each
-                        // indicates either a race or a config problem — in
-                        // either case ops need to see it, so WARN, not DEBUG.
                         tracing::warn!(
                             partition = p_idx,
                             execution_id = eid_s.as_str(),
-                            error = %script_err,
-                            "scheduler: ff_issue_claim_grant rejected, trying next"
+                            error = %e,
+                            "scheduler: issue_claim_grant rejected, trying next"
                         );
                     }
                     if let QuotaCheckOutcome::Admitted { tag, quota_id, eid } = &quota_admission {
@@ -856,7 +846,31 @@ impl Scheduler {
                     }
                     continue;
                 }
-            }
+            };
+
+            // `IssueClaimGrantOutcome` only surfaces `Granted` as
+            // success today; keep the wildcard to stay non_exhaustive-
+            // robust.
+            let _ = outcome;
+
+            partitions_hit += 1;
+            tracing::debug!(
+                partition = p_idx,
+                execution_id = eid_s.as_str(),
+                worker_instance_id = worker_instance_id.as_str(),
+                start_p = scan_start,
+                partitions_visited,
+                partitions_skipped,
+                partitions_hit,
+                elapsed_ms = call_start.elapsed().as_millis() as u64,
+                "scheduler: claim call completed (hit)"
+            );
+            return Ok(Some(ClaimGrant::new(
+                eid,
+                ff_core::partition::PartitionKey::from(&partition),
+                grant_key.clone(),
+                now_ms + grant_ttl_ms,
+            )));
         }
 
         tracing::debug!(
@@ -921,9 +935,11 @@ impl Scheduler {
         &self,
         _exec_ctx: &ExecKeyContext,
         core_key: &str,
-        eid_s: &str,
+        eid: &ExecutionId,
         now_ms: u64,
     ) -> Result<QuotaCheckOutcome, SchedulerError> {
+        let eid_s = eid.to_string();
+        let eid_s = eid_s.as_str();
         // Read quota_policy_id from exec_core
         let quota_id_str: Option<String> = self
             .client
@@ -950,125 +966,92 @@ impl Scheduler {
             Err(_) => "{q:0}".to_owned(), // fallback for non-UUID test IDs
         };
 
-        let quota_def_key = format!("ff:quota:{}:{}", tag, quota_id_str);
-        let window_key = format!("ff:quota:{}:{}:window:requests_per_window", tag, quota_id_str);
-        let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id_str);
-        let admitted_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id_str, eid_s);
-        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id_str);
+        // FF #511 Phase 2c: Valkey-shaped quota_def_key / window_key /
+        // concurrency_key / admitted_key / admitted_set_key used to
+        // be built here for the pre-#511 FCALL KEYS array. The trait
+        // primitives now compute their own keys from `quota_policy_id`
+        // + `execution_id`. No need to build them scheduler-side.
+        //
+        // Parse failure on `quota_id_str` → treat as no-quota (matches
+        // pre-#511 behaviour where invalid IDs fell through to the
+        // unlimited branch).
+        let Ok(qid) = QuotaPolicyId::parse(&quota_id_str) else {
+            return Ok(QuotaCheckOutcome::NoQuota);
+        };
+        let backend = self.upgrade_backend()?;
+        let limits = match backend.read_quota_policy_limits(&qid).await {
+            Ok(Some(l)) => l,
+            Ok(None) => return Ok(QuotaCheckOutcome::NoQuota),
+            Err(e) => {
+                return Err(SchedulerError::EngineContext { source: Box::new(e),
+                    context: format!("check_quota: read_quota_policy_limits {qid}"),
+                });
+            }
+        };
+        let rate_limit = limits.max_requests_per_window;
+        let window_secs = if limits.requests_per_window_seconds == 0 {
+            60
+        } else {
+            limits.requests_per_window_seconds
+        };
+        let concurrency_cap = limits.active_concurrency_cap;
+        let jitter_ms = limits.jitter_ms;
 
-        // Read quota limits from policy hash
-        let rate_limit: Option<String> = self.client
-            .cmd("HGET").arg(&quota_def_key).arg("max_requests_per_window")
-            .execute().await?;
-        let window_secs: Option<String> = self.client
-            .cmd("HGET").arg(&quota_def_key).arg("requests_per_window_seconds")
-            .execute().await?;
-        let concurrency_cap: Option<String> = self.client
-            .cmd("HGET").arg(&quota_def_key).arg("active_concurrency_cap")
-            .execute().await?;
-        let jitter: Option<String> = self.client
-            .cmd("HGET").arg(&quota_def_key).arg("jitter_ms")
-            .execute().await?;
-
-        let rate_limit = rate_limit.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
-        let window_secs = window_secs.as_deref().and_then(|s| s.parse().ok()).unwrap_or(60u64);
-        let concurrency_cap = concurrency_cap.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
-        let jitter_ms = jitter.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0u64);
-
-        // No limits configured — admit without recording
-        if rate_limit == 0 && concurrency_cap == 0 {
+        if limits.is_unlimited() {
             return Ok(QuotaCheckOutcome::NoQuota);
         }
 
-        // FCALL ff_check_admission_and_record on {q:K}
-        let keys: [&str; 5] = [&window_key, &concurrency_key, &quota_def_key, &admitted_key, &admitted_set_key];
-        let now_s = now_ms.to_string();
-        let ws = window_secs.to_string();
-        let rl = rate_limit.to_string();
-        let cc = concurrency_cap.to_string();
-        let jt = jitter_ms.to_string();
-        let argv: [&str; 6] = [&now_s, &ws, &rl, &cc, eid_s, &jt];
+        // FF #511 Phase 2c: route through `backend.check_admission`.
+        // Trait's CheckAdmissionResult enum maps 1:1 onto the pre-#511
+        // Lua status strings: Admitted/AlreadyAdmitted →
+        // QuotaCheckOutcome::Admitted, RateExceeded → Blocked (rate),
+        // ConcurrencyExceeded → Blocked.
+        let args = ff_core::contracts::CheckAdmissionArgs {
+            execution_id: eid.clone(),
+            now: ff_core::types::TimestampMs(now_ms as i64),
+            window_seconds: window_secs,
+            rate_limit,
+            concurrency_cap,
+            jitter_ms: if jitter_ms == 0 { None } else { Some(jitter_ms) },
+        };
 
-        match self.client
-            .fcall::<ferriskey::Value>("ff_check_admission_and_record", &keys, &argv)
-            .await
-        {
+        match backend.check_admission(&qid, "default", args).await {
             Ok(result) => {
-                // Parse domain-specific result: {"ADMITTED"}, {"RATE_EXCEEDED", retry_after},
-                // {"CONCURRENCY_EXCEEDED"}, {"ALREADY_ADMITTED"}
-                let status = Self::parse_admission_status(&result);
-                match status.as_str() {
-                    "ADMITTED" | "ALREADY_ADMITTED" => Ok(QuotaCheckOutcome::Admitted {
-                        tag: tag.clone(),
-                        quota_id: quota_id_str.clone(),
-                        eid: eid_s.to_owned(),
-                    }),
-                    "RATE_EXCEEDED" => {
-                        // PR-94: quota admission block, labelled by
-                        // reason so rate-vs-concurrency waves are
-                        // distinguishable in a dashboard.
+                use ff_core::contracts::CheckAdmissionResult;
+                match result {
+                    CheckAdmissionResult::Admitted | CheckAdmissionResult::AlreadyAdmitted => {
+                        Ok(QuotaCheckOutcome::Admitted {
+                            tag: tag.clone(),
+                            quota_id: quota_id_str.clone(),
+                            eid: eid_s.to_owned(),
+                        })
+                    }
+                    CheckAdmissionResult::RateExceeded { .. } => {
                         self.metrics.inc_quota_hit("rate");
                         Ok(QuotaCheckOutcome::Blocked(format!(
                             "quota {}: rate limit {}/{} per {}s window",
                             quota_id_str, rate_limit, rate_limit, window_secs
                         )))
                     }
-                    "CONCURRENCY_EXCEEDED" => {
+                    CheckAdmissionResult::ConcurrencyExceeded => {
                         self.metrics.inc_quota_hit("concurrency");
                         Ok(QuotaCheckOutcome::Blocked(format!(
                             "quota {}: concurrency cap {}",
                             quota_id_str, concurrency_cap
                         )))
                     }
-                    other => {
-                        // Fail-closed: an unrecognised status is the Lua
-                        // telling us a contract we don't understand. Do
-                        // NOT default to admit — surface it so the
-                        // scheduler retries next cycle and ops sees the
-                        // event.
-                        tracing::warn!(
-                            quota_id = quota_id_str.as_str(),
-                            status = other,
-                            "scheduler: unexpected admission result, denying (fail-closed)"
-                        );
-                        Err(SchedulerError::Config(format!(
-                            "quota {quota_id_str}: unexpected admission status \"{other}\""
-                        )))
-                    }
                 }
             }
             Err(e) => {
-                // Fail-closed: transport fault on the admission FCALL
-                // must NOT silently admit the candidate. Propagate so
-                // the outer cycle returns the error and the worker
-                // retries after the usual backoff; the next cycle will
-                // re-run the admission check against fresh state.
                 tracing::warn!(
                     quota_id = quota_id_str.as_str(),
                     error = %e,
-                    "scheduler: quota FCALL failed, denying (fail-closed)"
+                    "scheduler: check_admission failed, denying (fail-closed)"
                 );
-                Err(SchedulerError::ValkeyContext {
-                    source: e,
-                    context: format!("ff_check_admission_and_record {quota_id_str}"),
+                Err(SchedulerError::EngineContext { source: Box::new(e),
+                    context: format!("check_admission {quota_id_str}"),
                 })
             }
-        }
-    }
-
-    /// Parse the first element of a Valkey array result as a status string.
-    fn parse_admission_status(result: &ferriskey::Value) -> String {
-        match result {
-            ferriskey::Value::Array(arr) => {
-                match arr.first() {
-                    Some(Ok(ferriskey::Value::BulkString(b))) => {
-                        String::from_utf8_lossy(b).into_owned()
-                    }
-                    Some(Ok(ferriskey::Value::SimpleString(s))) => s.clone(),
-                    _ => "UNKNOWN".to_owned(),
-                }
-            }
-            _ => "UNKNOWN".to_owned(),
         }
     }
 
@@ -1078,148 +1061,139 @@ impl Scheduler {
     async fn block_candidate(
         &self,
         partition: &Partition,
-        idx: &IndexKeys,
+        _idx: &IndexKeys,
         lane: &LaneId,
         eid: &ExecutionId,
-        eligible_key: &str,
+        _eligible_key: &str,
         block_reason: &str,
         blocking_detail: &str,
         now_ms: u64,
     ) {
-        let exec_ctx = ExecKeyContext::new(partition, eid);
-        let core_key = exec_ctx.core();
         let eid_s = eid.to_string();
-        let blocked_key = match block_reason {
-            "waiting_for_budget" => idx.lane_blocked_budget(lane),
-            "waiting_for_quota" => idx.lane_blocked_quota(lane),
-            "waiting_for_capable_worker" => idx.lane_blocked_route(lane),
-            _ => idx.lane_blocked_budget(lane),
+        let reason = match block_reason {
+            "waiting_for_budget" => ff_core::contracts::BlockingReason::WaitingForBudget,
+            "waiting_for_quota" => ff_core::contracts::BlockingReason::WaitingForQuota,
+            "waiting_for_capable_worker" => {
+                ff_core::contracts::BlockingReason::WaitingForCapableWorker
+            }
+            other => {
+                tracing::warn!(
+                    execution_id = eid_s,
+                    reason = other,
+                    "scheduler: unrecognised block reason, defaulting to WaitingForBudget"
+                );
+                ff_core::contracts::BlockingReason::WaitingForBudget
+            }
         };
 
-        let keys: [&str; 3] = [&core_key, eligible_key, &blocked_key];
-        let now_s = now_ms.to_string();
-        let argv: [&str; 4] = [&eid_s, block_reason, blocking_detail, &now_s];
-
-        // Parse FcallResult so we distinguish Lua-level rejections (e.g.
-        // execution_not_active because the execution went terminal between
-        // our HGET and the FCALL) from a real block. Previously `Ok(_)`
-        // treated an err-tuple as success → INFO log "candidate blocked"
-        // while nothing actually changed on exec_core, then the next tick
-        // re-picked the same candidate and looped. Mirrors the
-        // release_admission parse fix.
-        match self.client
-            .fcall::<ferriskey::Value>("ff_block_execution_for_admission", &keys, &argv)
-            .await
-        {
-            Ok(v) => match FcallResult::parse(&v).and_then(|r| r.into_success()) {
-                Ok(_) => {
-                    tracing::info!(
-                        execution_id = eid_s,
-                        reason = block_reason,
-                        "scheduler: candidate blocked by admission check"
-                    );
-                }
-                Err(script_err) => {
-                    // Logical reject from Lua (e.g. execution_not_active
-                    // — the execution went terminal between the scheduler
-                    // pick and the block FCALL; the candidate loop will
-                    // naturally move on). WARN so ops dashboards surface
-                    // actual block failures, but not so loud that a common
-                    // race spams alerts.
-                    tracing::warn!(
-                        execution_id = eid_s,
-                        reason = block_reason,
-                        error = %script_err,
-                        "scheduler: ff_block_execution_for_admission rejected by Lua"
-                    );
-                }
+        let args = ff_core::contracts::BlockExecutionForAdmissionArgs::new(
+            eid.clone(),
+            lane.clone(),
+            *partition,
+            reason,
+            if blocking_detail.is_empty() {
+                None
+            } else {
+                Some(blocking_detail.to_owned())
             },
+            ff_core::types::TimestampMs(now_ms as i64),
+        );
+
+        let Some(backend) = self.backend.upgrade() else {
+            tracing::warn!(
+                execution_id = eid_s,
+                "scheduler: block_execution_for_admission skipped — backend dropped"
+            );
+            return;
+        };
+        match backend.block_execution_for_admission(args).await {
+            Ok(ff_core::contracts::BlockExecutionForAdmissionOutcome::Blocked { .. }) => {
+                tracing::info!(
+                    execution_id = eid_s,
+                    reason = block_reason,
+                    "scheduler: candidate blocked by admission check"
+                );
+            }
+            Ok(ff_core::contracts::BlockExecutionForAdmissionOutcome::LuaRejected { message }) => {
+                // Logical reject (e.g. execution went terminal between
+                // scheduler pick and block call); candidate loop moves on.
+                tracing::warn!(
+                    execution_id = eid_s,
+                    reason = block_reason,
+                    error = %message,
+                    "scheduler: block_execution_for_admission rejected"
+                );
+            }
+            Ok(_) => {
+                // #[non_exhaustive] fallback.
+                tracing::warn!(
+                    execution_id = eid_s,
+                    "scheduler: unknown BlockExecutionForAdmissionOutcome variant"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     execution_id = eid_s,
                     error = %e,
-                    "scheduler: ff_block_execution_for_admission transport failed"
+                    "scheduler: block_execution_for_admission transport failed"
                 );
             }
         }
     }
 
     /// Release a previously-recorded quota admission slot.
-    /// Called when ff_issue_claim_grant fails after admission was recorded.
+    /// Called when issue_claim_grant fails after admission was
+    /// recorded. FF #511 Phase 2c: trait-routed.
     async fn release_admission(
         &self,
-        tag: &str,
+        _tag: &str,
         quota_id: &str,
         eid_s: &str,
     ) {
-        let admitted_key = format!("ff:quota:{}:{}:admitted:{}", tag, quota_id, eid_s);
-        let admitted_set_key = format!("ff:quota:{}:{}:admitted_set", tag, quota_id);
-        let concurrency_key = format!("ff:quota:{}:{}:concurrency", tag, quota_id);
-
-        let keys: [&str; 3] = [&admitted_key, &admitted_set_key, &concurrency_key];
-        let argv: [&str; 1] = [eid_s];
-
-        // Parse the Lua response properly: FCALL returns `Ok(Value)` for
-        // BOTH success and logical-error paths. Treating Ok(_) blindly as
-        // "released" logs a false positive when the Lua returns
-        // `{0, "quota_not_found"}` (or any other script-level err) — the
-        // slot in fact remains pinned until its TTL expires, which is
-        // minutes to hours. Surface the real outcome so on-call sees
-        // actual release failures instead of clean "released" events.
-        match self.client
-            .fcall::<ferriskey::Value>("ff_release_admission", &keys, &argv)
-            .await
-        {
-            Ok(v) => match FcallResult::parse(&v).and_then(|r| r.into_success()) {
-                Ok(_) => {
-                    tracing::info!(
-                        execution_id = eid_s,
-                        quota_id,
-                        "scheduler: released admission after claim failure"
-                    );
-                }
-                Err(script_err) => {
-                    tracing::warn!(
-                        execution_id = eid_s,
-                        quota_id,
-                        error = %script_err,
-                        "scheduler: ff_release_admission rejected by Lua \
-                         (slot will expire via TTL)"
-                    );
-                }
-            },
+        let Ok(qid) = QuotaPolicyId::parse(quota_id) else {
+            tracing::warn!(
+                execution_id = eid_s,
+                quota_id,
+                "scheduler: release_admission skipped — invalid quota_policy_id"
+            );
+            return;
+        };
+        let Ok(eid) = ExecutionId::parse(eid_s) else {
+            tracing::warn!(
+                execution_id = eid_s,
+                quota_id,
+                "scheduler: release_admission skipped — invalid execution_id"
+            );
+            return;
+        };
+        let args = ff_core::contracts::ReleaseAdmissionArgs::new(qid, eid);
+        let Some(backend) = self.backend.upgrade() else {
+            tracing::warn!(
+                execution_id = eid_s,
+                quota_id,
+                "scheduler: release_admission skipped — backend dropped"
+            );
+            return;
+        };
+        match backend.release_admission(args).await {
+            Ok(_) => {
+                tracing::info!(
+                    execution_id = eid_s,
+                    quota_id,
+                    "scheduler: released admission after claim failure"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     execution_id = eid_s,
                     quota_id,
                     error = %e,
-                    "scheduler: ff_release_admission transport failed \
+                    "scheduler: release_admission failed \
                      (slot will expire via TTL)"
                 );
             }
         }
     }
-}
-
-/// Get server time in milliseconds via the TIME command.
-async fn server_time_ms(client: &ferriskey::Client) -> Result<u64, ferriskey::Error> {
-    let result: Vec<String> = client
-        .cmd("TIME")
-        .execute()
-        .await?;
-    if result.len() < 2 {
-        return Err(ferriskey::Error::from((
-            ferriskey::ErrorKind::ClientError,
-            "TIME returned fewer than 2 elements",
-        )));
-    }
-    let secs: u64 = result[0].parse().map_err(|_| {
-        ferriskey::Error::from((ferriskey::ErrorKind::ClientError, "TIME: invalid seconds"))
-    })?;
-    let micros: u64 = result[1].parse().map_err(|_| {
-        ferriskey::Error::from((ferriskey::ErrorKind::ClientError, "TIME: invalid microseconds"))
-    })?;
-    Ok(secs * 1000 + micros / 1000)
 }
 
 /// Errors from the scheduler.
@@ -1233,6 +1207,16 @@ pub enum SchedulerError {
     ValkeyContext {
         #[source]
         source: ferriskey::Error,
+        context: String,
+    },
+    /// FF #511 Phase 2c: trait-routed backend error (backend-agnostic).
+    /// Carries the original `EngineError` so callers can classify by
+    /// kind via `EngineError::kind`-ish matchers. Boxed because
+    /// `EngineError` is large (clippy::result_large_err).
+    #[error("engine ({context}): {source}")]
+    EngineContext {
+        #[source]
+        source: Box<ff_core::engine_error::EngineError>,
         context: String,
     },
     /// Caller-supplied value failed ingress validation. NOT retryable — the
@@ -1251,6 +1235,11 @@ impl SchedulerError {
     pub fn valkey_kind(&self) -> Option<ferriskey::ErrorKind> {
         match self {
             Self::Valkey(e) | Self::ValkeyContext { source: e, .. } => Some(e.kind()),
+            // EngineContext wraps a higher-level error that's already
+            // classified (transport vs validation vs contention) —
+            // callers that need retry-ability consult
+            // `EngineError::is_retryable` instead. Return None here.
+            Self::EngineContext { .. } => None,
             Self::Config(_) => None,
         }
     }

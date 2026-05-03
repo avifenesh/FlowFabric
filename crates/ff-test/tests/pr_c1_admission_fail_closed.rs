@@ -127,7 +127,14 @@ async fn scheduler_fails_closed_on_corrupted_budget_limits() {
     // 4. Call the scheduler. Post-fix: returns Err(SchedulerError::Valkey)
     //    carrying the WRONGTYPE. Pre-fix: silently returns Ok(Some(grant))
     //    because the budget checker swallowed the error and cached Ok.
-    let scheduler = ff_scheduler::claim::Scheduler::new(tc.client().clone(), config);
+    let _backend_keepalive = tc.backend();
+    let weak_backend: std::sync::Weak<dyn ff_core::engine_backend::EngineBackend> =
+        std::sync::Arc::downgrade(&_backend_keepalive);
+    let scheduler = ff_scheduler::claim::Scheduler::new(
+        tc.client().clone(),
+        weak_backend,
+        config,
+    );
     let worker_id = WorkerId::new(WORKER);
     let wiid = WorkerInstanceId::new(WORKER_INST);
     let no_caps: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

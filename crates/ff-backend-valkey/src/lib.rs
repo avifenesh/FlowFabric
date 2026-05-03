@@ -480,6 +480,41 @@ impl ValkeyBackend {
         self.scheduler.as_ref()
     }
 
+    /// FF #511 Phase 2c: install a scheduler that holds a
+    /// `Weak<dyn EngineBackend>` into this backend, via `Arc::new_cyclic`.
+    ///
+    /// Takes the already-constructed (but scheduler-less) `Arc<Self>`
+    /// and a closure that produces the scheduler given the final
+    /// backend's `Weak<dyn EngineBackend>`. Returns a new `Arc<Self>`
+    /// with the scheduler installed. Needed because
+    /// [`Self::with_scheduler`] uses `Arc::get_mut`, which fails once
+    /// a `Weak<dyn EngineBackend>` has been minted against the
+    /// backend Arc — exactly the state after constructing the
+    /// scheduler externally.
+    pub fn install_scheduler_cyclic(
+        existing: Arc<Self>,
+        build_scheduler: impl FnOnce(std::sync::Weak<dyn EngineBackend>) -> Arc<ff_scheduler::Scheduler>,
+    ) -> Result<Arc<Self>, &'static str> {
+        // Unpack the fields from the existing Arc. `try_unwrap`
+        // succeeds only if the Arc is unique (which it is at this
+        // boot-path moment).
+        let inner = Arc::try_unwrap(existing).map_err(|_| {
+            "install_scheduler_cyclic: backend Arc has other strong refs; cannot install scheduler"
+        })?;
+
+        // `Arc::new_cyclic` gives `build_scheduler` the Weak pointer
+        // to the final Arc before Arc construction completes.
+        let new_arc = Arc::new_cyclic(move |weak_self: &std::sync::Weak<Self>| {
+            let weak_trait: std::sync::Weak<dyn EngineBackend> = weak_self.clone();
+            let scheduler = build_scheduler(weak_trait);
+            Self {
+                scheduler: Some(scheduler),
+                ..inner
+            }
+        });
+        Ok(new_arc)
+    }
+
     /// Build a `ValkeyBackend` with an embedded scheduler instance, so
     /// [`EngineBackend::claim_for_worker`] works from direct-`Arc<dyn
     /// EngineBackend>` consumers (i.e. outside of `ff-server`'s boot
@@ -521,24 +556,37 @@ impl ValkeyBackend {
             }
             Err(e) => return Err(e),
         };
-        let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
-            client.clone(),
-            partition_config,
-            metrics.clone(),
-        ));
-        let backend = Arc::new(Self {
-            client,
-            partition_config,
-            subscriber_connection: Some(v),
-            metrics: Some(metrics),
-            stream_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                DEFAULT_STREAM_SEMAPHORE_PERMITS as usize,
-            )),
-            stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
-            admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
-            scheduler: Some(scheduler),
+        // FF #511 Phase 2c: Scheduler holds a `Weak<dyn EngineBackend>`
+        // to avoid a cycle with ValkeyBackend.scheduler. Use
+        // `Arc::new_cyclic` so the scheduler can see the final backend
+        // Arc at construction time.
+        let client_for_sched = client.clone();
+        let partition_config_clone = partition_config;
+        let metrics_clone = metrics.clone();
+        let v_clone = v.clone();
+        let backend_arc = Arc::new_cyclic(move |weak_self: &std::sync::Weak<Self>| {
+            let weak_trait: std::sync::Weak<dyn EngineBackend> = weak_self.clone();
+            let scheduler = Arc::new(ff_scheduler::Scheduler::with_metrics(
+                client_for_sched,
+                weak_trait,
+                partition_config_clone,
+                metrics_clone.clone(),
+            ));
+            Self {
+                client,
+                partition_config,
+                subscriber_connection: Some(v_clone),
+                metrics: Some(metrics_clone),
+                stream_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    DEFAULT_STREAM_SEMAPHORE_PERMITS as usize,
+                )),
+                stream_semaphore_max: DEFAULT_STREAM_SEMAPHORE_PERMITS,
+                admin_rotate_fanout_concurrency: DEFAULT_ADMIN_ROTATE_FANOUT_CONCURRENCY,
+                scheduler: Some(scheduler),
+            }
         });
-        Ok(backend as Arc<dyn EngineBackend>)
+        let _ = v; // original v was consumed by v_clone above via `move`
+        Ok(backend_arc as Arc<dyn EngineBackend>)
     }
 
     /// RFC-017 Wave 8 Stage D (§4 row 12): run the Valkey-specific
@@ -8045,6 +8093,12 @@ impl EngineBackend for ValkeyBackend {
                 ),
                 ff_scheduler::SchedulerError::ValkeyContext { source, context } => {
                     ff_core::engine_error::backend_context(transport_fk(source), context)
+                }
+                ff_scheduler::SchedulerError::EngineContext { source, context } => {
+                    // Already a typed EngineError (boxed to keep
+                    // SchedulerError's Result small). Unbox + prefix
+                    // with scheduler-site context.
+                    ff_core::engine_error::backend_context(*source, context)
                 }
                 ff_scheduler::SchedulerError::Config(msg) => EngineError::Validation {
                     kind: ff_core::engine_error::ValidationKind::InvalidInput,
