@@ -71,7 +71,8 @@ use crate::contracts::{
     CancelFlowArgs, ChangePriorityArgs, ChangePriorityResult, ClaimExecutionArgs,
     ClaimExecutionResult, ClaimForWorkerArgs, ClaimForWorkerOutcome, ClaimResumedExecutionArgs,
     ClaimResumedExecutionResult,
-    BlockRouteArgs, BlockRouteOutcome, CheckAdmissionArgs, CheckAdmissionResult,
+    BlockExecutionForAdmissionArgs, BlockExecutionForAdmissionOutcome, BlockRouteArgs,
+    BlockRouteOutcome, CheckAdmissionArgs, CheckAdmissionResult,
     ClaimGrantOutcome,
     CompleteExecutionArgs, CompleteExecutionResult, CreateBudgetArgs, CreateBudgetResult,
     CreateExecutionArgs, CreateExecutionResult, CreateFlowArgs, CreateFlowResult,
@@ -1687,6 +1688,27 @@ pub trait EngineBackend: Send + Sync + 'static {
     ) -> Result<CheckAdmissionResult, EngineError> {
         Err(EngineError::Unavailable {
             op: "check_admission",
+        })
+    }
+
+    /// Generalised admission block — covers budget / quota /
+    /// capability denial paths. `BlockingReason` selects both the
+    /// eligibility state written to `exec_core` and the target
+    /// `blocked_<reason>` lane index. Valkey wraps the existing
+    /// `ff_block_execution_for_admission` FCALL (KEYS=3); PG/SQLite
+    /// write the equivalent row transition.
+    ///
+    /// Companion to [`Self::block_route`] — `block_route` stays as the
+    /// capability-mismatch shorthand; this method is the primitive
+    /// the scheduler reaches for when the reason is known at the
+    /// call site (budget denial, quota denial, etc.). FF #511 Phase 2b.
+    #[cfg(feature = "core")]
+    async fn block_execution_for_admission(
+        &self,
+        _args: BlockExecutionForAdmissionArgs,
+    ) -> Result<BlockExecutionForAdmissionOutcome, EngineError> {
+        Err(EngineError::Unavailable {
+            op: "block_execution_for_admission",
         })
     }
 
