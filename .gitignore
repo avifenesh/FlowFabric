@@ -16,7 +16,9 @@ ferriskey/bench-results-*.json
 ferriskey/benchmarks/
 ferriskey/flamegraph.svg
 *.perf.data
+*.perf.data.*
 perf.data
+perf.data.*
 
 # ── Internal bench result JSONs (regenerable, hardware-specific) ──
 # Keep benches/results/baseline.md as the tracked summary; raw JSONs are local.
