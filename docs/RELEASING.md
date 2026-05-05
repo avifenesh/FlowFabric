@@ -174,14 +174,16 @@ scripts/published-smoke.sh 0.9.0
 Exit codes: `0` all clean; `1` build or symbol resolution failed;
 `2` script invocation problem.
 
-**Intended release.yml wiring (follow-up PR):** add a new
-`published_smoke` job to `.github/workflows/release.yml` that
-`needs: publish` and runs `scripts/published-smoke.sh ${{ env.TAG_VERSION }}`.
-The GitHub Release job (`release`) then moves to
-`needs: [publish, published_smoke]` so a failed published-artifact
-smoke blocks the release-notes-cut step (the publish itself cannot
-be rolled back beyond `cargo yank`). This enforces CLAUDE.md §5
-item 8 for the external-consumer dimension.
+**release.yml wiring (shipped v0.16+):** the `published_smoke` job
+in `.github/workflows/release.yml` runs after `publish` and before
+`release`. It waits 60s for crates.io index propagation, then
+invokes `scripts/published-smoke.sh "${TAG_NAME#v}"` against the
+freshly-published artifacts. The `release` job (GitHub Release
+creation) depends on `[publish, published_smoke]`, so a failed
+published-artifact smoke blocks the release-notes cut — the
+publish itself cannot be rolled back beyond `cargo yank`, but
+preventing the announcement is meaningful belt-and-braces. Enforces
+CLAUDE.md §5 item 8 for the external-consumer dimension.
 
 Scenarios covered (see `benches/smoke/README.md` for details):
 
