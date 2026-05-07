@@ -7,6 +7,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`ff_sdk::runtime` handler-DI surface (#331).** New opt-in module
+  behind the `runtime` feature on `ff-sdk`. Wraps
+  [`FlowFabricWorker`] in a [`WorkerRuntime`] that supplies the four
+  pieces of plumbing every consumer was writing by hand around
+  `claim_next_via_backend`: idle-backoff, bounded `tokio::spawn`
+  fan-out (default `max_concurrent = 64`), panic catch, and typed
+  shared-state threading. Handlers are plain `async fn` whose
+  arguments implement `FromTask`; three extractors ship (`Payload<P>`
+  for JSON input, `PayloadBytes` for raw bytes, `Data<T>` for typed
+  shared state, `TaskInfo` for execution metadata). The tuple
+  blanket impl covers 1..=4 args. Handler errors map to
+  `ClaimedTask::fail(reason, "handler_error")`; panics to
+  `"handler_panic"`; extractor misses to
+  `"extractor_missing_state"` / `"extractor_payload_decode"`;
+  unregistered `execution_kind` to `"runtime_no_handler"`. No engine,
+  Lua, or backend-trait change — purely an SDK-level ergonomics
+  layer; the imperative `claim_next_via_backend` + `ClaimedTask`
+  loop stays as the lower-level API. New headline example at
+  `examples/v016-worker-runtime/`.
 - **`FF_FORCE_LUA_RELOAD` dev-only env override** (ff-script). When
   set to `1` / `true` / `yes`, `ff_script::loader::ensure_library`
   bypasses the version-check fast-path and always issues

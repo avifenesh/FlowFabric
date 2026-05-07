@@ -77,6 +77,15 @@ layer-ratelimit = ["dep:async-trait", "dep:governor"]
 layer-metrics = ["dep:async-trait"]
 layer-circuit-breaker = ["dep:async-trait"]
 
+# Issue #331 — Handler-DI `WorkerRuntime` + `FromTask` extractors
+# built on top of `FlowFabricWorker::claim_next_via_backend`. Off by
+# default so consumers that use the imperative `ClaimedTask` loop
+# pay no extra compile cost. Pulls `futures` for the panic-catch
+# combinator `FutureExt::catch_unwind`; both `valkey-default` and
+# `sqlite` can enable this feature alongside — the dispatch path
+# forwards through `FlowFabricWorker` (not a direct backend).
+runtime = ["dep:futures", "valkey-default"]
+
 [dependencies]
 # RFC-012 feature-gate discipline (#164, completes #158): default-features
 # disabled so ff-sdk's `--no-default-features` build does NOT activate
@@ -124,6 +133,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # layer features see zero compile-cost.
 async-trait = { workspace = true, optional = true }
 governor = { version = "0.7", default-features = false, optional = true, features = ["std"] }
+# Issue #331 — `FutureExt::catch_unwind` for the `runtime`'s panic
+# boundary. Workspace version, optional so `runtime`-off builds
+# compile without it.
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

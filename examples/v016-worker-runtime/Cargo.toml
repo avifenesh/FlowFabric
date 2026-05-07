@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "v016-worker-runtime-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "v016-worker-runtime"
+path = "src/main.rs"
+
+[dependencies]
+# #331 demo — pulls the `runtime` feature on ff-sdk. `valkey-default`
+# rides along (the runtime feature requires it).
+ff-sdk = { path = "../../crates/ff-sdk", features = ["runtime"] }
+ff-core = { path = "../../crates/ff-core" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
