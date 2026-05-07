@@ -117,6 +117,13 @@ pub(crate) mod valkey_preamble;
 // `FlowFabricWorker::connect_with` + the trait-forwarder accessors
 // are reachable under `default-features = false, features = ["sqlite"]`.
 pub mod worker;
+// Issue #331: handler-DI runtime on top of `FlowFabricWorker`. Gated
+// behind the `runtime` feature (pulls `futures` for panic-catch);
+// also requires `valkey-default` because it drives
+// `FlowFabricWorker::claim_next_via_backend`, which is
+// `valkey-default`-gated at the worker-surface level.
+#[cfg(feature = "runtime")]
+pub mod runtime;
 
 // Re-exports for convenience.
 //
