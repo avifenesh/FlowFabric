@@ -1,238 +1,286 @@
 # FlowFabric
 
-Valkey-native execution engine for long-running, interruptible, resource-aware workflows.
+[![crates.io](https://img.shields.io/crates/v/flowfabric.svg)](https://crates.io/crates/flowfabric)
+[![CI](https://github.com/avifenesh/FlowFabric/actions/workflows/matrix.yml/badge.svg)](https://github.com/avifenesh/FlowFabric/actions/workflows/matrix.yml)
+[![security & quality](https://github.com/avifenesh/FlowFabric/actions/workflows/security-and-quality.yml/badge.svg)](https://github.com/avifenesh/FlowFabric/actions/workflows/security-and-quality.yml)
+[![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
+[![Valkey 7.2+](https://img.shields.io/badge/Valkey-7.2%2B-informational)](https://valkey.io)
+[![rustc edition 2024](https://img.shields.io/badge/rustc-edition%202024-dea584)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 
-## Architecture
+**Valkey-native durable execution engine for Rust.** Long-running,
+interruptible, budget-aware workflows with lease-based claim, HMAC-signed
+human-in-the-loop waitpoints, capability routing, and first-class
+backends for Valkey, Postgres, and SQLite.
 
+FlowFabric is for teams who already run Redis/Valkey (or Postgres) and
+want durable execution with Rust-native performance, without standing
+up Kafka or adopting a workflow DSL. Workflows are ordinary `async fn`
+Rust — no compiler plugins, no DAG builder, no proprietary runtime.
+
+## Why FlowFabric
+
+- **Use this when** you need durable background jobs with retries,
+  lease-safe crash recovery, and deterministic cancellation cascades.
+- **Use this when** your workflow needs to suspend for human approval
+  (code review, deploy gate, two-source approval) and resume on an
+  HMAC-signed signal from outside your trust boundary.
+- **Use this when** you need per-flow or per-tenant token/cost budgets
+  that terminate in-flight work when breached — LLM fan-out, batch
+  inference, CI matrices.
+- **Use this when** you want Redis/Valkey queue semantics *and*
+  first-class Postgres persistence as deployment options, picked per
+  environment by a feature flag.
+- **Use this when** you want to embed the worker SDK directly in your
+  Rust service — `WorkerRuntime::new(worker).data(http).on("task", handler).run()`
+  drops the hand-rolled claim-loop boilerplate.
+
+## Installation
+
+```toml
+# Cargo.toml — workers and clients
+[dependencies]
+ff-sdk = "0.15"
 ```
-                         ┌─────────────┐
-                         │  ff-server   │  HTTP API + boot sequence
-                         └──────┬──────┘
-                                │
-                 ┌──────────────┼──────────────┐
-                 │              │              │
-          ┌──────┴──────┐ ┌────┴────┐ ┌───────┴───────┐
-          │  ff-engine   │ │ ff-sdk  │ │ ff-scheduler  │
-          │  17 scanners │ │ worker  │ │ claim-grant   │
-          └──────┬──────┘ │   API   │ │   cycle       │
-                 │        └────┬────┘ └───────┬───────┘
-                 │             │              │
-                 └──────────────┼──────────────┘
-                                │
-                         ┌──────┴──────┐
-                         │  ff-script  │  typed FCALL wrappers (Valkey)
-                         └──────┬──────┘
-                                │
-                         ┌──────┴──────┐
-                         │   ff-core   │  types, state, keys, errors,
-                         │              │  EngineBackend trait
-                         └──────┬──────┘
-                                │
-           ┌────────────────────┼────────────────────┐
-           │                    │                    │
-  ┌────────┴────────┐  ┌────────┴────────┐  ┌───────┴────────┐
-  │ ff-backend-     │  │ ff-backend-     │  │ ff-backend-    │
-  │  valkey         │  │  postgres       │  │  sqlite         │
-  │  (production)   │  │  (production)   │  │  (dev-only)    │
-  │                 │  │                 │  │  RFC-023       │
-  └────────┬────────┘  └─────────────────┘  └────────────────┘
-           │
-  ┌────────┴────────┐
-  │    ferriskey    │  Valkey client (Rust)
-  └─────────────────┘
+
+Add the umbrella crate if you want backend selection behind a
+feature flag:
+
+```toml
+flowfabric = "0.15"                                    # valkey (default)
+# or, to swap backends:
+flowfabric = { version = "0.15", default-features = false, features = ["postgres"] }
 ```
 
-## Features
-
-- **Lease-based ownership** -- workers hold leases on executions; auto-renewed, crash-safe
-- **Suspend / signal / resume** -- human-in-the-loop and async event-driven workflows with HMAC-signed waitpoint tokens
-- **Flow coordination** -- DAG execution with dependency edges, fan-out, skip propagation
-- **Budget and quota** -- per-dimension usage tracking, hard/soft limits, sliding-window rate limiting
-- **Streaming output** -- append-only frame streams scoped to each attempt
-- **Priority scheduling** -- score-based eligible sets with priority clamping
-- **Capability routing** -- workers advertise capabilities; scheduler subset-matches per-execution requirements
-- **REST API** -- 27 endpoints on axum with JSON error handling, CORS, health check
-- **Backend trait** -- `EngineBackend` is the stable surface for alternate backends (Valkey + Postgres both first-class at v0.8.0, RFC-017 Stage E4); `capabilities()` returns a flat `Capabilities { identity, supports }` — dot-access `caps.supports.<method>` bools (v0.10, #277); typed `subscribe_lease_history` / `subscribe_completion` / `subscribe_signal_delivery` with a required `&ScannerFilter` parameter for per-tenant tag isolation (pass `&ScannerFilter::default()` for the unfiltered stream) (v0.10, #282); cursor-paginated `list_executions` / `list_flows` / `list_lanes` / `list_suspended` for operator tooling
-- **Client-local tower-style layer surface** -- opt-in `TracingLayer`, `RateLimitLayer`, `MetricsLayer`, `CircuitBreakerLayer` compose around any `EngineBackend`
-- **Observability** -- OTEL via `ff-observability`, Prometheus scrape endpoint via `ff-server` (engine-side) or `ff-observability-http` crate (consumer-side), optional Sentry integration, Grafana dashboard JSON bundled
-- **Cluster-safe** -- all operations use hash-tag partitioning; cluster-aware enumeration via ferriskey's hash-tag-aware `cluster_scan` (single-shard routing when the match pattern embeds a tag)
+See [`crates.io/crates/flowfabric`](https://crates.io/crates/flowfabric).
 
 ## Quick start
 
-### 1. Start Valkey
+Three commands get you a running worker loop.
 
-FlowFabric is Valkey-native and is not tested or supported against Redis.
-The version check expects Valkey's `INFO` shape; pointing `ff-server` at a
-Redis server is unsupported and is rejected at boot by the version gate
-(`parse_valkey_version` requires `server_name:valkey` in INFO). The
-`redis_version:` fallback exists for pre-8.0 Valkey (which emits only
-`redis_version:`, not `valkey_version:`), not to legitimize or allow Redis.
-
-FlowFabric requires Valkey >= 7.2 (RFC-011 §13, enforced at boot). 7.2 is the
-release where the Valkey Functions API + RESP3 stabilized. Valkey 7.0 and
-earlier are rejected by `ff-server`.
+**1. Start Valkey.** FlowFabric requires Valkey ≥ 7.2 (RFC-011 §13) and
+refuses Redis at boot. CI exercises 7.2 and 8.
 
 ```bash
 docker run -d --name valkey -p 6379:6379 valkey/valkey:8-alpine
 ```
 
-The quickstart image pins major 8 for reproducibility, but any `valkey/valkey`
-tag whose version is ≥ 7.2 will boot. CI exercises both 7.2 and 8.
-
-### 2. Start the FlowFabric server
-
-`FF_WAITPOINT_HMAC_SECRET` is required at boot — the server refuses to start
-without it so waitpoint HMAC authentication can never be silently disabled
-(see RFC-004 §Waitpoint Security). Any even-length hex string works for
-local dev; production should use 64 hex chars (32 bytes) from a secret
-manager.
+**2. Start `ff-server`.** The HMAC secret is mandatory — the server
+refuses to start without it (RFC-004 §Waitpoint Security).
 
 ```bash
 FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 ```
 
-### 3. Try an example
-
-Sixteen end-to-end examples live under [`examples/`](examples/):
-
-- **[`v016-worker-runtime`](examples/v016-worker-runtime/)** -- issue #331 handler-DI demo. `WorkerRuntime::new(worker).data(http).on("enrich", handler).run()` — drops the hand-rolled idle-backoff / bounded-spawn / panic-catch / shared-state boilerplate consumers were writing for every service. Built on `FlowFabricWorker::claim_next_via_backend`; handlers are plain `async fn` whose arguments implement `FromTask` (`Payload<P>` for JSON input, `Data<T>` for typed shared state, `TaskInfo` for execution metadata). Feature-gated on `ff-sdk/runtime`. Run with `FF_HOST=127.0.0.1 FF_PORT=6379 cargo run --bin v016-worker-runtime` — drives the loop for 5s against Valkey; point a producer at the same Valkey and submit work under `execution_kind = "enrich"` / `"bad"` to exercise handler paths.
-- **[`v015-ff511-scheduler-agnostic`](examples/v015-ff511-scheduler-agnostic/)** -- v0.15 headline demo for FF #511. A Postgres-only deployment (no Valkey in scope) asserts the new capability surface (`release_admission` + `read_quota_policy_limits` advertised on PG; `block_execution_for_admission` + `read_budget_usage_and_limits` Valkey-only per RFC-023), creates a quota policy, reads its typed limits snapshot (replacing the pre-#511 4× HGET pattern), constructs `Scheduler::new_with_backend(Arc::downgrade(&backend), cfg)` without a `ferriskey::Client`, verifies `claim_for_worker` degrades to `Ok(None)` (scanner still Valkey-bound — PG consumers use `PostgresScheduler` for real claims), and exercises `release_admission` + idempotent replay against a seeded `ff_quota_admitted` row with `active_concurrency` floor-clamp. Requires `FF_PG_TEST_URL`. See [`docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md`](docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md).
-- **[`v014-rfc025-worker-registry`](examples/v014-rfc025-worker-registry/)** -- v0.14 headline demo for RFC-025 worker registry. Round-trips `register_worker` (Registered) → idempotent re-register with changed caps (Refreshed, overwrite per §9.3) → `heartbeat_worker` (Refreshed with `next_expiry_ms`) → `list_workers` (namespace-scoped) → `mark_worker_dead` (Marked, NotRegistered on replay) → post-mark heartbeat (NotRegistered). Exercises the new atomic `ff_register_worker` Lua FCALL (library v34). Runs against local Valkey with `cargo run --bin worker-registry-demo`; no scheduler/worker required. See [`docs/CONSUMER_MIGRATION_0.14_worker_registry.md`](docs/CONSUMER_MIGRATION_0.14_worker_registry.md) and `docs/POSTGRES_PARITY_MATRIX.md §cairn #473` for the trait-method parity table (all three backends `impl` at v0.14.0).
-- **[`v013-cairn-454-budget-ledger`](examples/v013-cairn-454-budget-ledger/)** -- v0.13 headline demo for cairn #454's per-execution budget ledger (migration 0020 + Lua v31). Calls `EngineBackend::record_spend` + `EngineBackend::release_budget` directly on Valkey; shows the aggregate counter transitioning through before → after-spend → after-release states and verifies idempotent replay of both methods. Runs against local Valkey with `cargo run --bin budget-ledger`; no scheduler/worker required. See `docs/POSTGRES_PARITY_MATRIX.md §cairn #454` for the trait-method parity table (all three backends `impl` at v0.13.0).
-- **[`external-callback`](examples/external-callback/)** -- v0.13 headline demo for the waitpoint consumer surface (SC-09 scenario). A workflow suspends against an HMAC-signed pending waitpoint, an asynchronous external actor POSTs the token back, a signal-bridge authenticates via `EngineBackend::read_waitpoint_token` (#434), and `FlowFabricWorker::deliver_signal` resumes the flow. Exercises `create_waitpoint` (#435), the backend-agnostic `FlowFabricAdminClient::connect_with` facade (#432), and `WorkerConfig.backend: Option<BackendConfig>` (#448). Runs end-to-end against SQLite with `FF_DEV_MODE=1 cargo run -p external-callback -- --backend sqlite`; includes a tamper-rejection branch demonstrating HMAC verify. See [`docs/CONSUMER_MIGRATION_0.13.md`](docs/CONSUMER_MIGRATION_0.13.md).
-- **[`ff-dev`](examples/ff-dev/)** -- v0.12 headline demo for the RFC-023 SQLite dev-only backend. Try FlowFabric in 60 seconds with zero Docker: in-process `:memory:` SQLite, `create_flow` + `create_execution` + `claim` + `complete` + Wave-9 admin (`change_priority`, `cancel_execution`) + `read_execution_info` + RFC-019 `subscribe_completion` surface. Runs as `FF_DEV_MODE=1 cargo run --bin ff-dev`. No external services.
-- **[`incident-remediation`](examples/incident-remediation/)** -- v0.12 headline demo for the RFC-024 lease-reclaim consumer surface (SC-10 scenario). Two-responder pager-death handoff: Responder A claims an incident, "dies" mid-flow, a supervisor issues a `ReclaimGrant`, Responder B picks up via `FlowFabricWorker::claim_from_reclaim_grant` and completes; a second incident is run past `max_reclaim_count` to show the `ReclaimCapExceeded` escalation. Runs end-to-end against SQLite with `FF_DEV_MODE=1 cargo run -p incident-remediation -- --backend sqlite`; Valkey + Postgres dispatch paths present, require a scheduler+scanner deployment for the full loop.
-- **[`v011-wave9-postgres`](examples/v011-wave9-postgres/)** -- v0.11 headline demo for the RFC-020 Wave 9 Postgres release. Multi-tenant operator dashboard exercising all six Wave-9 method groups on Postgres: budget/quota admin, `change_priority`, `cancel_execution` + `ack_cancel_member`, `replay_execution`, `list_pending_waitpoints`, `cancel_flow_header`, and `read_execution_info`. Requires `FF_PG_TEST_URL`.
-- **[`v010-read-side-ergonomics`](examples/v010-read-side-ergonomics/)** -- v0.10 headline demo for consumer read-side APIs: flat `Capabilities::supports.<flag>` discovery (#277), typed `LeaseHistoryEvent` from `subscribe_lease_history` (#282), and tag-restricted subscriptions via `ScannerFilter::with_instance_tag(..)`. Multi-tenant lease-audit console pattern. No external dependencies beyond a running `ff-server`.
-- **[`llm-race`](examples/llm-race/)** -- race N free OpenRouter LLM providers against the same prompt; automatically cancel losers when one wins; stream the winner via `DurableSummary` with JSON Merge Patch. Exercises v0.6 `AnyOf{CancelRemaining}` + `Count{DistinctSources}` + typed `SuspendArgs`. Verified live 2026-04-24. Best starting point for learning v0.6 primitives. Requires `OPENROUTER_API_KEY` (free tier).
-- **[`coding-agent`](examples/coding-agent/)** -- LLM-powered code-patch worker with streaming output and human-in-the-loop suspend/signal review. Requires `OPENROUTER_API_KEY`.
-- **[`media-pipeline`](examples/media-pipeline/)** -- three-stage audio pipeline (transcribe → summarize → embed) exercising capability routing, stream tail with terminal markers, and HMAC-signed waitpoint signals. Requires `OPENROUTER_API_KEY` + local whisper.cpp.
-- **[`retry-and-cancel`](examples/retry-and-cancel/)** -- minimal control-plane demo of retry-exhaustion terminal failure + `cancel_flow` cascade. No external dependencies beyond the running server.
-- **[`deploy-approval`](examples/deploy-approval/)** -- CI/CD pipeline demo: fans out unit/integration/e2e tests in parallel (capability routing), gates a canary rollout on two distinct human approvals (`Count{n:2, DistinctSources}`), streams build logs as JSON Merge Patch frames (`DurableSummary`), and cascades `cancel_flow` on verify failure. Proved live 2026-04-24. Requires Valkey + `ff-server`.
-- **[`token-budget`](examples/token-budget/)** -- v0.9 UC-37 + UC-39 demo: a batch-inference runner dispatches five LLM prompts as child executions under a shared per-flow token budget, reports usage in real time via `report_usage`, and cancels with `cancel_pending` on hard-limit breach. Proved live 2026-04-24. Requires Valkey + `ff-server`.
-- **[`grafana`](examples/grafana/)** -- Grafana operator dashboard (`flowfabric-ops.json`) with ten panels covering claim-grant latency, lease renewals, admission-control hits, scanner cycle timing, and HTTP status rates. Load into Grafana and point at your Prometheus scrape of `ff-server`.
-
-Quick start with the coding agent:
+**3. Run an example.**
 
 ```bash
-# Terminal 1: worker
-cd examples/coding-agent
-OPENROUTER_API_KEY=sk-or-... OPENROUTER_MODEL=moonshotai/kimi-k2.6 cargo run --bin worker
+# Zero-Docker path — in-process SQLite dev backend, no Valkey needed
+FF_DEV_MODE=1 cargo run --bin ff-dev
 
-# Terminal 2: submit a task
-cd examples/coding-agent
-cargo run --bin submit -- --issue "Write a Rust function that checks if a string is a palindrome"
+# Or the WorkerRuntime handler-DI demo against the running ff-server
+FF_HOST=127.0.0.1 FF_PORT=6379 cargo run --bin v016-worker-runtime
 ```
 
-## SDK claim_next() feature gate
+Full example index: [`examples/`](examples/). Fifteen runnable
+examples plus one operator-dashboard asset, covering LLM fan-out,
+approval gates, waitpoint roundtrip, retry exhaustion, budget ledger,
+and worker-registry lifecycle.
 
-The SDK's `claim_next()` method bypasses budget/quota admission control and is gated behind a feature flag. Enable it explicitly:
+## Core concepts
 
-```toml
-ff-sdk = { path = "crates/ff-sdk", features = ["direct-valkey-claim"] }
+- **Execution.** A single unit of work with state, lease, attempt
+  history, and optional streaming output.
+- **Flow.** A DAG of executions with dependency edges, fan-out,
+  cancellation cascade, and skip propagation.
+- **Lease.** A worker's ownership claim on an execution. Auto-renewed
+  via heartbeat; reclaimed on expiry so crashes don't wedge work.
+- **Waitpoint.** A named suspension point in a flow. A worker calls
+  `suspend`; an external signer POSTs an HMAC-signed token; the flow
+  resumes.
+- **Budget / quota.** Per-dimension usage counters with hard/soft
+  limits, sliding-window rate limiting, and per-flow admission
+  control.
+- **Capability.** A string a worker advertises (e.g. `"gpu"`,
+  `"trusted"`); the scheduler subset-matches against per-execution
+  requirements before issuing a claim grant.
+
+## Features
+
+- **Durable execution** over Valkey Functions (FCALL) or Postgres
+  SQL — backend chosen per deployment, same SDK.
+- **Lease-safe claim/renew/fail** — a crashed worker releases its
+  leases on TTL expiry; retry semantics are at-least-once with
+  idempotent terminal ops.
+- **Suspend / signal / resume** with HMAC-signed waitpoint tokens —
+  safe to hand to untrusted external services for callbacks.
+- **Flow coordination** — DAG execution with `cancel_flow` cascade,
+  dependency edges, fan-out, skip propagation, `AnyOf` / `Count{n, DistinctSources}` joins.
+- **Streaming output** — append-only frame streams scoped per attempt;
+  JSON Merge Patch `DurableSummary` for incremental UI updates.
+- **Priority + capability scheduling** — score-based eligible sets,
+  priority clamping, capability subset matching.
+- **Budget / quota** — per-flow token budgets with real-time
+  `report_usage`, hard-limit `cancel_pending`, sliding-window rate
+  limits.
+- **Client-local middleware** — compose `TracingLayer`,
+  `RateLimitLayer`, `MetricsLayer`, `CircuitBreakerLayer` around any
+  `EngineBackend`.
+- **29-endpoint REST API** on axum with JSON errors, CORS, Bearer
+  auth, `/healthz`, optional `/metrics`.
+- **Observability** — structured `tracing` logs, OTEL + Prometheus
+  via `ff-observability`, optional Sentry integration, bundled
+  Grafana dashboard.
+- **Cluster-safe** — every key carries a hash tag
+  (`{fp:N}`, `{b:M}`, `{q:K}`) so related state always co-locates;
+  cluster-aware enumeration via ferriskey's hash-tag-aware
+  `cluster_scan`.
+
+## Backends
+
+| Backend | Status at v0.15 | Use case |
+| --- | --- | --- |
+| **Valkey** (`FF_BACKEND=valkey`, default) | production, standalone + cluster | High-throughput durable execution. Every trait method backed by an atomic Lua FCALL. |
+| **Postgres** (`FF_BACKEND=postgres`) | production, RFC-017 Stage E4 | Enterprise persistence, long-retention analytics, shops that prefer SQL ops over Redis ops. Parity matrix in [`docs/POSTGRES_PARITY_MATRIX.md`](docs/POSTGRES_PARITY_MATRIX.md). |
+| **SQLite** (`FF_BACKEND=sqlite`) | **dev-only**, RFC-023 | Zero-Docker local dev loop and `cargo test` path. Gated behind `FF_DEV_MODE=1`; refuses to start without it. Not a deployment target. |
+
+Backend selection is per-deployment via `FF_BACKEND`; the SDK and HTTP
+surface are identical. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+for the full env-var reference.
+
+## Architecture
+
 ```
-
-For production deployments, use the Scheduler (`ff-scheduler`) which enforces admission control before issuing claim grants. The direct claim path is intended for development, testing, and trusted single-worker setups.
+                         ┌─────────────┐
+                         │  ff-server  │  HTTP API + 17 scanners
+                         └──────┬──────┘
+                                │
+                 ┌──────────────┼──────────────┐
+          ┌──────┴──────┐ ┌────┴────┐ ┌───────┴───────┐
+          │  ff-engine  │ │ ff-sdk  │ │ ff-scheduler  │
+          └──────┬──────┘ └────┬────┘ └───────┬───────┘
+                 └─────── ff-script ──────────┘  (Valkey FCALL)
+                                │
+                         ┌──────┴──────┐
+                         │   ff-core   │  traits, types, keys
+                         └──────┬──────┘
+           ┌────────────────────┼────────────────────┐
+  ┌────────┴────────┐  ┌────────┴────────┐  ┌───────┴────────┐
+  │ ff-backend-     │  │ ff-backend-     │  │ ff-backend-    │
+  │  valkey         │  │  postgres       │  │  sqlite        │
+  │  (production)   │  │  (production)   │  │  (dev-only)    │
+  └─────────────────┘  └─────────────────┘  └────────────────┘
+```
 
 ## Crates
 
-| Crate | Description |
-|-------|-------------|
-| `ferriskey` | Valkey client -- in-tree, forked from glide-core (valkey-glide). Hash-tag-aware `cluster_scan` single-shard routing. |
-| `ff-core` | Core types, state enums, partition math, key builders, `EngineBackend` trait, error codes |
-| `ff-script` | Typed FCALL wrappers and Lua library loader |
-| `ff-engine` | Cross-partition dispatch and 17 background scanners |
-| `ff-scheduler` | Claim-grant cycle, fairness, capability matching |
-| `ff-backend-valkey` | `EngineBackend` implementation backed by Valkey FCALL |
-| `ff-backend-postgres` | `EngineBackend` implementation backed by Postgres (RFC-017 Stage E) |
-| `ff-backend-sqlite` | `EngineBackend` implementation backed by SQLite (RFC-023) — **dev-only**, gated behind `FF_DEV_MODE=1`. For `cargo test` without Docker and contributor onboarding. Not a deployment target. |
-| `flowfabric` | Umbrella re-export crate; feature-flagged backend selection (`valkey` default, `postgres` opt-in) |
-| `ff-sdk` | Worker SDK — public API for worker authors; includes the client-local `EngineBackendLayer` surface |
-| `ff-server` | HTTP API server, Valkey connection, boot sequence, engine `/metrics` endpoint |
-| `ff-observability` | OTEL + Prometheus instrumentation, optional Sentry integration |
-| `ff-observability-http` | Consumer-side `/metrics` axum router for workers embedding `ff-sdk` in library mode |
-| `ff-test` | Integration test harness, fixtures, assertion helpers |
-| `ff-readiness-tests` | Release-gate behavioral smokes (lifecycle, flow fanout/join, HMAC roundtrip, cancel cascade) |
+| Crate | Role |
+| --- | --- |
+| [`flowfabric`](crates/flowfabric) | Umbrella re-export. Feature-flagged backend selection (`valkey` default, `postgres` opt-in). |
+| [`ff-sdk`](crates/ff-sdk) | Worker SDK — public API for worker authors. Includes the `EngineBackendLayer` tower surface and the `runtime` feature for `WorkerRuntime`. |
+| [`ff-core`](crates/ff-core) | Core types, state enums, partition math, key builders, `EngineBackend` trait. |
+| [`ff-engine`](crates/ff-engine) | Cross-partition dispatch + 17 background scanners. |
+| [`ff-scheduler`](crates/ff-scheduler) | Claim-grant cycle, fairness, capability matching, admission control. |
+| [`ff-script`](crates/ff-script) | Typed FCALL wrappers and Lua library loader. |
+| [`ff-backend-valkey`](crates/ff-backend-valkey) | `EngineBackend` over Valkey FCALL. |
+| [`ff-backend-postgres`](crates/ff-backend-postgres) | `EngineBackend` over Postgres (RFC-017 Stage E). |
+| [`ff-backend-sqlite`](crates/ff-backend-sqlite) | `EngineBackend` over SQLite (RFC-023) — **dev-only**, gated on `FF_DEV_MODE=1`. |
+| [`ff-server`](crates/ff-server) | HTTP API, Valkey/Postgres connection, boot sequence, `/metrics`. |
+| [`ff-observability`](crates/ff-observability) | OTEL + Prometheus + optional Sentry. |
+| [`ff-observability-http`](crates/ff-observability-http) | Consumer-side `/metrics` axum router for workers embedding `ff-sdk` in library mode. |
+| [`ff-test`](crates/ff-test) | Integration-test harness, fixtures, assertions. |
+| [`ff-readiness-tests`](crates/ff-readiness-tests) | Release-gate behavioral smokes. |
+| [`ferriskey`](ferriskey) | Valkey client (in-tree fork of glide-core with hash-tag-aware `cluster_scan`). |
 
-## Production considerations
+## When not to use FlowFabric
 
-- **Env var reference** — `ServerConfig::from_env` in `crates/ff-server/src/config.rs` is the source of truth. Full list below (required ones are marked `required`):
+- **Not an analytics pipeline.** Optimized for integrating durable
+  execution into application code, not for large fan-out ETL or
+  data-warehousing.
+- **Not a Kafka replacement.** No topic fan-out, no consumer groups,
+  no log retention semantics.
+- **At-least-once semantics.** Terminal ops (`complete`, `fail`,
+  `cancel`) are idempotent on retry by the same caller, but user code
+  must tolerate duplicate attempt execution on worker crash.
+- **SQLite is not a deployment target.** It exists for `cargo test`
+  and contributor onboarding. Production is Valkey or Postgres.
+- **No built-in TLS or rate limiting on `ff-server`.** Deploy behind a
+  reverse proxy (nginx, Envoy). See
+  [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+- **`ff-sdk::claim_next()` bypasses admission control** — gated
+  behind the default-off `direct-valkey-claim` feature. Production
+  consumers use `ff-scheduler`'s claim-grant cycle.
+- **Pre-1.0.** Breaking changes are documented per release in
+  [`CHANGELOG.md`](CHANGELOG.md) and `docs/CONSUMER_MIGRATION_*.md`.
 
-  | Variable | Default | Description |
-  |----------|---------|-------------|
-  | `FF_WAITPOINT_HMAC_SECRET` | *required* | Hex-encoded HMAC signing secret for waitpoint tokens (RFC-004 §Waitpoint Security). Even-length hex; 64 chars (32 bytes) recommended. |
-  | `FF_BACKEND` | `valkey` | Backend family — `valkey`, `postgres`, or `sqlite`. Valkey + Postgres are first-class at v0.8.0 (RFC-017 Stage E4); SQLite lands at v0.12.0 as a **dev-only** backend (RFC-023). |
-  | `FF_HOST` | `localhost` | Valkey host (ignored when `FF_BACKEND=postgres` or `sqlite`) |
-  | `FF_PORT` | `6379` | Valkey port (ignored when `FF_BACKEND=postgres` or `sqlite`) |
-  | `FF_TLS` | `false` | Enable Valkey TLS (`1` or `true`) |
-  | `FF_CLUSTER` | `false` | Enable Valkey cluster mode |
-  | `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (required when `FF_BACKEND=postgres`). Example: `postgres://user:pass@host:5432/db`. |
-  | `FF_POSTGRES_POOL_SIZE` | `10` | Postgres pool size (ignored on non-Postgres paths). |
-  | `FF_SQLITE_PATH` | `:memory:` | SQLite path or URI (required shape under `FF_BACKEND=sqlite`). File path (`/tmp/ff-dev.db`) or URI (`file:name?mode=memory&cache=shared`). Dev-only per RFC-023. |
-  | `FF_SQLITE_POOL_SIZE` | `4` | SQLite pool size (1 writer + N–1 readers); ignored on non-SQLite paths. |
-  | `FF_DEV_MODE` | *(unset)* | **Required** when `FF_BACKEND=sqlite` or when constructing `SqliteBackend::new` directly; server + backend refuse to start without it. Orthogonal to `FF_ENV=development` / `FF_BACKEND_ACCEPT_UNREADY=1`. No effect on Valkey / Postgres paths. See [`docs/dev-harness.md`](docs/dev-harness.md). |
-  | `FF_FORCE_LUA_RELOAD` | *(unset)* | **Dev-only.** When set to `1`/`true`/`yes`, `ff_script::loader::ensure_library` bypasses the version-check fast-path and always issues `FUNCTION LOAD REPLACE`. Use locally when iterating on Lua sources without bumping `crates/ff-script/src/flowfabric_lua_version` — otherwise a long-lived dev Valkey keeps serving the stale cached library. The PR-level CI guard (`ff-script lua drift`) catches un-bumped edits before merge; this env covers the inner dev loop. Leave unset in production — the version-guard prevents accidental reloads under concurrent deploys. |
-  | `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address |
-  | `FF_LANES` | `default` | Comma-separated lane names |
-  | `FF_FLOW_PARTITIONS` | `256` | Flow partition count (exec keys co-locate under RFC-011) |
-  | `FF_BUDGET_PARTITIONS` | `32` | Budget partition count |
-  | `FF_QUOTA_PARTITIONS` | `32` | Quota partition count |
-  | `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins; empty string is rejected |
-  | `FF_API_TOKEN` | *(none)* | Shared-secret Bearer token; if set, all non-`/healthz` requests require it |
-  | `FF_WAITPOINT_HMAC_GRACE_MS` | `86400000` | Grace window for previous-kid token acceptance after rotation |
-  | `FF_MAX_CONCURRENT_STREAM_OPS` | `64` | Shared semaphore for stream reads + tails; legacy `FF_MAX_CONCURRENT_TAIL` still accepted |
-  | `FF_LEASE_EXPIRY_INTERVAL_MS` | `1500` | Lease-expiry scanner interval |
-  | `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed-promoter scanner interval |
-  | `FF_INDEX_RECONCILER_INTERVAL_S` | `45` | Index reconciler interval |
-  | `FF_ATTEMPT_TIMEOUT_INTERVAL_S` | `2` | Attempt-timeout scanner interval |
-  | `FF_SUSPENSION_TIMEOUT_INTERVAL_S` | `2` | Suspension-timeout scanner interval |
-  | `FF_PENDING_WP_EXPIRY_INTERVAL_S` | `5` | Pending-waitpoint expiry interval |
-  | `FF_RETENTION_TRIMMER_INTERVAL_S` | `60` | Retention-trimmer scanner interval |
-  | `FF_BUDGET_RESET_INTERVAL_S` | `15` | Budget-reset scanner interval |
-  | `FF_BUDGET_RECONCILER_INTERVAL_S` | `30` | Budget reconciler interval |
-  | `FF_QUOTA_RECONCILER_INTERVAL_S` | `30` | Quota reconciler interval |
-  | `FF_UNBLOCK_INTERVAL_S` | `5` | Unblock scanner interval |
-  | `FF_DEPENDENCY_RECONCILER_INTERVAL_S` | `15` | DAG dependency reconciler interval |
-  | `FF_FLOW_PROJECTOR_INTERVAL_S` | `15` | Flow projector scanner interval |
-  | `FF_EXECUTION_DEADLINE_INTERVAL_S` | `5` | Execution-deadline scanner interval |
-  | `FF_CANCEL_RECONCILER_INTERVAL_S` | `15` | Cancel-reconciler scanner interval |
-- **Auth is opt-in** — if `FF_API_TOKEN` is unset, every endpoint except `GET /healthz` is reachable without authentication. Always set `FF_API_TOKEN` (and consider CORS via `FF_CORS_ORIGINS`) before exposing the server beyond localhost.
-- **No API rate limiting** — deploy behind a reverse proxy (nginx, Envoy) with rate limiting configured
-- **No HTTP connection limit** — axum accepts unbounded connections; configure limits at the load balancer
-- **cancel_flow** returns `CancellationScheduled` immediately for `cancel_all` policy and dispatches member cancellations asynchronously (see `POST /v1/flows/{id}/cancel`); append `?wait=true` for synchronous completion. Background dispatch is drained with a 15s timeout on shutdown and may be aborted for very large flows.
-- **detect_cycle BFS** can issue ~100K `redis.call` operations on large DAGs (up to 1000 nodes × edges per node), blocking the Valkey event loop; keep flow graph fan-out moderate
-- **Terminal operation replay** — `complete()`, `fail()`, and `cancel()` are idempotent on retry: if the connection drops after the Lua commit but before the client reads the response, a retry by the same caller (matching `lease_epoch` + `attempt_id`) is reconciled by the SDK and returns the same outcome as the original call would have. A retry after a different terminal op committed (e.g. cancel after complete) surfaces as `ExecutionNotActive` with populated `terminal_outcome` so the caller can inspect what actually happened.
-- **cancel_flow dispatch durability** — the async member-cancel loop is durable against process crashes and permanent per-member errors via a per-flow-partition `cancel_backlog` ZSET and per-flow `pending_cancels` SET. Live dispatch acks members as they cancel; the `cancel_reconciler` scanner drains any remainder on its interval (default 15s). A worker can still claim a cancelled flow's member in the cross-slot window between `cancel_flow` and the member's own `ff_cancel_execution` — `ff_claim_execution` reads exec_core on `{p:N}` and cannot atomically consult `flow_core.public_flow_state` on `{fp:N}`, so a member may run one partial attempt before the reconciler cancels it. `?wait=true` still eliminates that window synchronously; default-async now converges within `reconciler_interval + grace_ms` rather than relying on retention.
-- **Lua library after failover** — the server auto-reloads the Lua library on first "function not found" error after a Valkey failover, but the first request in the new epoch will fail and be retried
+## Production notes
 
-### Rolling upgrades
+- **`cancel_flow` dispatch is asynchronous by default** — durable
+  against crashes via a per-flow-partition `cancel_backlog` ZSET; the
+  `cancel_reconciler` scanner drains on its interval (default 15 s).
+  Append `?wait=true` for synchronous completion.
+- **Terminal op replay is idempotent.** A retry by the same caller
+  (matching `lease_epoch` + `attempt_id`) returns the same outcome as
+  the original call would have; a retry after a *different* terminal
+  op committed surfaces as `ExecutionNotActive` with populated
+  `terminal_outcome`.
+- **KEYS-arity changes require blue-green deploys.** Lua `LIBRARY_VERSION`
+  bumps pair with this constraint — see
+  [`docs/DEPLOYMENT.md §7 Upgrade checklist`](docs/DEPLOYMENT.md#7-upgrade-checklist).
+- **Lua auto-reload after Valkey failover.** The server reloads the
+  library on first "function not found" error in a new epoch; the
+  triggering request fails once and retries.
+- **Auth is opt-in.** If `FF_API_TOKEN` is unset, every endpoint
+  except `GET /healthz` is reachable unauthenticated.
 
-KEYS-arity changes (and the `LIBRARY_VERSION` bump that paired with Batch A) require **blue-green or stop-then-start deployment**. Running old and new `ff-server` binaries against the same Valkey simultaneously can produce Lua errors on the old binary because the new binary loads a library whose KEYS arity differs from what the old binary expects — `redis.call(..., nil, ...)` surfaces as `ResponseError`, not silent corruption, but requests will fail until the old instances are drained.
+## Documentation
 
-The version string lives in **`lua/version.lua`** (single source of truth). `scripts/gen-ff-script-lua.sh` extracts it and writes `crates/ff-script/src/flowfabric_lua_version`, which Rust reads via `include_str!`. Regenerate after any edit to `lua/*.lua`; CI fails on drift.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history, one entry per
+  user-visible change.
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — production deployment
+  guide, full env-var reference, Docker Compose starter.
+- [`docs/POSTGRES_PARITY_MATRIX.md`](docs/POSTGRES_PARITY_MATRIX.md)
+  — per-method backend parity table.
+- [`docs/MIGRATIONS.md`](docs/MIGRATIONS.md) — Postgres schema
+  migration reference.
+- [`docs/CONSUMER_MIGRATION_v0.8.md`](docs/CONSUMER_MIGRATION_v0.8.md)
+  … [`CONSUMER_MIGRATION_0.15_scheduler_agnostic.md`](docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md)
+  — per-release consumer migration guides.
+- [`docs/RELEASING.md`](docs/RELEASING.md) — release-gate contract
+  (see also [`CLAUDE.md §5`](CLAUDE.md)).
+- [`docs/operator-guide-postgres.md`](docs/operator-guide-postgres.md)
+  — Postgres operator runbook.
+- [`docs/dev-harness.md`](docs/dev-harness.md) — local dev loop with
+  the SQLite backend.
+- [`rfcs/`](rfcs/) — active RFC drafts. Accepted RFCs live in the
+  `avifenesh/flowfabric-archive` private repo.
 
-Future: per-FCALL version negotiation. For now: drain old instances before starting new ones, or run a single writer at a time.
+## CI & quality gates
 
-## CI coverage
+- [`matrix.yml`](.github/workflows/matrix.yml) — 6-job host × Valkey × mode
+  matrix. linux x86_64 + arm64 × Valkey 7.2 + 8 × {standalone, cluster},
+  plus macOS arm64.
+- [`security-and-quality.yml`](.github/workflows/security-and-quality.yml)
+  — `cargo audit` (deny warnings), `cargo deny`, `cargo geiger`
+  ratchet, CodeQL, `cargo machete`, `cargo semver-checks` against the
+  last tag.
+- [`release.yml`](.github/workflows/release.yml) — tag-triggered
+  verify → smoke → publish → published-artifact smoke → GitHub Release.
 
-Two PR-time GitHub Actions workflows gate merges:
+## Contributing
 
-- **`.github/workflows/matrix.yml`** — 6-job host × valkey × mode matrix. RFC-011 §13 requires Valkey >= 7.2, enforced at `ff-server` boot.
-  - linux x86_64 (`ubuntu-latest`) × valkey 8 (`valkey/valkey:8-alpine`) × {standalone, cluster}
-  - linux x86_64 (`ubuntu-latest`) × valkey 7.2 (`valkey/valkey:7.2`) × standalone — guards against accidental 8-specific primitive adoption
-  - linux arm64 (`ubuntu-24.04-arm`) × valkey 8 × {standalone, cluster}
-  - macos arm64 (`macos-latest`) × valkey 8 × standalone (Homebrew Valkey, currently tracking the 8.x line unpinned; docker-on-mac on GitHub hosted runners does not support the privileged-mode cluster setup).
-  - Cluster mode on linux uses a 3-master 3-replica cluster via `.github/cluster/docker-compose.cluster.yml` + `bootstrap.sh`.
-- **`.github/workflows/security-and-quality.yml`** — 6 independent gates, any one blocks merge:
-  - `cargo audit` with `--deny warnings`; ignore list in `.cargo/audit.toml`
-  - `cargo deny check` (licenses, bans, sources, advisories); policy in `deny.toml`
-  - `cargo geiger` unsafe-expression ratchet against a committed baseline at `.github/geiger-baseline.json`. Refresh with `bin/update-geiger-baseline.sh` in a PR that deliberately changes the unsafe count.
-  - CodeQL gate (polls `codeql.yml` for the same SHA)
-  - `cargo machete` unused-dep detection on `crates/` + `ferriskey` (benches and examples are out of scope — their authors own hygiene there)
-  - `cargo semver-checks` against the latest `v*.*.*` git tag; skips gracefully before the first release.
+The repo does not yet ship a `CONTRIBUTING.md`. For now:
 
-`cargo install` takes a minute per tool; the `Swatinem/rust-cache@v2` key partitioning in both workflows amortises this across PR pushes.
+- Bugs, proposals, and questions → open an issue on
+  [avifenesh/FlowFabric](https://github.com/avifenesh/FlowFabric/issues).
+- Design discussions for non-trivial changes → check
+  `avifenesh/flowfabric-archive` (private) for accepted RFCs before
+  drafting new ones; active drafts live under [`rfcs/`](rfcs/).
+- See [`CLAUDE.md`](CLAUDE.md) for the contributor-facing working
+  style (surgical changes, simplicity first, release-gate
+  requirements).
 
 ## License
 
-Apache-2.0
+Apache-2.0. See the `license` field in [`Cargo.toml`](Cargo.toml) and
+each crate's `Cargo.toml`. The full license text is at
+<https://www.apache.org/licenses/LICENSE-2.0>.

@@ -182,11 +182,49 @@ contract.
 | `FF_SENTRY_ENVIRONMENT` | `production`             | Sentry `environment` tag (`staging`, `dev`, …).                  |
 | `FF_SENTRY_RELEASE`     | crate `CARGO_PKG_VERSION`| Sentry `release` tag — wire in a git SHA or build ID here.       |
 
-The complete list of variables (all the scanner intervals, partition
-counts, etc.) is in the rustdoc for
-[`ServerConfig::from_env`](../crates/ff-server/src/config.rs) and mirrored
-in the project `README.md`. Both tables are kept in sync manually; the
-`from_env` rustdoc is the canonical reference.
+### Full environment reference
+
+`ServerConfig::from_env` in `crates/ff-server/src/config.rs` is the
+canonical source of truth. The table below mirrors it.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FF_WAITPOINT_HMAC_SECRET` | *required* | Hex-encoded HMAC signing secret for waitpoint tokens (RFC-004 §Waitpoint Security). Even-length hex; 64 chars (32 bytes) recommended. |
+| `FF_BACKEND` | `valkey` | Backend family — `valkey`, `postgres`, or `sqlite`. Valkey + Postgres are first-class at v0.8.0 (RFC-017 Stage E4); SQLite lands at v0.12.0 as a **dev-only** backend (RFC-023). |
+| `FF_HOST` | `localhost` | Valkey host (ignored when `FF_BACKEND=postgres` or `sqlite`). |
+| `FF_PORT` | `6379` | Valkey port (ignored when `FF_BACKEND=postgres` or `sqlite`). |
+| `FF_TLS` | `false` | Enable Valkey TLS (`1` or `true`). |
+| `FF_CLUSTER` | `false` | Enable Valkey cluster mode. |
+| `FF_POSTGRES_URL` | *(empty)* | Postgres connection URL (required when `FF_BACKEND=postgres`). Example: `postgres://user:pass@host:5432/db`. |
+| `FF_POSTGRES_POOL_SIZE` | `10` | Postgres pool size (ignored on non-Postgres paths). |
+| `FF_SQLITE_PATH` | `:memory:` | SQLite path or URI (required shape under `FF_BACKEND=sqlite`). File path (`/tmp/ff-dev.db`) or URI (`file:name?mode=memory&cache=shared`). Dev-only per RFC-023. |
+| `FF_SQLITE_POOL_SIZE` | `4` | SQLite pool size (1 writer + N–1 readers); ignored on non-SQLite paths. |
+| `FF_DEV_MODE` | *(unset)* | **Required** when `FF_BACKEND=sqlite` or when constructing `SqliteBackend::new` directly; server + backend refuse to start without it. Orthogonal to `FF_ENV=development` / `FF_BACKEND_ACCEPT_UNREADY=1`. No effect on Valkey / Postgres paths. See [`docs/dev-harness.md`](dev-harness.md). |
+| `FF_FORCE_LUA_RELOAD` | *(unset)* | **Dev-only.** When set to `1`/`true`/`yes`, `ff_script::loader::ensure_library` bypasses the version-check fast-path and always issues `FUNCTION LOAD REPLACE`. Use locally when iterating on Lua sources without bumping `crates/ff-script/src/flowfabric_lua_version` — otherwise a long-lived dev Valkey keeps serving the stale cached library. The PR-level CI guard (`ff-script lua drift`) catches un-bumped edits before merge; this env covers the inner dev loop. Leave unset in production — the version-guard prevents accidental reloads under concurrent deploys. |
+| `FF_LISTEN_ADDR` | `0.0.0.0:9090` | API listen address. |
+| `FF_LANES` | `default` | Comma-separated lane names. |
+| `FF_FLOW_PARTITIONS` | `256` | Flow partition count (exec keys co-locate under RFC-011). |
+| `FF_BUDGET_PARTITIONS` | `32` | Budget partition count. |
+| `FF_QUOTA_PARTITIONS` | `32` | Quota partition count. |
+| `FF_CORS_ORIGINS` | `*` | Comma-separated CORS origins; empty string is rejected. |
+| `FF_API_TOKEN` | *(none)* | Shared-secret Bearer token; if set, all non-`/healthz` requests require it. |
+| `FF_WAITPOINT_HMAC_GRACE_MS` | `86400000` | Grace window for previous-kid token acceptance after rotation. |
+| `FF_MAX_CONCURRENT_STREAM_OPS` | `64` | Shared semaphore for stream reads + tails; legacy `FF_MAX_CONCURRENT_TAIL` still accepted. |
+| `FF_LEASE_EXPIRY_INTERVAL_MS` | `1500` | Lease-expiry scanner interval. |
+| `FF_DELAYED_PROMOTER_INTERVAL_MS` | `750` | Delayed-promoter scanner interval. |
+| `FF_INDEX_RECONCILER_INTERVAL_S` | `45` | Index reconciler interval. |
+| `FF_ATTEMPT_TIMEOUT_INTERVAL_S` | `2` | Attempt-timeout scanner interval. |
+| `FF_SUSPENSION_TIMEOUT_INTERVAL_S` | `2` | Suspension-timeout scanner interval. |
+| `FF_PENDING_WP_EXPIRY_INTERVAL_S` | `5` | Pending-waitpoint expiry interval. |
+| `FF_RETENTION_TRIMMER_INTERVAL_S` | `60` | Retention-trimmer scanner interval. |
+| `FF_BUDGET_RESET_INTERVAL_S` | `15` | Budget-reset scanner interval. |
+| `FF_BUDGET_RECONCILER_INTERVAL_S` | `30` | Budget reconciler interval. |
+| `FF_QUOTA_RECONCILER_INTERVAL_S` | `30` | Quota reconciler interval. |
+| `FF_UNBLOCK_INTERVAL_S` | `5` | Unblock scanner interval. |
+| `FF_DEPENDENCY_RECONCILER_INTERVAL_S` | `15` | DAG dependency reconciler interval. |
+| `FF_FLOW_PROJECTOR_INTERVAL_S` | `15` | Flow projector scanner interval. |
+| `FF_EXECUTION_DEADLINE_INTERVAL_S` | `5` | Execution-deadline scanner interval. |
+| `FF_CANCEL_RECONCILER_INTERVAL_S` | `15` | Cancel-reconciler scanner interval. |
 
 ### Ports
 
