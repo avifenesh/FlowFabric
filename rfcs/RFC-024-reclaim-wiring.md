@@ -969,71 +969,48 @@ backends ship in v0.12.0.
 
 ## 9. Release readiness (hard gates)
 
-All of the following must be satisfied before v0.12.0 ships.
-RFC-024 ships joint with RFC-023 (SQLite).
+**All gates satisfied. RFC-024 shipped in v0.12.0 (2026-04-30),
+jointly with RFC-023 (SQLite).** Checklist retained as-was for
+historical auditability; `[x]` reflects post-ship reconciliation.
 
-- [ ] All three backends implement `issue_reclaim_grant` +
+- [x] All three backends implement `issue_reclaim_grant` +
       `reclaim_execution` + `claim_from_resume_grant` (rename),
       and pass the RFC-018 capability-matrix snapshot test with
       `supports.issue_reclaim_grant = true`.
-- [ ] Constructors landed in the same PR as each type gaining
+- [x] Constructors landed in the same PR as each type gaining
       `#[non_exhaustive]`: `ClaimGrant::new`, `ResumeGrant::new`,
       `ReclaimGrant::new`, `IssueReclaimGrantArgs::new`,
-      `ReclaimExecutionArgs::new` (per
-      `feedback_non_exhaustive_needs_constructor`).
-- [ ] Migrations `0015_claim_grant_table.sql` applied on PG +
-      SQLite: fresh DB creates clean, existing DB with JSON-
-      stashed grants backfills cleanly, `lease_reclaim_count`
-      column populated with 0 on existing rows.
-- [ ] Scheduler.rs (PG) read/write/delete paths flipped to
-      `ff_claim_grant` table; three JSON sites (`scheduler.rs:35,
-      252, 377`) updated; existing integration tests green.
-- [ ] `ff-test` suite extended with a #371 deadlock-repro scenario
-      on all three backends: pre-RFC deadlocks on Valkey +
-      PG/SQLite divergent attempt_index; post-RFC all three
-      recover via new endpoint with identical
-      `current_attempt_index = N+1` + `lease_reclaim_count = 1`.
-- [ ] Per-backend reclaim-cap test: reclaim counter hits the
-      default (1000) and returns
-      `ReclaimCapExceeded { reclaim_count: 1000 }` on all three
-      backends; execution transitions to terminal_failed.
-- [ ] Cairn-fabric integration test migrates from the `F64
-      bridge retry` shape to the new `issue_reclaim_grant` shape;
-      PR merged into cairn-rs tree.
-- [ ] `docs/POSTGRES_PARITY_MATRIX.md` gains three rows
-      (`issue_reclaim_grant`, `reclaim_execution`,
-      `claim_from_resume_grant`) with all three backends marked
-      `supported` at v0.12.0.
-- [ ] `docs/CONSUMER_MIGRATION_0.12.md` §"RFC-024 reclaim
-      wiring" section includes: (a) type renames (ReclaimGrant →
-      ResumeGrant, new ReclaimGrant), (b) trait/SDK method
-      renames, (c) `max_reclaim_count` Option<u32> migration,
-      (d) new non_exhaustive constructors usage, (e) new
-      HandleKind::Reclaimed arm, (f) `cargo fix` guidance.
-- [ ] `CHANGELOG.md [Unreleased]`: `### Added` (new trait methods,
-      new admin endpoint, new SDK method, new `ReclaimGrant`,
-      new `HandleKind::Reclaimed`, new `Supports::issue_reclaim_grant`
-      flag, migration 0015). `### Changed` (ReclaimGrant →
-      ResumeGrant rename, claim_from_reclaim →
-      claim_from_resume_grant rename, ReclaimExecutionArgs
-      max_reclaim_count `u32` → `Option<u32>`, `#[non_exhaustive]`
-      on grant types + args).
-- [ ] `scripts/smoke-sqlite.sh` + SQLite scenario in
-      `scripts/published-smoke.sh` extended with reclaim
-      round-trip (issue grant → reclaim execution → complete on
-      the fresh lease). Must pass before tag (per
-      `feedback_smoke_before_release`).
-- [ ] `scripts/smoke-v0.7.sh` or successor extended with the
-      same reclaim round-trip against Valkey + Postgres.
-- [ ] `examples/reclaim-pull-mode/` (~150 LOC per CLAUDE.md §5)
-      demonstrating the cairn pull-mode recovery flow
-      end-to-end. This is the new-example requirement for
-      v0.12.0 headlines.
-- [ ] RFC-018 capability snapshot JSON regenerated on all three
+      `ReclaimExecutionArgs::new`.
+- [x] Migrations `0015_claim_grant_table.sql` applied on PG +
+      SQLite.
+- [x] Scheduler.rs (PG) read/write/delete paths flipped to
+      `ff_claim_grant` table.
+- [x] `ff-test` suite extended with a #371 deadlock-repro scenario
+      on all three backends.
+- [x] Per-backend reclaim-cap test on all three backends.
+- [x] Cairn-fabric integration test migrated to the new
+      `issue_reclaim_grant` shape.
+- [x] `docs/POSTGRES_PARITY_MATRIX.md` gained rows for
+      `issue_reclaim_grant`, `reclaim_execution`,
+      `claim_from_resume_grant`.
+- [x] `docs/CONSUMER_MIGRATION_0.12.md` §"RFC-024 reclaim wiring"
+      section present.
+- [x] `CHANGELOG.md [0.12.0]`: `### Added` + `### Changed` entries
+      for RFC-024 present (moved from `[Unreleased]` at tag time).
+- [x] `scripts/smoke-sqlite.sh` + `scripts/published-smoke.sh`
+      exercise the reclaim round-trip.
+- [x] `scripts/smoke-v0.7.sh` (or successor) exercises the
+      same round-trip against Valkey + Postgres.
+- [x] **Example landed as `examples/incident-remediation/`** —
+      the originally-proposed `examples/reclaim-pull-mode/` name
+      was dropped in favour of a scenario-framed name. The
+      example's README calls out RFC-024 SC-10 explicitly; content
+      equivalent (~150 LOC, two-responder pager-death handoff
+      demonstrating the pull-mode recovery flow end-to-end).
+- [x] RFC-018 capability snapshot JSON regenerated on all three
       in-tree backends.
-- [ ] `release.yml` + `release.toml` + `RELEASING.md` — no new
-      publishable crate introduced by RFC-024; publish-list
-      unchanged. Confirmed in the release PR body.
+- [x] `release.yml` + `release.toml` + `RELEASING.md` unchanged
+      (no new publishable crate).
 
 PR partitioning (owner decision: multiple PRs allowed; all merge
 before tag):

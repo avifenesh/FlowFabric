@@ -39,6 +39,17 @@ TEAM.md
 
 # ── Claude / agent artifacts ──
 ferriskey/.claude/
+# Agent state dirs at the repo root (repo-intel cache, codex/opencode caches).
+/.claude/
+/.codex
+/.codex/
+/.opencode/
+# Agent audit / report artifacts. These are one-off scans (drift-detect,
+# audit-project, repo-intel exports, etc.) — regenerate locally, don't commit.
+/drift-detect-report.md
+/audit-project-report.md
+/repo-intel-report.md
+/.audit-reports/
 
 # ── Model caches (fastembed writes to $CWD-relative .fastembed_cache/) ──
 .fastembed_cache/

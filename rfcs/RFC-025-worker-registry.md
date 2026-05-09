@@ -1,9 +1,10 @@
 # RFC-025: Worker registry — backend-agnostic trait methods
 
-**Status:** DRAFT (Revision 4)
+**Status:** ACCEPTED — Revision 4
 **Author:** FlowFabric Team (manager single-agent draft)
 **Proposed:** 2026-05-02
-**Target release:** v0.14 content delivery (post-weekend v0.14 ergonomics work)
+**Accepted:** 2026-05-02 (shipped in v0.14.0)
+**Target release:** v0.14 content delivery (shipped)
 **Related RFCs:** RFC-012 (EngineBackend trait), RFC-018 (capability discovery), RFC-019 (lease events), RFC-023 (SQLite dev-only backend)
 **Tracking issue:** #473
 **Consumer report:** avifenesh/cairn-rs → `PostgresControlPlane` currently stubs these four methods with `unimplemented!("PR-C4")`; cairn-app worker-registry code paths are Valkey-gated today
