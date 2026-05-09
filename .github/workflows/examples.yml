@@ -27,13 +27,22 @@ on:
   push:
     branches: [main]
     paths:
-      - 'examples/**'
+      # Source-only triggers. Example READMEs are excluded: an edit
+      # to examples/**/*.md or examples/README.md is documentation
+      # and does not need the ~1h live-run harness. A README-documented
+      # behavior change must accompany the corresponding .rs /
+      # Cargo.toml edit anyway, which does trigger.
+      - 'examples/**/*.rs'
+      - 'examples/**/Cargo.toml'
+      - 'examples/**/Cargo.lock'
       - 'crates/ff-*/**'
       - 'scripts/run-all-examples.sh'
       - '.github/workflows/examples.yml'
   pull_request:
     paths:
-      - 'examples/**'
+      - 'examples/**/*.rs'
+      - 'examples/**/Cargo.toml'
+      - 'examples/**/Cargo.lock'
       - 'crates/ff-*/**'
       - 'scripts/run-all-examples.sh'
       - '.github/workflows/examples.yml'

@@ -16,6 +16,15 @@ on:
       - 'NOTICE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE*'
+      # Repo-meta files that can't affect the analysed source.
+      - '.gitignore'
+      - '.gitattributes'
+      - '.mailmap'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - '.github/CODEOWNERS'
+      - '.github/dependabot.yml'
+      - '.github/release-drafter.yml'
   pull_request:
     paths-ignore:
       - '**.md'
@@ -25,6 +34,15 @@ on:
       - 'NOTICE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE*'
+      # Repo-meta files that can't affect the analysed source.
+      - '.gitignore'
+      - '.gitattributes'
+      - '.mailmap'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - '.github/CODEOWNERS'
+      - '.github/dependabot.yml'
+      - '.github/release-drafter.yml'
   schedule:
     - cron: "0 6 * * 1"
 

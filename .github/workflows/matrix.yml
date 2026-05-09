@@ -63,6 +63,16 @@ on:
       - 'NOTICE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE*'
+      # Repo-meta files that cannot affect a Rust build or a runtime
+      # check — safe to skip CI on pure edits to these.
+      - '.gitignore'
+      - '.gitattributes'
+      - '.mailmap'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - '.github/CODEOWNERS'
+      - '.github/dependabot.yml'
+      - '.github/release-drafter.yml'
   pull_request:
     paths-ignore:
       - '**.md'
@@ -72,6 +82,16 @@ on:
       - 'NOTICE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE*'
+      # Repo-meta files that cannot affect a Rust build or a runtime
+      # check — safe to skip CI on pure edits to these.
+      - '.gitignore'
+      - '.gitattributes'
+      - '.mailmap'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - '.github/CODEOWNERS'
+      - '.github/dependabot.yml'
+      - '.github/release-drafter.yml'
 
 env:
   CARGO_TERM_COLOR: always
