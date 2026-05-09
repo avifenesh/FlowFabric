@@ -48,10 +48,10 @@ Source RFCs: RFC-001..012 + RFC-017..019 (archived at
 | D-029 | RFC-006 | §Impl Notes Batch B | REST chunked-transfer / SSE for large span streams deferred to v2 | v2 | M |
 | D-030 | RFC-006 | §V2 upgrade path | Replace single `tail_client`+Mutex with pool of N dedicated ferriskey clients (BLOCKs truly parallel) | v2 | M |
 | D-031 | RFC-006 | §V2 upgrade path | Close paths emit `stream_closed` sentinel XADD so XREAD BLOCK wakes immediately | v2 | M |
-| D-032 | RFC-007 | §V1 limitation | Dependency checks on the resume path (dynamic deps on non-runnable executions) | ? | M |
+| D-032 | RFC-007 | §V1 limitation | Dependency checks on the resume path (dynamic deps on non-runnable executions) — tracked at #525 | ? | M |
 | D-033 | RFC-007 | §V1 limitation | Batch dependency resolution by partition with staggered 100-500 batches to smooth large fan-out bursts | ? | M |
 | D-036 | RFC-007 | §Designed for later | Richer multi-edge semantics | post-v1 | M |
-| D-037 | RFC-007 | §Designed for later | Multi-flow membership | post-v1 | M |
+| D-037 | RFC-007 | §Designed for later | Multi-flow membership / subflow nesting — tracked at #524 (RFC-design-sketch) | post-v1 | M |
 | D-038 | RFC-007 | §Designed for later | Coordinator-authored custom aggregate completion logic beyond declared policy set | post-v1 | L |
 | D-039 | RFC-007 | §Open Q4 | Graph-reconciliation model so replay reopens downstream eligibility (satisfied edges un-resolve) | ? | L |
 | D-040 | RFC-008 | §Designed-for but deferred | Budget reservation / precharge semantics | post-v1 | M |
@@ -71,7 +71,7 @@ Source RFCs: RFC-001..012 + RFC-017..019 (archived at
 | D-054 | RFC-009 | §5 capabilities | Secondary ZSET index per capability to avoid O(N) eligible scans for niche caps | V2 | M |
 | D-055 | RFC-009 | §5 capabilities | Operator `explain_capability_mismatch` API for C3 | V2 | S |
 | D-056 | RFC-009 | §5 capabilities | Isolation level and locality matching | V2 | L |
-| D-057 | RFC-009 | §5 capabilities | Worker-connect-triggered blocked_route sweep (V1 uses periodic unblock scanner) | V2 | M |
+| D-057 | RFC-009 | §5 capabilities | Worker-connect-triggered blocked_route sweep (V1 uses periodic unblock scanner) — tracked at #526 | V2 | M |
 | D-058 | RFC-009 | §5 capabilities | Reclaim scanner integration for `ff_issue_reclaim_grant` | Batch C | M |
 | D-059 | RFC-009 | §Designed-for but deferred | Weighted preference scoring beyond simple match/no-match | ? | M |
 | D-060 | RFC-009 | §Designed-for but deferred | Global fairness scheduler (v1 uses per-scheduler-instance deficit tracking) | ? | L |
