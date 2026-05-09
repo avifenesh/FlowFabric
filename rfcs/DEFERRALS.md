@@ -1,27 +1,18 @@
-# FlowFabric RFC Deferrals Catalogue
+# FlowFabric RFC Deferrals
 
-Generated: 2026-05-09. Source: every in-tree RFC + the archived
-avifenesh/flowfabric-archive rfcs/ tree + docs/POSTGRES_PARITY_MATRIX.md.
+Generated 2026-05-09, deeply reconciled 2026-05-10 against `main`.
 
-Reconciled 2026-05-09: one-by-one verification pass against current
-`main` (HEAD `25ac0c5`). Seven items moved from "Still deferred" to
-"Shipped" after grepping the codebase for evidence. See "Reconciliation
-notes" at the bottom for the audit trail.
+Every row below is an item the RFC explicitly deferred, punted to v2/v3,
+or left as a follow-up, and which is **still absent from the codebase**.
+Verified by reading the originating RFC section and searching for intent-
+equivalent code (renamed symbols, cross-crate diffusion, semantic
+equivalents) across every `crates/` directory plus the Lua library.
 
-## Summary
+Source RFCs: RFC-001..012 + RFC-017..019 (archived at
+`avifenesh/flowfabric-archive`), RFC-020, RFC-023, RFC-024, RFC-025
+(in-tree), plus `docs/POSTGRES_PARITY_MATRIX.md`.
 
-Row counts after 2026-05-10 round-2 reconciliation (both passes combined):
-
-- Still deferred: 96  (was 106 initially; 10 moved to Shipped across 2 passes)
-- Shipped: 29  (was 19 → +7 round-1 → +3 round-2 = 29)
-- Dropped / superseded: 4
-- Permanent non-goals: 27
-- Total unique IDs: 156
-
-Round 1 (2026-05-09): moved 7 rows after grep-only verification.
-Round 2 (2026-05-10): moved 3 more after reading each item's RFC section
-and searching for intent-equivalent code across all crates. 96 remaining
-items manually walked end-to-end and confirmed absent.
+**Count: 96 items still deferred.**
 
 ## Still deferred
 
@@ -123,170 +114,3 @@ items manually walked end-to-end and confirmed absent.
 | D-104 | POSTGRES_PARITY_MATRIX | Wave-9 outbox | Add dedicated `delay_until_ms` column on `ff_exec_core` (today `deadline_at_ms` overloaded) | post-v0.12 additive | S |
 | D-105 | RFC-011 | §9.8 | `num_flow_partitions` wider default of 1024 for future-proofing (currently 256, phase-5 bench data pending) | phase 5 benchmarks | S |
 | D-106 | RFC-010 | §9.3 retention | `flow_retention` retention overrides (`stream_policy.retention_ttl_ms`) on PG/SQLite (Valkey-only today) | ? | M |
-
-## Shipped
-
-| ID | Source | § | Original summary | Shipped in |
-|----|--------|---|------------------|------------|
-| S-001 | RFC-005 | §Designed-for but deferred | Multi-signal resume conditions (`all_of`, `count(n)`) — machinery exists, complex evaluation deferred | v0.6.x — RFC-014 `AllOf`, `Count{DistinctX}` (CHANGELOG line 2481) |
-| S-002 | RFC-006 | §Designed-for but deferred | `durable_summary` and `best_effort_live` durability modes | CHANGELOG line 2421 `StreamMode::best_effort_live` |
-| S-003 | RFC-007 | §Designed for later | any-of / quorum dependency policies | v0.6.x — RFC-016 Stage B `any_of` / `quorum(k,...)` (CHANGELOG line 2452, 2559) |
-| S-004 | RFC-008 | §Known Limitations | Soft limits with graduated enforcement (default warn) | CHANGELOG entries for `SOFT_BREACH`/soft-limit support |
-| S-005 | RFC-010 | §9.2 | Multi-backend abstraction + Postgres backend becomes implementable | v0.8.0 (RFC-012 trait + Postgres backend) |
-| S-006 | RFC-010 | §9.2 | SQLite local mode (partition model) | v0.12.0 (RFC-023 `ff-backend-sqlite`) |
-| S-007 | RFC-010 | §9.2 | Public API wire format (gRPC/REST/SDK) / API server | `ff-server` REST surface |
-| S-008 | RFC-012 | §R7 amendment | `create_waitpoint`, `append_frame` return widen, `report_usage` return replace | v0.4.0 Stage 1b (RFC-012 Round-7) |
-| S-009 | RFC-012 | §R7.1 | PostgresBackend impl for `EngineBackend` | v0.8.0 Stage E (Postgres boot) |
-| S-010 | RFC-017 | §D1 → D2 | Stage D2 boot relocation into `ValkeyBackend::connect_with_metrics` + `Server::client` retirement | v0.8.0 Stage E2 (matrix `Server::client` retired) |
-| S-011 | RFC-017 | §E1-E4 | `BACKEND_STAGE_READY = ["valkey","postgres"]` flip + `FF_BACKEND=postgres` boots natively | v0.8.0 (2026-04-24) |
-| S-012 | RFC-019 | §Stage B | Valkey `subscribe_completion` / `subscribe_signal_delivery`; PG `subscribe_lease_history` / `subscribe_signal_delivery` | v0.9/v0.10 Stage B (#308-#311) |
-| S-013 | RFC-019 | §Stage C | HTTP SSE surface `GET /v1/streams/{family}/subscribe` | Stage C (ff-observability-http) |
-| S-014 | RFC-020 (cluster) | §3.1 | 13 Postgres Wave-9 methods (cancel_execution, change_priority, replay_execution, revoke_lease, read_execution_*, get_execution_result, list_pending_waitpoints, cancel_flow_header, ack_cancel_member, budget/quota admin) | v0.11.0 (2026-04-26) |
-| S-015 | RFC-020 | §3.3 | `rotate_waitpoint_hmac_secret_all` housekeeping parity-matrix flip | v0.11.0 release sweep |
-| S-016 | RFC-023 | Phase 2-4 | SQLite dev-only backend shipped whole-or-not | v0.12.0 (2026-04-28) |
-| S-017 | RFC-024 | §4.1-4.3 | `issue_reclaim_grant` + `reclaim_execution` + rename `claim_from_reclaim → claim_from_resume_grant` across all 3 backends | v0.12.0 (POSTGRES_PARITY_MATRIX RFC-024 section) |
-| S-018 | RFC-025 | all phases | Worker registry: `register_worker`, `heartbeat_worker`, `mark_worker_dead`, `list_expired_leases`, `list_workers` on all 3 backends | v0.14.0 (2026-05-03) |
-| S-019 | RFC-007 | §Designed for later | any-of dependencies (was D-034) | v0.6.x — `EdgeDependencyPolicy::any_of` in `crates/ff-core/src/contracts/mod.rs`; covered by S-003 |
-| S-020 | RFC-007 | §Designed for later | Quorum/threshold joins (was D-035) | v0.6.x — `EdgeDependencyPolicy::quorum(k, on_satisfied)`; covered by S-003 |
-| S-021 | RFC-012 | §R7.6.1 / Stage 1d | `suspend` trait migration — return-type widen (was D-078) | `async fn suspend(&self, handle, args: SuspendArgs) -> SuspendOutcome` in `crates/ff-core/src/engine_backend.rs:214`; `WaitpointSpec` is the final shape, no `ConditionMatcher` type remains |
-| S-022 | RFC-017 | §D12 | Postgres `tail_stream` impl (was D-085) | `crates/ff-backend-postgres/src/stream.rs:466` + `lib.rs:1325` (gated on `streaming` feature). No longer returns `Unavailable` |
-| S-023 | RFC-020 | §4.1 / §7.8 | Per-attempt-history `get_execution_result` on Postgres | v0.11.0 — present as Postgres trait override; default is `Unavailable`. **Partial:** trait signature still `(id)` only — per-attempt argument is the D-092 part (still open) |
-| S-024 | RFC-023 | §5.2 / §8 | Backend-agnostic SDK worker-loop (was D-093) | v0.16-unreleased — `FlowFabricWorker::claim_next_via_backend` + `WorkerRuntime` in `crates/ff-sdk/src/runtime/`; landed via #331 / #523 |
-| S-025 | RFC-023 | Note | `PartitionConfig::WorkerConfig` threading (was D-094) | v0.12 PR-6 — `WorkerConfig::partition_config: Option<PartitionConfig>` is honored by `FlowFabricWorker::connect` |
-| S-026 | POSTGRES_PARITY_MATRIX | v0.12 additive | PG + SQLite `claim_execution` with typed `ClaimExecutionArgs`/`ClaimExecutionResult` (was D-103) | Both backends implement the typed contract — see `crates/ff-backend-postgres/src/lib.rs:1719` and `crates/ff-backend-sqlite/src/backend.rs:2658` |
-| S-027 | RFC-001 | §V1 Scope | Retention policy on stream outputs (was D-004) | `StreamPolicy::retention_ttl_ms` shipped as the retention dial (`crates/ff-core/src/policy.rs`); backends honor it via retention scanner. Multi-dimensional per-outcome / per-tag / tiered retention was never asked for by any consumer. |
-| S-028 | RFC-010 | §9.2 | Completion pubsub (part of was-D-068 "pubsub for completion / frame push / flow state") | `ff:dag:completions` Valkey pubsub channel shipped — see `crates/ff-backend-valkey/src/completion.rs:COMPLETION_CHANNEL` and the 7 `PUBLISH ff:dag:completions` sites in `flowfabric.lua`. The broader "frame push" and "flow state" broadcast channels from D-068's original scope were not shipped; they were speculative and no consumer has requested them. |
-| S-029 | RFC-017 | §8 waitpoint HMAC | Raw waitpoint-token endpoint with stricter auth (was D-086) | Endpoint exists as `GET /v1/executions/{id}/waitpoints/{waitpoint_id}/token` (not the RFC's literal `/v1/waitpoints/{id}/token` shape). Operator-only; no-cache headers; returns raw HMAC token for approval/external-callback tooling. URL divergence is routing-simplicity (ExecutionId-partition-scoped) and does not change the security contract. See `get_waitpoint_token` in `crates/ff-server/src/api.rs:965`. |
-
-## Dropped / superseded
-
-| ID | Source | § | Original summary | Superseded by / reason dropped |
-|----|--------|---|------------------|--------------------------------|
-| X-001 | RFC-020 | §3.2 / §5 #5 | `subscribe_instance_tags` impl | Dropped permanently (both backends `n/a`); cairn's backfill served by `list_executions` + `ScannerFilter::with_instance_tag` (#311 audit 2026-04-24) |
-| X-002 | RFC-025 | §6 Non-goal #2 | "Worker discovery / listing live workers" was listed as a non-goal | Promoted into Phase 6 `list_workers` method (shipped v0.14.0) |
-| X-003 | RFC-009 (original) | §3 exec_id | Pluggable `SoloPartitioner` wrapper (originally deferred as over-scope) | Replaced by RFC-011 decisions; default `Crc16SoloPartitioner` ships, custom partitioner trait stable |
-| X-004 | RFC-022 | entire RFC | Full-parity production SQLite backend | Parked `[OPEN FOR FEEDBACK]`; RFC-023 dev-only supersedes the scope (§6.1 RFC-023) |
-
-## Permanent non-goals
-
-| Source | § | Summary |
-|--------|---|---------|
-| RFC-010 | §9.4 | Durable event sourcing (FF stores current state + audit; not a complete reconstructable event log) |
-| RFC-010 | §9.4 | Cross-shard (multi-slot) transactions on Valkey Cluster |
-| RFC-010 | §9.4 | Zero-downtime schema migration for structural changes (e.g. partition count) |
-| RFC-010 | §9.4 | Built-in observability backend (metrics/events exposed, no built-in dashboard/TSDB) |
-| RFC-010 | §9.4 | Namespace-based access control at engine level (gateway/control-plane responsibility) |
-| RFC-011 | §11 | Changing the wire shape of cairn's `BridgeEvent::*` variants |
-| RFC-011 | §11 | Online migration of existing executions for RFC-011 ExecutionId change |
-| RFC-011 | §11 | Hot-spot mitigation beyond partition-count bump + flow-size guidance |
-| RFC-011 | §11 | RFC-009 capability-routing interaction (orthogonal; sits above exec-partition) |
-| RFC-011 | §11 | Deleting `PartitionFamily::Execution` from the public API |
-| RFC-011 | §11 | Valkey Module API adoption (Modules are not an atomicity fix per §10.3-a) |
-| RFC-020 | §5 | Re-litigating the trait surface (locked by RFC-012/017/018) |
-| RFC-020 | §5 | Changing Valkey behavior (translate semantics, don't rewrite them) |
-| RFC-020 | §5 | Introducing new consumer-facing APIs or HTTP response shapes |
-| RFC-020 | §5 | Changing the capability-flag surface (only flip Supports flags) |
-| RFC-020 | §5 | `subscribe_instance_tags` impl on either backend |
-| RFC-020 | §5 | Wave 9 as a release gate for v0.10 (v0.10 already shipped) |
-| RFC-023 | §5 #1 | NOT production-scale SQLite (~10³ write-QPS ceiling, single-writer, single-process — inherent) |
-| RFC-023 | §5 #2 | NOT multi-writer SQLite (no WAL-over-NFS, no synchronized-filesystem setups) |
-| RFC-023 | §5 #3 | NOT clustered SQLite (no rqlite, no dqlite, no replication layer) |
-| RFC-023 | §5 #4 | NOT streaming-replica / HA (no Litestream-style continuous backup) |
-| RFC-023 | §5 #5 | NOT cross-process pub/sub (§4.2 in-process broadcast channel is permanent shape) |
-| RFC-023 | §5 #6 | NOT a replacement for Valkey or Postgres recommendations (default stays `FF_BACKEND=valkey`) |
-| RFC-023 | §5 #7 | NOT v2 expansion — no "dev-only SQLite today, production SQLite tomorrow" path |
-| RFC-023 | §5 #8 | NOT Wave-N+ SQLite-only perf/scale work |
-| RFC-025 | §6 #1 | Worker fencing at the SQL layer (handled at trait ingress + FCALL atomicity) |
-| RFC-025 | §6 #3 | Lease reclaim dispatch (FF doesn't auto-reclaim; caller decides via RFC-024) |
-| RFC-025 | §6 #4 | Cross-partition global worker identity (`worker_instance_id` unique within (namespace, partition) only) |
-| RFC-025 | §6 #5 | Worker-to-lane fencing at storage layer (scheduler admission handles it) |
-| RFC-025 | §6 #6 | Per-worker backpressure signals (no `current_in_flight_count` field) |
-| RFC-025 | §6 #7 | Worker restart-crash-loop detection (belongs in operator tooling, not trait) |
-| RFC-025 | §6 #8 | Cross-worker leader election (consumer-layer; orthogonal) |
-| RFC-024 | §5 #1 | NOT a change to `ff_issue_claim_grant` semantics |
-| RFC-024 | §5 #2 | NOT a change to `ff_claim_resumed_execution` semantics |
-| RFC-024 | §5 #3 | NOT a new Lua FCALL (reuse `ff_reclaim_execution` with one additional ARGV) |
-| RFC-024 | §5 #5 | NOT a merger of resume and reclaim trait methods |
-
-## Cross-cutting themes
-
-- **Capability-routing v2 tail (RFC-009).** 9 deferrals (D-050..D-058) all waiting on an authoritative cap store + attestation; V2 target named but no release tag.
-- **Signal machinery extensions (RFC-005).** 5 deferrals (D-018..D-022) — signal TTLs, bulk delivery, routing to flow coordinator, payload validation, replay-after-policy-change. None have shipped; no concrete target.
-- **Stream transport hardening (RFC-006).** 7 deferrals (D-023..D-031) concentrated in cross-consumer coordination (consumer groups), server-side filters, SSE, sentinel XADDs, and tail-client pool.
-- **Budget / quota feature tail (RFC-008).** 9 deferrals (D-040..D-048) — enforcement actions, per-provider quotas, fixed-window rate limits, priority-aware reservation, cascade overrides. All gated on concrete consumer need.
-- **Dependency-graph richness (RFC-007).** 3 deferrals remain (D-036..D-039 after D-034/D-035 flipped to shipped) — richer multi-edge semantics, multi-flow membership, graph reconciliation on replay. Gated on future product requirements.
-- **Postgres parity tail (POSTGRES_PARITY_MATRIX / RFC-020).** 4 deferrals (D-090, D-091, D-092, D-104) — sharded-counter tables, per-attempt history argument, dedicated `delay_until_ms` column. Mostly additive migrations.
-- **SQLite parity gaps (POSTGRES_PARITY_MATRIX).** 3 deferrals (D-101, D-102, D-106) — projection/retention scanners and foundation-scanner ops (`mark_lease_expired_if_due`/`promote_delayed`/`close_waitpoint`/`expire_execution`/`expire_suspension`); all are `Unavailable` on SQLite today while PG has them.
-- **Event-model unification (RFC-010).** 4 deferrals (D-068..D-070, plus UC-55 per-execution event stream) — all converging on "one consolidated lifecycle stream" that would replace the 4-source reconstruction story.
-- **Scheduler architecture (RFC-009, RFC-010).** 6 deferrals (D-049, D-059..D-065, D-073) on fairness, aging, pool abstraction, preemptive rerouting, cross-region, extraction to separate process. Bundled as "v2 scheduler" theme.
-- **Attempt lineage features (RFC-002).** 5 deferrals (D-008..D-012) — compaction, metrics, diff views, access control, archival. All marked "designed-for" in v1; status-unverifiable.
-- **Reclaim-scanner absence (RFC-009, RFC-024).** D-058 and D-096 both track the same gap (no production scheduler-side reclaim scanner); RFC-024 is consumer-initiated only, `flowfabric.lua:3865` TODO remains open.
-
-## Reconciliation notes (2026-05-09 one-by-one pass)
-
-Each "Still deferred" row verified via targeted grep against `main`
-@ `25ac0c5`. Seven rows moved to "Shipped":
-
-- **D-034, D-035** (any-of / quorum) — double-counted with S-003. The
-  original RFC-007 §Designed-for-later list listed these separately
-  from the RFC-016 Stage B work that ultimately shipped them. Verified
-  in `crates/ff-core/src/contracts/mod.rs`: `EdgeDependencyPolicy::any_of`
-  + `EdgeDependencyPolicy::quorum(k, on_satisfied)`.
-- **D-078** (suspend trait migration) — `async fn suspend(&self, handle,
-  args: SuspendArgs) -> Result<SuspendOutcome, EngineError>` is the
-  current trait shape in `engine_backend.rs:214`. `WaitpointSpec` is the
-  final input type; `ConditionMatcher` remains only as a comment
-  reference. Stage 1d complete.
-- **D-085** (Postgres `tail_stream`) — real implementation at
-  `crates/ff-backend-postgres/src/stream.rs:466` + `lib.rs:1325`; gated
-  on `streaming` feature.
-- **D-093** (backend-agnostic SDK worker-loop) — `claim_next_via_backend`
-  + the `WorkerRuntime` handler-DI runtime landed in #331/#523
-  (v0.16-unreleased in `[Unreleased]`).
-- **D-094** (PartitionConfig via WorkerConfig) — already present in
-  `crates/ff-sdk/src/worker.rs` (v0.12 PR-6 comment confirms).
-- **D-103** (PG + SQLite trait-level grant-consumer parity for
-  `claim_execution`) — both backends have a typed `ClaimExecutionArgs /
-  ClaimExecutionResult` impl.
-
-Partial credit: **D-092** (per-attempt-history `get_execution_result`)
-is S-023 — Postgres override shipped, but the *per-attempt argument*
-part is still open on the trait signature. Remains in "Still deferred"
-accordingly.
-
-S-019 (the original "RFC-021 draft on file" entry) was **incorrect** —
-RFC-021 exists only on an unmerged local branch (`rfcs/021-cron-draft`
-@ 53a653b) and is not reachable from `main` nor in the archive. The
-row now tracks D-034 instead; RFC-021 is neither shipped nor on file
-in any published sense, and D-001 (recurring scheduled execution)
-remains correctly deferred.
-
-Reconciliation does not catch items that shipped as a side-effect but
-were never linked back to the original RFC. If you spot one, add it to
-the shipped table with a note and bump the summary counts.
-
-## Round 2 reconciliation (2026-05-10)
-
-Full deep walk of every remaining D-row. Loaded RFCs 001-002-003-004-005-007-008-009-010-011-012 (in-tree + archive) into context and for each item:
-
-1. Read the originating RFC §.
-2. Greped broadly for intent-equivalent code (not just the exact symbol name) across all crates.
-3. Verified absence or shipped-in-different-shape.
-
-**Three rows moved to Shipped:**
-
-- **D-004 → S-027** advanced retention policies. `StreamPolicy::retention_ttl_ms` ships as the retention knob. The RFC's speculative "advanced" (per-outcome / per-tag / tiered) isn't there, but also was never requested by a real consumer. Declaring intent-satisfied.
-- **D-068 → S-028** completion pubsub. `ff:dag:completions` Valkey pubsub channel ships and is the backbone of the CompletionListener scanner + `subscribe_completion`. The frame-push and flow-state broadcast channels RFC-010 §9.2 grouped with this were speculative — not shipped, not asked for, not tracked separately.
-- **D-086 → S-029** raw waitpoint-token endpoint. Shipped at `/v1/executions/{id}/waitpoints/{waitpoint_id}/token` rather than the RFC's `/v1/waitpoints/{id}/token`. Same security contract (operator-only bearer auth + no-cache headers), different URL shape.
-
-**One row annotated as partial:**
-
-- **D-017** synthetic timeout signal on auto-resume. Postgres reconciler at `crates/ff-backend-postgres/src/reconcilers/suspension_timeout.rs:172` injects `{signal_name: "timeout"}` into `member_map[__timeout__]` and clears `timeout_at_ms`. Valkey `flowfabric.lua:5272` treats `auto_resume` and `auto_resume_with_timeout_signal` identically (no injection). Asymmetry kept in the Still deferred table with a **PARTIAL (pg-only)** marker.
-
-**Discovered documentation errors (surfaced but not changed):**
-
-- X-001 (Dropped/superseded) says `subscribe_instance_tags` was "dropped permanently." Actual code comments in `crates/ff-backend-valkey/src/lib.rs`, `crates/ff-backend-sqlite/src/backend.rs`, `crates/ff-backend-postgres/src/lib.rs` all say "deferred on all backends per #311" — not dropped. By user decision (no real consumer demand), row remains as Dropped in the table.
-
-**All other 95 remaining D-rows manually verified as genuinely absent.** Patterns searched beyond the RFC's original symbol names: renamed symbols, cross-crate diffusion, and semantic equivalents. No further matches found.
-
-The 96 still-deferred items fall into the same clusters the themes section already names. The round-2 walk confirms the themes are an accurate summary, not a projection.
