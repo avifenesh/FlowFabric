@@ -37,6 +37,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   inner dev loop where the change isn't pushed yet. Production
   deployments leave the env unset — the version-guard prevents
   accidental reloads under concurrent deploys.
+- **CI release gate: published-artifact smoke as pre-release blocker (#522).**
+  `.github/workflows/release.yml` now runs a `published_smoke` job between
+  `publish` and the GitHub Release creation step. Waits 60 s for crates.io
+  index propagation then invokes `scripts/published-smoke.sh "${TAG_NAME#v}"`
+  (scratch consumer build, both `valkey`-default and
+  `--no-default-features --features=postgres` variants). The release job
+  depends on both `publish` and `published_smoke`; a failed smoke blocks
+  the announcement without rolling back the publish. See
+  `docs/RELEASING.md` §5 for operator notes.
 
 ## [0.15.0] - 2026-05-03
 

@@ -108,6 +108,9 @@ Sixteen end-to-end examples live under [`examples/`](examples/):
 - **[`coding-agent`](examples/coding-agent/)** -- LLM-powered code-patch worker with streaming output and human-in-the-loop suspend/signal review. Requires `OPENROUTER_API_KEY`.
 - **[`media-pipeline`](examples/media-pipeline/)** -- three-stage audio pipeline (transcribe → summarize → embed) exercising capability routing, stream tail with terminal markers, and HMAC-signed waitpoint signals. Requires `OPENROUTER_API_KEY` + local whisper.cpp.
 - **[`retry-and-cancel`](examples/retry-and-cancel/)** -- minimal control-plane demo of retry-exhaustion terminal failure + `cancel_flow` cascade. No external dependencies beyond the running server.
+- **[`deploy-approval`](examples/deploy-approval/)** -- CI/CD pipeline demo: fans out unit/integration/e2e tests in parallel (capability routing), gates a canary rollout on two distinct human approvals (`Count{n:2, DistinctSources}`), streams build logs as JSON Merge Patch frames (`DurableSummary`), and cascades `cancel_flow` on verify failure. Proved live 2026-04-24. Requires Valkey + `ff-server`.
+- **[`token-budget`](examples/token-budget/)** -- v0.9 UC-37 + UC-39 demo: a batch-inference runner dispatches five LLM prompts as child executions under a shared per-flow token budget, reports usage in real time via `report_usage`, and cancels with `cancel_pending` on hard-limit breach. Proved live 2026-04-24. Requires Valkey + `ff-server`.
+- **[`grafana`](examples/grafana/)** -- Grafana operator dashboard (`flowfabric-ops.json`) with ten panels covering claim-grant latency, lease renewals, admission-control hits, scanner cycle timing, and HTTP status rates. Load into Grafana and point at your Prometheus scrape of `ff-server`.
 
 Quick start with the coding agent:
 
