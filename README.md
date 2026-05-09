@@ -268,19 +268,15 @@ for the full env-var reference.
 
 ## Contributing
 
-The repo does not yet ship a `CONTRIBUTING.md`. For now:
-
-- Bugs, proposals, and questions → open an issue on
-  [avifenesh/FlowFabric](https://github.com/avifenesh/FlowFabric/issues).
-- Design discussions for non-trivial changes → check
-  `avifenesh/flowfabric-archive` (private) for accepted RFCs before
-  drafting new ones; active drafts live under [`rfcs/`](rfcs/).
-- See [`CLAUDE.md`](CLAUDE.md) for the contributor-facing working
-  style (surgical changes, simplicity first, release-gate
-  requirements).
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — issue-first policy, local
+  dev loop, commit style, PR expectations, CI gates.
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant
+  v2.1.
+- [`SECURITY.md`](SECURITY.md) — vulnerability disclosure.
+- [`CLAUDE.md`](CLAUDE.md) — working style (surgical changes,
+  simplicity-first, release-gate contract).
 
 ## License
 
-Apache-2.0. See the `license` field in [`Cargo.toml`](Cargo.toml) and
-each crate's `Cargo.toml`. The full license text is at
-<https://www.apache.org/licenses/LICENSE-2.0>.
+Licensed under the Apache License, Version 2.0. See
+[`LICENSE`](LICENSE) for the full text.
