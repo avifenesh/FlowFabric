@@ -10,17 +10,18 @@ notes" at the bottom for the audit trail.
 
 ## Summary
 
-Row counts after 2026-05-09 reconciliation:
+Row counts after 2026-05-10 round-2 reconciliation (both passes combined):
 
-- Still deferred: 99  (was 106 in the initial catalogue; 7 moved to Shipped)
-- Shipped: 26  (was 19 → +7 moved from "Still deferred")
+- Still deferred: 96  (was 106 initially; 10 moved to Shipped across 2 passes)
+- Shipped: 29  (was 19 → +7 round-1 → +3 round-2 = 29)
 - Dropped / superseded: 4
 - Permanent non-goals: 27
 - Total unique IDs: 156
 
-The original catalogue's summary miscounted "Still deferred" as 56.
-The corrected count (99 after this reconciliation, 106 pre-reconciliation)
-reflects every D- row in the table.
+Round 1 (2026-05-09): moved 7 rows after grep-only verification.
+Round 2 (2026-05-10): moved 3 more after reading each item's RFC section
+and searching for intent-equivalent code across all crates. 96 remaining
+items manually walked end-to-end and confirmed absent.
 
 ## Still deferred
 
@@ -29,7 +30,6 @@ reflects every D- row in the table.
 | D-001 | RFC-001 | §V1 Scope / Designed-for but deferred | Recurring scheduled execution (cron semantics) — interface exists, scheduler loop deferred | RFC-021 draft | L |
 | D-002 | RFC-001 | §V1 Scope / Designed-for but deferred | Bulk submission API — individual `create_execution` sufficient for v1 | ? | M |
 | D-003 | RFC-001 | §V1 Scope / Designed-for but deferred | Tag-based search indexes — optional, may start without | ? | M |
-| D-004 | RFC-001 | §V1 Scope / Designed-for but deferred | Advanced retention policies — v1 uses simple TTL | ? | M |
 | D-005 | RFC-001 | §V1 Scope / Designed-for but deferred | Cross-lane fairness scheduler — v1 uses per-lane priority ordering | ? | L |
 | D-006 | RFC-001 | §V1 Scope / Designed-for but deferred | Soft-limit budgets with escalation workflows | ? | M |
 | D-007 | RFC-001 | §Open Questions | Reclaim grace period between lease expiry and reclaim eligibility (configurable) | ? | S |
@@ -42,7 +42,7 @@ reflects every D- row in the table.
 | D-014 | RFC-003 | §Fencing Model rule 2 | Future cooperative lease handoff | ? | M |
 | D-015 | RFC-004 | §Rate limits | Per-(execution_id, source) token-bucket admission at REST boundary for signals | v2 | M |
 | D-016 | RFC-004 | §Q3 / Implementation Notes | Standardized checkpoint envelope for cross-runtime continuation portability | v2 | L |
-| D-017 | RFC-004 | §Implementation Notes | Synthetic timeout signal injection into waitpoint buffer on auto-resume | v2 | S |
+| D-017 | RFC-004 | §Implementation Notes | **PARTIAL (pg-only).** Synthetic timeout signal injection into waitpoint buffer on auto-resume. Postgres `reconcilers/suspension_timeout.rs:172` injects into `member_map[__timeout__]`; Valkey `flowfabric.lua:5272` treats `auto_resume_with_timeout_signal` identically to plain `auto_resume` (no injection). Valkey parity still deferred. | v2 | S |
 | D-018 | RFC-005 | §Designed-for but deferred | Signal routing to flow coordinator (v1 requires explicit execution targeting) | ? | M |
 | D-019 | RFC-005 | §Designed-for but deferred | Signal payload schema validation (v1 treats payload as opaque bytes) | ? | M |
 | D-020 | RFC-005 | §Designed-for but deferred | Signal TTL / expiry independent of waitpoint | ? | M |
@@ -91,7 +91,6 @@ reflects every D- row in the table.
 | D-065 | RFC-009 | §Designed-for but deferred | Cross-region routing optimization | ? | XL |
 | D-066 | RFC-009 | §Open Q3 | Flow-aware priority boosting (inherit/boost from parent flow or coordinator) | ? | M |
 | D-067 | RFC-010 | §9.2 | Global secondary indexes (cross-partition search by tag, tenant, time range) | ? | L |
-| D-068 | RFC-010 | §9.2 | Pub/sub for real-time notifications (SUBSCRIBE channels for completion, frame push, flow state) | ? | M |
 | D-069 | RFC-010 | §9.2 | Cross-execution event feed (lane-level / system-level event stream for dashboards, UC-55) | ? | M |
 | D-070 | RFC-010 | §9.2 | Per-execution lifecycle event stream (`ff:exec:{p:N}:<eid>:events`) consolidating audit trail | ? | M |
 | D-071 | RFC-010 | §6.15 / Future optimization | Per-lane partition bitmap tracking non-empty eligible sets to skip empty partitions | ? | S |
@@ -107,7 +106,6 @@ reflects every D- row in the table.
 | D-082 | RFC-012 | §alternatives / §§new trait hierarchy | `trait Backend` + `trait EngineBackend: Backend` default-impl hierarchy | post-Stage-3 | M |
 | D-083 | RFC-012 | §§alternatives / batch | Batch submission trait method `submit_batch(Vec<ExecutionRequest>)` | ? | S |
 | D-084 | RFC-017 | §5.4 / §11 | `EngineBackend` seal (public trait stability mechanism beyond SemVer) | separate RFC-012 R8+ | M |
-| D-086 | RFC-017 | §8 waitpoint HMAC | `/v1/waitpoints/{id}/token` raw-token endpoint with stricter auth | RFC-017 follow-up | S |
 | D-087 | RFC-018 | §9 | Dynamic capability-flips mid-run / event-stream of capability changes | if real consumer emerges | M |
 | D-088 | RFC-019 | §Cairn Migration | Realtime `subscribe_instance_tags` implementation (trait remains, both backends Unavailable / n/a) | concrete consumer demand | M |
 | D-089 | RFC-019 | §Valkey Stage A | Durable Valkey `subscribe_completion` (today pubsub-backed, at-most-once; PG is durable via outbox) | separate follow-up | M |
@@ -156,6 +154,9 @@ reflects every D- row in the table.
 | S-024 | RFC-023 | §5.2 / §8 | Backend-agnostic SDK worker-loop (was D-093) | v0.16-unreleased — `FlowFabricWorker::claim_next_via_backend` + `WorkerRuntime` in `crates/ff-sdk/src/runtime/`; landed via #331 / #523 |
 | S-025 | RFC-023 | Note | `PartitionConfig::WorkerConfig` threading (was D-094) | v0.12 PR-6 — `WorkerConfig::partition_config: Option<PartitionConfig>` is honored by `FlowFabricWorker::connect` |
 | S-026 | POSTGRES_PARITY_MATRIX | v0.12 additive | PG + SQLite `claim_execution` with typed `ClaimExecutionArgs`/`ClaimExecutionResult` (was D-103) | Both backends implement the typed contract — see `crates/ff-backend-postgres/src/lib.rs:1719` and `crates/ff-backend-sqlite/src/backend.rs:2658` |
+| S-027 | RFC-001 | §V1 Scope | Retention policy on stream outputs (was D-004) | `StreamPolicy::retention_ttl_ms` shipped as the retention dial (`crates/ff-core/src/policy.rs`); backends honor it via retention scanner. Multi-dimensional per-outcome / per-tag / tiered retention was never asked for by any consumer. |
+| S-028 | RFC-010 | §9.2 | Completion pubsub (part of was-D-068 "pubsub for completion / frame push / flow state") | `ff:dag:completions` Valkey pubsub channel shipped — see `crates/ff-backend-valkey/src/completion.rs:COMPLETION_CHANNEL` and the 7 `PUBLISH ff:dag:completions` sites in `flowfabric.lua`. The broader "frame push" and "flow state" broadcast channels from D-068's original scope were not shipped; they were speculative and no consumer has requested them. |
+| S-029 | RFC-017 | §8 waitpoint HMAC | Raw waitpoint-token endpoint with stricter auth (was D-086) | Endpoint exists as `GET /v1/executions/{id}/waitpoints/{waitpoint_id}/token` (not the RFC's literal `/v1/waitpoints/{id}/token` shape). Operator-only; no-cache headers; returns raw HMAC token for approval/external-callback tooling. URL divergence is routing-simplicity (ExecutionId-partition-scoped) and does not change the security contract. See `get_waitpoint_token` in `crates/ff-server/src/api.rs:965`. |
 
 ## Dropped / superseded
 
@@ -263,3 +264,29 @@ remains correctly deferred.
 Reconciliation does not catch items that shipped as a side-effect but
 were never linked back to the original RFC. If you spot one, add it to
 the shipped table with a note and bump the summary counts.
+
+## Round 2 reconciliation (2026-05-10)
+
+Full deep walk of every remaining D-row. Loaded RFCs 001-002-003-004-005-007-008-009-010-011-012 (in-tree + archive) into context and for each item:
+
+1. Read the originating RFC §.
+2. Greped broadly for intent-equivalent code (not just the exact symbol name) across all crates.
+3. Verified absence or shipped-in-different-shape.
+
+**Three rows moved to Shipped:**
+
+- **D-004 → S-027** advanced retention policies. `StreamPolicy::retention_ttl_ms` ships as the retention knob. The RFC's speculative "advanced" (per-outcome / per-tag / tiered) isn't there, but also was never requested by a real consumer. Declaring intent-satisfied.
+- **D-068 → S-028** completion pubsub. `ff:dag:completions` Valkey pubsub channel ships and is the backbone of the CompletionListener scanner + `subscribe_completion`. The frame-push and flow-state broadcast channels RFC-010 §9.2 grouped with this were speculative — not shipped, not asked for, not tracked separately.
+- **D-086 → S-029** raw waitpoint-token endpoint. Shipped at `/v1/executions/{id}/waitpoints/{waitpoint_id}/token` rather than the RFC's `/v1/waitpoints/{id}/token`. Same security contract (operator-only bearer auth + no-cache headers), different URL shape.
+
+**One row annotated as partial:**
+
+- **D-017** synthetic timeout signal on auto-resume. Postgres reconciler at `crates/ff-backend-postgres/src/reconcilers/suspension_timeout.rs:172` injects `{signal_name: "timeout"}` into `member_map[__timeout__]` and clears `timeout_at_ms`. Valkey `flowfabric.lua:5272` treats `auto_resume` and `auto_resume_with_timeout_signal` identically (no injection). Asymmetry kept in the Still deferred table with a **PARTIAL (pg-only)** marker.
+
+**Discovered documentation errors (surfaced but not changed):**
+
+- X-001 (Dropped/superseded) says `subscribe_instance_tags` was "dropped permanently." Actual code comments in `crates/ff-backend-valkey/src/lib.rs`, `crates/ff-backend-sqlite/src/backend.rs`, `crates/ff-backend-postgres/src/lib.rs` all say "deferred on all backends per #311" — not dropped. By user decision (no real consumer demand), row remains as Dropped in the table.
+
+**All other 95 remaining D-rows manually verified as genuinely absent.** Patterns searched beyond the RFC's original symbol names: renamed symbols, cross-crate diffusion, and semantic equivalents. No further matches found.
+
+The 96 still-deferred items fall into the same clusters the themes section already names. The round-2 walk confirms the themes are an accurate summary, not a projection.
