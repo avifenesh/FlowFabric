@@ -15,12 +15,15 @@
 mod builder;
 mod client;
 mod error;
+mod inspect;
 mod submit;
 
 pub use ff_core::backend::{BackendConfig, BackendConnection, BackendTag};
+pub use ff_core::contracts::ExecutionSnapshot;
 pub use ff_core::types::{ExecutionId, LaneId, Namespace};
 
 pub use builder::ClientBuilder;
 pub use client::Client;
 pub use error::{ClientError, Result};
+pub use inspect::{AttemptSummary, LeaseSummary, PublicState};
 pub use submit::{SubmitRequest, SubmitResult};
