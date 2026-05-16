@@ -18,15 +18,17 @@ mod client;
 mod error;
 mod inspect;
 mod read_context;
+mod signal;
 mod submit;
 
 pub use ff_core::backend::{BackendConfig, BackendConnection, BackendTag};
 pub use ff_core::contracts::{ExecutionContext, ExecutionSnapshot};
-pub use ff_core::types::{ExecutionId, LaneId, Namespace};
+pub use ff_core::types::{ExecutionId, LaneId, Namespace, SignalId, WaitpointId, WaitpointToken};
 
 pub use builder::ClientBuilder;
 pub use cancel::CancelResult;
 pub use client::Client;
 pub use error::{ClientError, Result};
 pub use inspect::{AttemptSummary, LeaseSummary, PublicState};
+pub use signal::{SignalRequest, SignalResult};
 pub use submit::{SubmitRequest, SubmitResult};
