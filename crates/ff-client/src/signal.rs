@@ -1,6 +1,8 @@
 use ff_core::contracts::DeliverSignalArgs;
 use ff_core::engine_backend::EngineBackend;
-use ff_core::types::{ExecutionId, SignalId, TimestampMs, WaitpointId, WaitpointToken};
+use ff_core::types::{ExecutionId, TimestampMs, WaitpointId, WaitpointToken};
+
+pub use ff_core::types::SignalId;
 
 pub use ff_core::contracts::DeliverSignalResult as SignalResult;
 
@@ -121,7 +123,7 @@ impl Client {
         let args = DeliverSignalArgs {
             execution_id: req.execution_id,
             waitpoint_id: req.waitpoint_id,
-            signal_id: req.signal_id.unwrap_or_else(SignalId::new),
+            signal_id: req.signal_id.unwrap_or_default(),
             signal_name: req.signal_name,
             signal_category: req.signal_category,
             source_type: req.source_type,
