@@ -13,6 +13,7 @@
 //! (e.g. valkey-glide) directly; this crate is for FlowFabric operations.
 
 mod builder;
+mod cancel;
 mod client;
 mod error;
 mod inspect;
@@ -23,6 +24,7 @@ pub use ff_core::contracts::ExecutionSnapshot;
 pub use ff_core::types::{ExecutionId, LaneId, Namespace};
 
 pub use builder::ClientBuilder;
+pub use cancel::CancelResult;
 pub use client::Client;
 pub use error::{ClientError, Result};
 pub use inspect::{AttemptSummary, LeaseSummary, PublicState};
