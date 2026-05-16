@@ -1,0 +1,18 @@
+[package]
+name = "ff-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "FlowFabric client SDK — submit, inspect, and signal workflows from non-worker Rust code (admin tools, FFI bindings, CLIs)."
+
+[dependencies]
+ff-core = { workspace = true }
+ferriskey = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

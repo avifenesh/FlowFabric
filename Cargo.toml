@@ -17,6 +17,7 @@ members = [
     "crates/ff-observability",
     "crates/ff-observability-http",
     "crates/flowfabric",
+    "crates/ff-client",
     "tools/publish-list-lint",
     "tools/non-exhaustive-lint",
 ]
@@ -51,6 +52,7 @@ ff-backend-postgres = { version = "0.15.0", path = "crates/ff-backend-postgres" 
 ff-backend-sqlite = { version = "0.15.0", path = "crates/ff-backend-sqlite" }
 ff-observability = { version = "0.15.0", path = "crates/ff-observability" }
 ff-observability-http = { version = "0.15.0", path = "crates/ff-observability-http" }
+ff-client = { version = "0.15.0", path = "crates/ff-client" }
 ferriskey = { version = "0.15.0", path = "ferriskey" }
 # Umbrella crate re-exporting the ff-* family (issue #279). Declared
 # at workspace scope so internal doc examples / dev-deps can name it

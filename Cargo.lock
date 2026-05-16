@@ -1048,6 +1048,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-client"
+version = "0.15.0"
+dependencies = [
+ "ferriskey",
+ "ff-core",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ff-core"
 version = "0.15.0"
 dependencies = [
