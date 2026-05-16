@@ -361,6 +361,16 @@ impl ValkeyBackend {
         &self.client
     }
 
+    /// The partition layout this backend was constructed with — either
+    /// loaded from `ff:config:partitions` at [`Self::connect`] time or
+    /// supplied directly via [`Self::from_client_and_partitions`].
+    /// Consumers building [`crate::contracts::CreateExecutionArgs`]
+    /// (e.g. ff-client) need this to mint partition-correct
+    /// [`ExecutionId`](ff_core::types::ExecutionId)s.
+    pub fn partition_config(&self) -> &PartitionConfig {
+        &self.partition_config
+    }
+
     /// Wrap an already-dialed `ferriskey::Client` + known
     /// `PartitionConfig` into a `ValkeyBackend`. Used by ff-sdk's
     /// legacy `FlowFabricWorker::connect` path (RFC-012 Stage 1b) to
@@ -2175,7 +2185,14 @@ async fn list_executions_impl(
 /// ff-server's published `num_flow_partitions` / budget / quota
 /// counts. Mirrors the ff-sdk `worker::read_partition_config` helper
 /// (Stage 1c will deduplicate once the hot-path migration lands).
-async fn load_partition_config(client: &ferriskey::Client) -> Result<PartitionConfig, EngineError> {
+///
+/// `pub` so external client crates (e.g. ff-client) that dial their
+/// own [`ferriskey::Client`] and then synthesise a backend via
+/// [`ValkeyBackend::from_client_and_partitions`] can reuse the same
+/// load path rather than duplicating the wire knowledge.
+pub async fn load_partition_config(
+    client: &ferriskey::Client,
+) -> Result<PartitionConfig, EngineError> {
     let key = ff_core::keys::global_config_partitions();
     let fields: HashMap<String, String> = client
         .hgetall(&key)
