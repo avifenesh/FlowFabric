@@ -25,3 +25,8 @@ ferriskey = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Only used by examples/gen_cross_lang_corpus.rs to emit JSON the
+# Python tests read back. Not part of the runtime surface.
+serde_json = { workspace = true }
