@@ -15,10 +15,12 @@
 mod builder;
 mod client;
 mod error;
+mod submit;
 
 pub use ff_core::backend::{BackendConfig, BackendConnection, BackendTag};
-pub use ff_core::types::Namespace;
+pub use ff_core::types::{ExecutionId, LaneId, Namespace};
 
 pub use builder::ClientBuilder;
 pub use client::Client;
 pub use error::{ClientError, Result};
+pub use submit::{SubmitRequest, SubmitResult};

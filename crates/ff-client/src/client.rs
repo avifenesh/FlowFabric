@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use ff_backend_valkey::ValkeyBackend;
 use ff_core::backend::{BackendConfig, BackendTag};
+use ff_core::partition::PartitionConfig;
 use ff_core::types::Namespace;
 
 use crate::builder::ClientBuilder;
@@ -8,10 +10,7 @@ use crate::builder::ClientBuilder;
 /// Internal backend dispatch. Variants are added as backend impls land.
 /// Kept private — consumers see only the public [`Client`] surface.
 pub(crate) enum BackendImpl {
-    // Held but currently unread — the first FF operation that touches
-    // the wire will consume it. `build()` still establishes the
-    // connection so a failed transport surfaces at construction.
-    Valkey(#[allow(dead_code)] Arc<ferriskey::Client>),
+    Valkey(Arc<ValkeyBackend>),
     // Postgres(...) — future
     // Sqlite(...) — future
 }
@@ -26,7 +25,7 @@ pub(crate) enum BackendImpl {
 /// verb like `ping`.
 pub struct Client {
     namespace: Namespace,
-    backend: BackendImpl,
+    pub(crate) backend: BackendImpl,
     config: BackendConfig,
 }
 
@@ -55,5 +54,16 @@ impl Client {
 
     pub fn config(&self) -> &BackendConfig {
         &self.config
+    }
+
+    /// The partition layout the backend was constructed with — loaded
+    /// from `ff:config:partitions` on Valkey at connect time (or the
+    /// 256/32/32 default if that key wasn't published yet). Callers
+    /// minting their own [`ExecutionId`](ff_core::types::ExecutionId)s
+    /// for batch submits should read this rather than guessing.
+    pub fn partition_config(&self) -> &PartitionConfig {
+        match &self.backend {
+            BackendImpl::Valkey(b) => b.partition_config(),
+        }
     }
 }

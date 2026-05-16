@@ -12,6 +12,8 @@ description = "FlowFabric client SDK — submit, inspect, and signal workflows f
 
 [dependencies]
 ff-core = { workspace = true }
+ff-backend-valkey = { workspace = true }
+ff-script = { workspace = true, features = ["valkey-client"] }
 ferriskey = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

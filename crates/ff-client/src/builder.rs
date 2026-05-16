@@ -1,6 +1,6 @@
-use std::sync::Arc;
-
+use ff_backend_valkey::{ValkeyBackend, load_partition_config};
 use ff_core::backend::{BackendConfig, BackendConnection, ValkeyConnection};
+use ff_core::partition::PartitionConfig;
 use ff_core::types::Namespace;
 
 use crate::client::{BackendImpl, Client};
@@ -39,7 +39,31 @@ impl ClientBuilder {
             BackendConnection::Valkey(v) => {
                 let url = valkey_url(v);
                 let fk = ferriskey::Client::connect(&url).await?;
-                BackendImpl::Valkey(Arc::new(fk))
+                // Ensure the FlowFabric Lua library is registered on
+                // the target Valkey. Idempotent: no-op when the
+                // current version is already loaded. Without this,
+                // every FCALL-backed op (create_execution, claim, …)
+                // fails with "Function not found" on a Valkey that
+                // ff-server hasn't bootstrapped yet.
+                ff_script::loader::ensure_library(&fk)
+                    .await
+                    .map_err(ClientError::script_load)?;
+                // Mirror ValkeyBackend::connect's warn-and-default
+                // fallback when the deployment hasn't published
+                // ff:config:partitions yet (e.g. local Valkey dev
+                // node, SDK-only tests). Surfacing the missing-key
+                // case as Ok-with-default here matches the backend's
+                // own behaviour and keeps client construction usable
+                // against bare Valkey instances.
+                let partition_config = load_partition_config(&fk).await.unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "ff:config:partitions not found, using PartitionConfig::default()"
+                    );
+                    PartitionConfig::default()
+                });
+                let backend = ValkeyBackend::from_client_and_partitions(fk, partition_config);
+                BackendImpl::Valkey(backend)
             }
             BackendConnection::Postgres(_) => {
                 return Err(ClientError::backend_not_yet_supported("postgres"));
