@@ -17,10 +17,11 @@ mod cancel;
 mod client;
 mod error;
 mod inspect;
+mod read_context;
 mod submit;
 
 pub use ff_core::backend::{BackendConfig, BackendConnection, BackendTag};
-pub use ff_core::contracts::ExecutionSnapshot;
+pub use ff_core::contracts::{ExecutionContext, ExecutionSnapshot};
 pub use ff_core::types::{ExecutionId, LaneId, Namespace};
 
 pub use builder::ClientBuilder;
