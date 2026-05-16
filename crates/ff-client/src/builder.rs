@@ -56,6 +56,11 @@ impl ClientBuilder {
 }
 
 fn valkey_url(v: &ValkeyConnection) -> String {
-    let scheme = if v.tls { "valkeys" } else { "valkey" };
+    // ferriskey's string-URL parser only accepts `redis` / `rediss`
+    // schemes (the lower-level `url::Url::into_connection_info` impl
+    // also accepts `valkey` / `valkeys`, but the string entry point
+    // filters them out first). Use the redis schemes here so
+    // `ferriskey::Client::connect(&url)` actually parses.
+    let scheme = if v.tls { "rediss" } else { "redis" };
     format!("{scheme}://{}:{}", v.host, v.port)
 }
