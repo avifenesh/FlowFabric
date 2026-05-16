@@ -9,6 +9,13 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "FlowFabric client SDK — submit, inspect, and signal workflows from non-worker Rust code (admin tools, FFI bindings, CLIs)."
+# v0 / foundation: surface is still maturing (submit, inspect,
+# result, cancel, read_context shipped; no list/signal yet). Keep
+# off crates.io until the API stabilises. Flip to publishable AND
+# add to the release.yml / release.toml / RELEASING.md /
+# matrix.yml feature-propagation sources of truth (the
+# publish-list-lint CI gate enforces this in lockstep).
+publish = false
 
 [dependencies]
 ff-core = { workspace = true }
