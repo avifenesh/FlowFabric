@@ -1052,7 +1052,9 @@ name = "ff-client"
 version = "0.15.0"
 dependencies = [
  "ferriskey",
+ "ff-backend-valkey",
  "ff-core",
+ "ff-script",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
