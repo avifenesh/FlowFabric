@@ -30,7 +30,7 @@ path = "src/scenario3.rs"
 # Brings in ff-sdk / reqwest as a transitive cost that doesn't touch
 # the measured workload — the Faktory hot path is faktory-crate-only.
 ff-bench = { path = "../../harness" }
-faktory = { version = "0.13", default-features = false, features = ["rustls"] }
+faktory = { version = "0.13", default-features = false }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
