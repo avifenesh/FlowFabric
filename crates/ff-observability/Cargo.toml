@@ -44,9 +44,9 @@ sentry = ["dep:sentry", "dep:sentry-tracing", "dep:tracing", "dep:tracing-subscr
 # still argues for an exact-patch pin; bumping to 0.31 is more
 # conservative than caret-ranging 0.27. Re-pin deliberately when
 # upgrading.
-opentelemetry = { version = "=0.31.0", default-features = false, features = ["metrics"], optional = true }
-opentelemetry_sdk = { version = "=0.31.0", default-features = false, features = ["metrics"], optional = true }
-opentelemetry-prometheus = { version = "=0.31.0", optional = true }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics"], optional = true }
+opentelemetry-prometheus = { version = "=0.32.0", optional = true }
 prometheus = { version = "=0.14.0", default-features = false, optional = true }
 
 # Sentry error reporting. Gated behind the `sentry` feature (orthogonal
