@@ -71,11 +71,8 @@ impl<'a, T: FromValue + 'a, C: AsyncConnection + Send + 'a> AsyncIterInner<'a, T
             if let Some(v) = self.batch.next() {
                 return Some(v);
             };
-            if let Some(cursor) = self.cmd.cursor {
-                if cursor == 0 {
-                    return None;
-                }
-            } else {
+            let cursor = self.cmd.cursor?;
+            if cursor == 0 {
                 return None;
             }
 
