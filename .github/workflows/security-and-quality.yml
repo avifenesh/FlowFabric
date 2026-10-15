@@ -209,7 +209,7 @@ jobs:
         # on a green branch. `rust-toolchain.toml` tracks `stable` (no
         # explicit version), so if cargo-semver-checks raises its MSRV
         # past whatever stable becomes, bump this pin in lockstep.
-        run: cargo install cargo-semver-checks --locked --version 0.46.0
+        run: cargo install cargo-semver-checks --locked --version 0.51.0
       - name: Run semver-checks on publish-bound crates
         # On a repo with no v*.*.* tag yet (pre-first-release), skip
         # with a visible note. Once a tag exists, compare against it.
