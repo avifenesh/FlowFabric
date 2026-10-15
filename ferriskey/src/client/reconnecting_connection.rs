@@ -200,6 +200,7 @@ impl TokioDisconnectNotifier {
     }
 }
 
+#[allow(clippy::result_large_err)] // Err hands the connection back to the caller for reuse
 async fn create_connection(
     connection_backend: ConnectionBackend,
     retry_strategy: RetryStrategy,
@@ -320,6 +321,7 @@ impl ConnectionBackend {
 
 impl ReconnectingConnection {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)] // Err hands the connection back to the caller for reuse
     pub(super) async fn new(
         address: &NodeAddress,
         connection_retry_strategy: RetryStrategy,

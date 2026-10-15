@@ -76,6 +76,10 @@
 //! [`ClaimGrant`]: crate::ClaimGrant
 //! [`ResumeGrant`]: crate::ResumeGrant
 
+// EngineError is the uniform error type across the backend surface; same
+// crate-level allow as ff-backend-{postgres,sqlite,valkey}.
+#![allow(clippy::result_large_err)]
+
 // v0.12 PR-6: `admin` is always compiled. The one Valkey-typed helper
 // (`rotate_waitpoint_hmac_secret_all_partitions`, which takes a
 // `&ferriskey::Client`) stays item-gated behind `valkey-default`;
