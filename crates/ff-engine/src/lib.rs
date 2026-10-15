@@ -1,5 +1,9 @@
 //! ff-engine: cross-partition dispatch and background scanners.
 
+// EngineError is the uniform error type across the backend surface; same
+// crate-level allow as ff-backend-{postgres,sqlite,valkey}.
+#![allow(clippy::result_large_err)]
+
 pub mod budget;
 pub mod completion_listener;
 pub mod partition_router;

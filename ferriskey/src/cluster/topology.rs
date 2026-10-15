@@ -222,7 +222,7 @@ pub(crate) fn parse_and_count_slots(
                                     if metadata.len() % 2 != 0 {
                                         tracing::warn!("cluster_topology - Node metadata array has odd length, some entries may be skipped");
                                     }
-                                    for chunk in metadata.chunks_exact(2) {
+                                    for chunk in metadata.as_chunks::<2>().0 {
                                         if let (Ok(Value::BulkString(key)), Ok(Value::BulkString(value))) =
                                             (&chunk[0], &chunk[1])
                                         {

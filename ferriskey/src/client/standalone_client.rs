@@ -780,6 +780,7 @@ impl StandaloneClient {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)] // Err hands the connection back to the caller for reuse
 async fn get_connection_and_replication_info(
     address: &NodeAddress,
     retry_strategy: &RetryStrategy,

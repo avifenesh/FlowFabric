@@ -2881,6 +2881,7 @@ const CANCEL_WAIT_INDEFINITE_CEILING: Duration = Duration::from_secs(300);
 ///   `deadline` elapses first. `elapsed` is the wait budget (the
 ///   requested timeout), not wall-clock precision.
 /// * `Err(e)` if `describe_flow` itself errors (propagated).
+#[allow(clippy::result_large_err)] // uniform EngineError, same convention as validate_tag_key
 pub async fn wait_for_flow_cancellation<B: EngineBackend + ?Sized>(
     backend: &B,
     flow_id: &crate::types::FlowId,
