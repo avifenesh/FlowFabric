@@ -11,7 +11,7 @@ Ferriskey descends from [glide-core](https://github.com/valkey-io/valkey-glide) 
 - **RESP3 protocol** -- native support for all Valkey value types
 - **Cluster mode** -- automatic slot routing, redirection handling, read replicas
 - **TLS** -- rustls-based, platform certificate verification
-- **AWS IAM auth** -- ElastiCache/MemoryDB token-based authentication
+- **AWS IAM auth** -- ElastiCache/MemoryDB token-based authentication, behind the off-by-default `iam` feature
 - **Compression** -- client-side zstd/lz4 support
 
 ## Quick start

@@ -32,7 +32,9 @@ Rust — no compiler plugins, no DAG builder, no proprietary runtime.
   environment by a feature flag.
 - **Use this when** you want to embed the worker SDK directly in your
   Rust service — `WorkerRuntime::new(worker).data(http).on("task", handler).run()`
-  drops the hand-rolled claim-loop boilerplate.
+  drops the hand-rolled claim-loop boilerplate. The `runtime` feature
+  is on `main` and ships in the next release; `ff-sdk` 0.15.0 on
+  crates.io does not have it yet.
 
 ## Installation
 
@@ -75,10 +77,10 @@ FF_WAITPOINT_HMAC_SECRET=$(openssl rand -hex 32) cargo run -p ff-server
 
 ```bash
 # Zero-Docker path — in-process SQLite dev backend, no Valkey needed
-FF_DEV_MODE=1 cargo run --bin ff-dev
+FF_DEV_MODE=1 cargo run --manifest-path examples/ff-dev/Cargo.toml
 
 # Or the WorkerRuntime handler-DI demo against the running ff-server
-FF_HOST=127.0.0.1 FF_PORT=6379 cargo run --bin v016-worker-runtime
+FF_HOST=127.0.0.1 FF_PORT=6379 cargo run --manifest-path examples/v016-worker-runtime/Cargo.toml
 ```
 
 Full example index: [`examples/`](examples/). Fifteen runnable
@@ -176,7 +178,7 @@ for the full env-var reference.
 | Crate | Role |
 | --- | --- |
 | [`flowfabric`](crates/flowfabric) | Umbrella re-export. Feature-flagged backend selection (`valkey` default, `postgres` opt-in). |
-| [`ff-sdk`](crates/ff-sdk) | Worker SDK — public API for worker authors. Includes the `EngineBackendLayer` tower surface and the `runtime` feature for `WorkerRuntime`. |
+| [`ff-sdk`](crates/ff-sdk) | Worker SDK — public API for worker authors. Includes the `EngineBackendLayer` tower surface and the `runtime` feature for `WorkerRuntime` (on `main`, not in 0.15.0). |
 | [`ff-core`](crates/ff-core) | Core types, state enums, partition math, key builders, `EngineBackend` trait. |
 | [`ff-engine`](crates/ff-engine) | Cross-partition dispatch + 17 background scanners. |
 | [`ff-scheduler`](crates/ff-scheduler) | Claim-grant cycle, fairness, capability matching, admission control. |
